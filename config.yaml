@@ -1,0 +1,26 @@
+# Training Basics
+epochs: 200
+val_interval: 40
+lr: 3.0e-4
+batch_size: 131072
+seed: 42
+subject: "1ABA103_3x3x3_resampled"
+no_wandb: false
+
+# Model Configuration
+model_type: "cnn"      # Options: "mlp", "cnn"
+no_fourier: false      # If true, disables Fourier features for MLP
+sigma: 10.0            # Fourier feature scale
+
+# Segmentation Input
+use_seg: true
+seg_name: "labels_moved_*.nii.gz"
+
+# CNN Specific
+patch_size: 96
+patches_per_epoch: 100
+
+# Loss Weights
+l1_w: 0.0
+l2_w: 1.0
+ssim_w: 0.0

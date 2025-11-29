@@ -10,3 +10,4 @@ dotenv
 tqdm
 scipy
 h5py
+wandb

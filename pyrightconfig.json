@@ -1,3 +1,8 @@
 {
-    "typeCheckingMode": "off"
+    "typeCheckingMode": "off",
+    "include": ["."],
+    "extraPaths": [
+        "./",
+        "/home/minsukc/MRI2CT/anatomix"
+    ]
 }

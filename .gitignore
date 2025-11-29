@@ -4,4 +4,10 @@ SynthRAD2025/
 .DS_Store
 .env
 .vscode
-anatomix_outputs/
+anatomix_registration_outputs/
+.ipynb_checkpoints/
+wandb
+tuning_outputs/
+results/
+data/
+*.pyc
