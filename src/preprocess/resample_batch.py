@@ -6,7 +6,8 @@ import SimpleITK as sitk
 from tqdm import tqdm
 
 INPUT_DIR = "/scratch/jjparkcv_root/jjparkcv98/minsukc/SynthRAD2025/Task1"
-OUTPUT_DIR = "/home/minsukc/MRI2CT/data"
+# OUTPUT_DIR = "/home/minsukc/MRI2CT/data"
+OUTPUT_DIR = "/scratch/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/data"
 
 # Number of volumes to process PER REGION. Set to None to process all.
 # NUM_VOLUMES = None  # e.g., 5 or None

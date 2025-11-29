@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from tqdm import tqdm
-from utils import compute_metrics_cpu
+from utils import compute_metrics, unpad_torch
 
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_type):
     model.train()
@@ -55,6 +55,14 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_typ
 @torch.no_grad()
 def evaluate(model, feats_mri, ct, device, model_type, pad_vals):
     model.eval()
+
+    if isinstance(ct, np.ndarray):
+        ct_tensor = torch.from_numpy(ct).float().to(device)
+    else:
+        ct_tensor = ct.float().to(device)
+    if ct_tensor.ndim == 3:
+        ct_tensor = ct_tensor.unsqueeze(0).unsqueeze(0)
+
     
     if model_type == "mlp":
         C, D, H, W = feats_mri.shape
@@ -71,12 +79,17 @@ def evaluate(model, feats_mri, ct, device, model_type, pad_vals):
         for i in range(0, feats_flat.size(0), batch_size):
             f_batch = feats_flat[i:i+batch_size]
             c_batch = coords[i:i+batch_size]
-            preds.append(model(f_batch, c_batch).cpu().numpy())
+            preds.append(model(f_batch, c_batch))
         
-        pred_ct = np.concatenate(preds, axis=0).reshape(ct.shape)
+        pred_flat = torch.cat(preds, dim=0)
+        pred_ct_tensor = pred_flat.reshape(1, 1, D, H, W)
 
     elif model_type == "cnn":
         feats_t = torch.from_numpy(feats_mri).unsqueeze(0).float().to(device)
-        pred_ct = model(feats_t).cpu().numpy()[0, 0]
+        pred_ct_tensor = model(feats_t)
 
-    return compute_metrics_cpu(pred_ct, ct, pad_vals), pred_ct
+    pred_ct_tensor_unpad = unpad_torch(pred_ct_tensor, pad_vals)
+    ct_tensor_unpad = unpad_torch(ct_tensor, pad_vals)
+    metrics = compute_metrics(pred_ct_tensor_unpad, ct_tensor_unpad)
+    pred_ct_numpy_unpad = pred_ct_tensor_unpad.squeeze().cpu().numpy()
+    return metrics, pred_ct_numpy_unpad

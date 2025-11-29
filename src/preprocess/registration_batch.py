@@ -5,69 +5,58 @@ import numpy as np
 import pandas as pd
 import nibabel as nib
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 from sklearn.metrics import f1_score
+from tqdm import tqdm
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="monai")
 
-# --- EXTERNAL DEPENDENCIES ---
-try:
-    from anatomix.registration import convex_adam
-except ImportError:
-    print("⚠️ WARNING: anatomix library not found. Dummy mode enabled.")
-    def convex_adam(**kwargs): pass
+from anatomix.registration import convex_adam
 
 # ==========================================
-# 1. CONFIGURATION & BEST PARAMETERS
+# 1. CONFIGURATION
 # ==========================================
 ROOT = "/home/minsukc/MRI2CT"
 DATA_DIR = os.path.join(ROOT, "data")
 CKPT_PATH = os.path.join(ROOT, "anatomix/model-weights/anatomix.pth")
-OUTPUT_ROOT = os.path.join(ROOT, "final_results_batch")
 
-# *** ENTER YOUR TUNED PARAMETERS HERE ***
-# NOTE: All parameters defining size (grid_sp) or counts (niter, smooth) must be INTEGERS.
+# Target specific subjects or set to None for ALL
+TARGET_LIST = None 
+# TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled", "1HNA001_3.0x3.0x3.0_resampled", "1THA001_3.0x3.0x3.0_resampled"]
+# TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled"]
+
+# *** BEST PARAMETERS FROM TUNING ***
 BEST_PARAMS = {
-    'lambda_weight': 0.75,  
-    'grid_sp': 2,           # FIXED: Changed from 2.0 to 2
-    'selected_smooth': 0,   # FIXED: Changed from float to int
-    'selected_niter': 80,   # Using 80 as a safe default if not provided, ensure it's int
-    'disp_hw': 1            # Using 1 as a safe default
+    'lambda_weight': 0.5,  
+    'grid_sp': 3,           
+    'selected_smooth': 1,   
+    'selected_niter': 80,   
+    'disp_hw': 1            
 }
 
-# Define your subjects
-SUBJECTS_CONFIG = [
-    { "id": "1ABA103_3x3x3_resampled", "region": "abdomen" },
-    { "id": "1ABB116_3x3x3_resampled", "region": "abdomen" },
-    { "id": "1ABB164_3x3x3_resampled", "region": "abdomen" },
-    { "id": "1THA267_3x3x3_resampled", "region": "thorax" },
-    { "id": "1THB050_3x3x3_resampled", "region": "thorax" },
-    { "id": "1THB211_3x3x3_resampled", "region": "thorax" },
-    { "id": "1HNA038_3x3x3_resampled", "region": "head_neck" },
-    { "id": "1HNA119_3x3x3_resampled", "region": "head_neck" },
-    { "id": "1HNC073_3x3x3_resampled", "region": "head_neck" },
-]
-
 # ==========================================
-# 2. REGION MAPS (For Accurate Dice)
+# 2. REGION MAPS
 # ==========================================
 REGION_MAPS = {
     "abdomen": {
-        "Spleen": (1, 1), "Kidney_R": (2, 2), "Kidney_L": (3, 3), 
-        "Liver": (5, 5), "Stomach": (6, 6), "Pancreas": (7, 7)
+        "Spleen": (1, 1), "Kidney_R": (2, 2), "Kidney_L": (3, 3), "Liver": (5, 5), "Stomach": (6, 6)
     },
     "thorax": {
-        "Heart": (51, 22), "Aorta": (52, 23), "Esophagus": (15, 12)
+        "Heart": (51, 22), "Lung_L": ([10, 11], 10), "Lung_R": ([12, 13, 14], 11)
     },
     "head_neck": {
         "Brain": (90, 50)
-    }
+    },
+    "brain": {},
+    "pelvis": {}
 }
 
+
 # ==========================================
-# 3. HELPER FUNCTIONS (Preprocessing)
+# 3. UTILITIES
 # ==========================================
 def minmax(arr, minclip=None, maxclip=None):
-    if minclip is not None and maxclip is not None:
+    if not (minclip is None) & (maxclip is None):
         arr = np.clip(arr, minclip, maxclip)
     denom = arr.max() - arr.min()
     if denom == 0: return np.zeros_like(arr)
@@ -80,46 +69,197 @@ def pad_to_multiple_np(arr, multiple=16):
     pad_W = (multiple - W % multiple) % multiple
     if pad_D == 0 and pad_H == 0 and pad_W == 0:
         return arr, (0,0,0)
-    return np.pad(arr, ((0, pad_D), (0, pad_H), (0, pad_W)), mode='constant'), (pad_D, pad_H, pad_W)
+    padded = np.pad(arr, ((0, pad_D), (0, pad_H), (0, pad_W)), mode='constant')
+    return padded, (pad_D, pad_H, pad_W)
 
 def unpad_np(arr, pad_vals):
     pad_D, pad_H, pad_W = pad_vals
-    D_end = None if pad_D == 0 else -pad_D
-    H_end = None if pad_H == 0 else -pad_H
-    W_end = None if pad_W == 0 else -pad_W
-    return arr[:D_end, :H_end, :W_end]
+    s_d = slice(None, -pad_D) if pad_D > 0 else slice(None)
+    s_h = slice(None, -pad_H) if pad_H > 0 else slice(None)
+    s_w = slice(None, -pad_W) if pad_W > 0 else slice(None)
+    return arr[s_d, s_h, s_w]
 
 def save_nifti(arr, affine, path):
     nib.save(nib.Nifti1Image(arr, affine), path)
 
-def make_rgb_overlay(ct_slice, mr_slice):
-    """Creates a Red-Green overlay (Red=CT, Green=MRI)."""
-    ct_norm = (ct_slice - ct_slice.min()) / (ct_slice.max() - ct_slice.min() + 1e-8)
-    mr_norm = (mr_slice - mr_slice.min()) / (mr_slice.max() - mr_slice.min() + 1e-8)
-    rgb = np.zeros((*ct_norm.shape, 3), dtype=np.float32)
-    rgb[..., 0] = ct_norm # Red
-    rgb[..., 1] = mr_norm # Green
-    return rgb
+def get_region_from_id(subject_id):
+    if len(subject_id) < 2 or not subject_id.startswith("1"):
+        raise ValueError(
+            f"⚠️ Invalid subject ID '{subject_id}'. Expected format '1XX...'"
+        )
+        
+    mapping = { "AB": "abdomen", "TH": "thorax", "HN": "head_neck", "B": "brain", "P": "pelvis" }
+    code_2 = subject_id[1:3].upper()
+    code_1 = subject_id[1:2].upper()
+    
+    if code_2 in mapping: 
+        return mapping[code_2]
+    if code_1 in mapping: 
+        return mapping[code_1]
+    
+    raise ValueError(
+        f"⚠️ Region code '{region_code}' in '{subject_id}' is not recognized..."
+    )
+
+def discover_subjects(data_dir, target_list=None):
+    if target_list:
+        candidates = target_list
+    else:
+        candidates = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+
+    print(f"🔎 Scanning {len(candidates)} candidates in {data_dir}...")
+    required_files = ["mr_resampled.nii.gz", "ct_resampled.nii.gz", "mask_resampled.nii.gz", "ct_seg.nii.gz", "mr_seg.nii.gz"]
+    valid = []
+
+    for subj_id in candidates:
+        subj_path = os.path.join(data_dir, subj_id)
+        missing = [f for f in required_files if not os.path.exists(os.path.join(subj_path, f))]
+        if missing:
+            if target_list: print(f"   ❌ Skipping {subj_id}: Missing {missing}")
+            continue
+        region = get_region_from_id(subj_id)
+        valid.append({ "id": subj_id, "path": subj_path, "region": region })
+
+    print(f"✅ Found {len(valid)} valid subjects.")
+    return valid
 
 # ==========================================
-# 4. EVALUATION FUNCTION
+# 4. VISUALIZATION & EVALUATION
 # ==========================================
+def create_random_colormap(num_classes=120, seed=42):
+    num_classes = int(num_classes)
+    np.random.seed(seed)
+    colors = np.random.rand(num_classes + 1, 4) 
+    colors[:, 3] = 1.0 
+    colors[0, :] = [0, 0, 0, 0] 
+    return ListedColormap(colors)
+
+def create_binary_colormap(color_name):
+    if color_name == 'red': c = [1, 0, 0, 0.6] 
+    elif color_name == 'green': c = [0, 1, 0, 0.6] 
+    else: c = [1, 1, 1, 1]
+        
+    cmap = np.zeros((2, 4))
+    cmap[0, :] = [0, 0, 0, 0]
+    cmap[1, :] = c 
+    return ListedColormap(cmap)
+
+def get_target_label_mask(seg_volume, region_name):
+    if region_name not in REGION_MAPS: 
+        return np.zeros_like(seg_volume)
+    target_ids = []
+    
+    for _, (ct_ids, mr_ids) in REGION_MAPS[region_name].items():
+        if isinstance(ct_ids, list): target_ids.extend(ct_ids)
+        else: target_ids.append(ct_ids)
+            
+        if isinstance(mr_ids, list): target_ids.extend(mr_ids)
+        else: target_ids.append(mr_ids)
+    mask = np.isin(seg_volume, target_ids)
+    return np.where(mask, seg_volume, 0) 
+
+def save_registration_vis(fixed_path, moving_path, warped_path, fseg_path, mseg_path, wseg_path, region_name, save_path):
+    try:
+        fix = nib.load(fixed_path).get_fdata()
+        mov = nib.load(moving_path).get_fdata()
+        wrp = nib.load(warped_path).get_fdata()
+        fix_seg = nib.load(fseg_path).get_fdata().astype(np.int32)
+        mov_seg = nib.load(mseg_path).get_fdata().astype(np.int32)
+        wrp_seg = nib.load(wseg_path).get_fdata().astype(np.int32)
+        
+        z = int(fix.shape[2] // 2)
+        fix_filt = get_target_label_mask(fix_seg, region_name)
+        mov_filt = get_target_label_mask(mov_seg, region_name)
+        wrp_filt = get_target_label_mask(wrp_seg, region_name)
+
+        def sl(vol, normalize=False):
+            s = np.rot90(vol[..., z])
+            if normalize:
+                denom = s.max() - s.min()
+                if denom > 0: s = (s - s.min()) / denom
+            return s
+
+        max_label = max(fix_seg.max(), mov_seg.max(), wrp_seg.max())
+        seg_cmap = create_random_colormap(int(max_label))
+        red_cmap = create_binary_colormap('red')
+        green_cmap = create_binary_colormap('green')
+
+        fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+        plt.subplots_adjust(hspace=0.3, wspace=0.1)
+        
+        # Row 1: Intensity
+        axes[0,0].imshow(sl(fix, True), cmap='gray',vmin=0,vmax=1)
+        axes[0,0].set_title("Fixed (CT)")
+        axes[0,1].imshow(sl(mov, True), cmap='gray',vmin=0,vmax=1)
+        axes[0,1].set_title("Moving (MRI)")
+        axes[0,2].imshow(sl(wrp, True), cmap='gray',vmin=0,vmax=1)
+        axes[0,2].set_title("Warped MRI")
+        
+        rgb = np.zeros((*sl(fix).shape, 3))
+        rgb[..., 0] = sl(fix, True)
+        rgb[..., 1] = sl(wrp, True)
+        axes[0,3].imshow(rgb); axes[0,3].set_title("Overlay (R=CT, G=Warp)")
+
+        # Row 2: All Labels
+        axes[1,0].imshow(sl(fix_seg), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[1,0].set_title("Fixed Seg (All)")
+        axes[1,1].imshow(sl(mov_seg), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[1,1].set_title("Moving Seg (All)")
+        axes[1,2].imshow(sl(wrp_seg), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[1,2].set_title("Warped Seg (All)")
+        
+        # Binary Overlay
+        f_bin = (sl(fix_seg) > 0).astype(int)
+        w_bin = (sl(wrp_seg) > 0).astype(int)
+        axes[1,3].imshow(f_bin, cmap=red_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[1,3].imshow(w_bin, cmap=green_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[1,3].set_title("Overlay: R=Fixed CT, G=Warped MR")
+
+        # Row 3: Targets
+        axes[2,0].imshow(sl(fix_filt), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[2,0].set_title("Fixed Seg (Targets)")
+        axes[2,1].imshow(sl(mov_filt), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[2,1].set_title("Moving Seg (Targets)")
+        axes[2,2].imshow(sl(wrp_filt), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[2,2].set_title("Warped Seg (Targets)")
+        
+        f_filt_bin = (sl(fix_filt) > 0).astype(int)
+        w_filt_bin = (sl(wrp_filt) > 0).astype(int)
+        axes[2,3].imshow(f_filt_bin, cmap=red_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[2,3].imshow(w_filt_bin, cmap=green_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[2,3].set_title("Overlay: R=Fixed CT, G=Warped MR")
+
+        for ax in axes.flatten(): ax.axis('off')
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close(fig)
+    except Exception as e:
+        print(f"⚠️ Visualization failed: {e}")
+
 def compute_dice_region(gt, pred, region_name):
     target_map = REGION_MAPS.get(region_name)
-    if not target_map: return {}, 0.0
+    if not target_map:
+        return {}, 0.0
 
     gt_present = np.unique(gt)
     pred_present = np.unique(pred)
-    
     organ_scores = {}
     scores_list = []
 
-    for organ, (ct_id, mr_id) in target_map.items():
-        if ct_id not in gt_present or mr_id not in pred_present:
+    def is_present(ids, present_list):
+        if isinstance(ids, list): return any(i in present_list for i in ids)
+        return ids in present_list
+
+    def make_mask(volume, ids):
+        if isinstance(ids, list): return np.isin(volume, ids)
+        return volume == ids
+
+    for organ, (ct_ids, mr_ids) in target_map.items():
+        if not is_present(ct_ids, gt_present) or not is_present(mr_ids, pred_present):
             continue
 
-        y_true = (gt == ct_id)
-        y_pred = (pred == mr_id)
+        y_true = make_mask(gt, ct_ids)
+        y_pred = make_mask(pred, mr_ids)
         inter = np.sum(y_true * y_pred)
         total = np.sum(y_true) + np.sum(y_pred)
         dice = (2.0 * inter) / (total + 1e-6)
@@ -128,34 +268,36 @@ def compute_dice_region(gt, pred, region_name):
         scores_list.append(dice)
 
     avg = np.mean(scores_list) if scores_list else 0.0
+    print("Avg Dice:", avg)
     return organ_scores, avg
-
+    
 # ==========================================
 # 5. MAIN PIPELINE
 # ==========================================
 def run_batch_pipeline():
-    print(f"🚀 Starting Batch Registration with Best Params: {BEST_PARAMS}")
-    os.makedirs(OUTPUT_ROOT, exist_ok=True)
-    
+    subjects = discover_subjects(DATA_DIR, target_list=TARGET_LIST)
+    if not subjects:
+        return
+
+    print(f"\n🚀 Starting Batch Registration with Best Params: {BEST_PARAMS}")
     summary_results = []
     
-    # --- Ensure required parameters are integers ---
     params = BEST_PARAMS.copy()
     params['grid_sp'] = int(params.get('grid_sp', 2))
     params['selected_smooth'] = int(params.get('selected_smooth', 0))
     params['selected_niter'] = int(params.get('selected_niter', 80))
     params['disp_hw'] = int(params.get('disp_hw', 1))
 
-    for s_idx, subj in enumerate(SUBJECTS_CONFIG):
+    for subj in tqdm(subjects, desc="Batch Progress", unit="subj"):
         subj_id = subj['id']
         region = subj['region']
+        subj_dir = subj['path']
         
-        print(f"\n[{s_idx+1}/{len(SUBJECTS_CONFIG)}] Processing: {subj_id} ({region})")
-        subj_dir = os.path.join(DATA_DIR, subj_id)
-        result_dir = os.path.join(OUTPUT_ROOT, subj_id)
+        # Local output directory per subject
+        result_dir = os.path.join(subj_dir, "registration_output")
         os.makedirs(result_dir, exist_ok=True)
 
-        # --- A. Load & Preprocess RAW Data ---
+        # --- A. Load & Preprocess ---
         raw_files = {
             'fixed': os.path.join(subj_dir, "ct_resampled.nii.gz"),
             'moving': os.path.join(subj_dir, "mr_resampled.nii.gz"),
@@ -165,27 +307,25 @@ def run_batch_pipeline():
         }
         
         try:
-            # 1. Load Raw Data
             nii_fixed = nib.load(raw_files['fixed'])
             dat_fixed = nii_fixed.get_fdata()
             dat_moving = nib.load(raw_files['moving']).get_fdata()
             affine = nii_fixed.affine
             
-            # 2. Normalize & Get Segments
             dat_fixed_norm = minmax(dat_fixed, -450, 450)
             dat_moving_norm = minmax(dat_moving)
             dat_mask = nib.load(raw_files['mask']).get_fdata()
             dat_fseg = nib.load(raw_files['fixed_seg']).get_fdata()
             dat_mseg = nib.load(raw_files['moving_seg']).get_fdata()
 
-            # 3. Pad ALL Volumes
+            # Pad
             pad_fixed, pad_vals = pad_to_multiple_np(dat_fixed_norm, 16)
             pad_moving, _ = pad_to_multiple_np(dat_moving_norm, 16)
             pad_mask, _ = pad_to_multiple_np(dat_mask, 16)
             pad_fseg, _ = pad_to_multiple_np(dat_fseg, 16)
             pad_mseg, _ = pad_to_multiple_np(dat_mseg, 16)
 
-            # 4. Define & Save Temp Padded Files
+            # Temp Files
             temp_paths = {k: os.path.join(result_dir, f"temp_padded_{k}.nii.gz") for k in ['fixed', 'moving', 'mask', 'fixed_seg', 'moving_seg']}
             save_nifti(pad_fixed, affine, temp_paths['fixed'])
             save_nifti(pad_moving, affine, temp_paths['moving'])
@@ -194,7 +334,7 @@ def run_batch_pipeline():
             save_nifti(pad_mseg, affine, temp_paths['moving_seg'])
 
         except Exception as e:
-            print(f"   ❌ Preprocessing failed: {e}")
+            tqdm.write(f"   ❌ Preprocessing failed for {subj_id}: {e}")
             continue
 
         # --- B. Run Registration ---
@@ -208,60 +348,75 @@ def run_batch_pipeline():
                 selected_smooth=params['selected_smooth'],
                 disp_hw=params['disp_hw'],
                 selected_niter=params['selected_niter'], 
-                grid_sp_adam=params['grid_sp'], # Typically grid_sp_adam = grid_sp
+                grid_sp_adam=params['grid_sp'],
                 ic=True, use_mask=True, warp_seg=True,
                 fixed_image=temp_paths['fixed'], fixed_mask=temp_paths['mask'], fixed_seg=temp_paths['fixed_seg'],
                 fixed_minclip=-450, fixed_maxclip=450,
                 moving_image=temp_paths['moving'], moving_mask=temp_paths['mask'], moving_seg=temp_paths['moving_seg']
             )
         except Exception as e:
-            print(f"   💥 Registration failed: {e}")
-            
-            # --- Cleanup Temp ---
+            tqdm.write(f"   💥 Registration failed: {e}")
             for p in temp_paths.values(): os.remove(p)
             continue
 
-
         # --- C. Unpad & Save Final Results ---
         try:
-            moved_img_path = glob.glob(os.path.join(result_dir, "moved_temp_padded_moving*.nii.gz"))[0]
-            moved_seg_path = glob.glob(os.path.join(result_dir, "labels_moved_temp_padded_moving*.nii.gz"))[0]
-            
-            # Unpad back to original shape
+            # Glob search for output
+            warped_pattern = os.path.join(result_dir, "moved*.nii.gz")
+            label_pattern = os.path.join(result_dir, "labels_moved_temp_padded*.nii.gz")
+            disp_pattern = os.path.join(result_dir, "disp_temp_padded_moving*.nii.gz")
+
+            moved_img_path = glob.glob(warped_pattern)[0]
+            moved_seg_path = glob.glob(label_pattern)[0]
+            disp_path = glob.glob(disp_pattern)[0]
+
+            # Load and Unpad
             moved_img_unpad = unpad_np(nib.load(moved_img_path).get_fdata(), pad_vals)
             moved_seg_unpad = unpad_np(nib.load(moved_seg_path).get_fdata(), pad_vals)
+            disp_unpad = unpad_np(nib.load(disp_path).get_fdata(), pad_vals)
             
             # Save Final (using original affine)
-            final_img_path = os.path.join(result_dir, "final_moved_mr.nii.gz")
-            final_seg_path = os.path.join(result_dir, "final_moved_seg.nii.gz")
+            final_img_path = os.path.join(result_dir, "moved_mr.nii.gz")
+            final_seg_path = os.path.join(result_dir, "labels_moved.nii.gz")
+            final_disp_path = os.path.join(result_dir, "disp.nii.gz")
             save_nifti(moved_img_unpad, affine, final_img_path)
             save_nifti(moved_seg_unpad, affine, final_seg_path)
+            save_nifti(disp_unpad, affine, final_disp_path)
 
-            # --- D. Evaluate ---
+            # Evaluate
             organ_scores, avg_dice = compute_dice_region(dat_fseg, moved_seg_unpad, region)
-            print(f"   ✅ Registration Dice ({region}): {avg_dice:.4f}")
             
+            # Vis
+            vis_path = os.path.join(result_dir, "registration_qc.png")
+            save_registration_vis(
+                raw_files['fixed'], raw_files['moving'], final_img_path,
+                raw_files['fixed_seg'], raw_files['moving_seg'], final_seg_path,
+                region, vis_path
+            )
+
+            # Store result
             summary_results.append({
                 'subject': subj_id, 'region': region, 'avg_dice': avg_dice, **organ_scores
             })
 
-            # --- E. Cleanup Temp ---
-            for p in temp_paths.values(): os.remove(p)
-            for p in glob.glob(os.path.join(result_dir, "moved_temp_padded_moving*.nii.gz")): os.remove(p)
-            for p in glob.glob(os.path.join(result_dir, "labels_moved_temp_padded_moving*.nii.gz")): os.remove(p)
-
+            # Cleanup
+            for p in temp_paths.values():
+                os.remove(p)
+            os.remove(moved_img_path)
+            os.remove(moved_seg_path)
+            os.remove(disp_path)
 
         except Exception as e:
-            print(f"   ⚠️ Post-processing/Evaluation Error: {e}")
-            # Ensure temp files are cleaned even on failure
+            tqdm.write(f"   ⚠️ Post-processing failed: {e}")
             for p in temp_paths.values(): os.remove(p)
             continue
 
-
     # Save Summary CSV
     if summary_results:
-        pd.DataFrame(summary_results).to_csv(os.path.join(OUTPUT_ROOT, "batch_summary.csv"), index=False)
-        print("\n🏁 Batch Processing Complete. Results saved to batch_summary.csv")
+        # Save to root data dir or project root
+        summary_path = os.path.join(DATA_DIR, "_registration_summary.csv")
+        pd.DataFrame(summary_results).to_csv(summary_path, index=False)
+        print(f"\n🏁 Batch Processing Complete. Results saved to {summary_path}")
 
 if __name__ == "__main__":
     run_batch_pipeline()

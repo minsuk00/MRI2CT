@@ -24,11 +24,8 @@ ROOT_DIR = "/home/minsukc/MRI2CT"
 CKPT_PATH = os.path.join(ROOT_DIR, "anatomix", "model-weights", "anatomix.pth")
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser()
-    
-    # Configuration File
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
 
     # Basics
     parser.add_argument("-W", "--no_wandb", action="store_true", help="DISABLE W&B (Default: Enabled)")
@@ -44,7 +41,7 @@ def main():
     parser.add_argument("--no_fourier", action="store_true", help="Disable Fourier positional encodings for MLP")
     parser.add_argument("--sigma", type=float, help="Scale (std dev) for Random Fourier Features")
     parser.add_argument("--use_seg", action="store_true", help="Use MRI segmentation mask as input")
-    parser.add_argument("--seg_name", type=str, default="segmentations.nii.gz", help="Segmentation filename")
+    parser.add_argument("--seg_name", type=str, default="labels_moved.nii.gz", help="Segmentation filename")
 
     # CNN Config
     parser.add_argument("--patch_size", type=int, help="Cube size for CNN patch training")
@@ -55,30 +52,28 @@ def main():
     parser.add_argument("--l2_w", type=float, help="MSE Loss Weight")
     parser.add_argument("--ssim_w", type=float, help="SSIM Loss Weight")
     
-    # 1. Parse Args to get Config Path
-    temp_args, _ = parser.parse_known_args()
-    
-    # 2. Load Config File
-    if os.path.exists(temp_args.config):
-        print(f"📄 Loading config from {temp_args.config}")
+    # Load Config File
+    if os.path.exists(os.path.join(ROOT_DIR, "config.yaml"):
         with open(temp_args.config, 'r') as f:
             config = yaml.safe_load(f)
         # Set defaults in parser based on config
         parser.set_defaults(**config)
     else:
-        print(f"⚠️ Config file {temp_args.config} not found. Using defaults/CLI args.")
-
-    # 3. Parse Args again (CLI overrides Config)
+        raise FileNotFoundError("Config file not found.")
+    # Parse Args again (CLI overrides Config)
     args = parser.parse_args()
 
+    return args
+    
+def main():
+    args = parse_args()
+    
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🟢 Using device: {device}")
     
-    # Invert logic for wandb arg to match config "no_wandb: false" -> enabled
     use_wandb = not args.no_wandb
-    
     if use_wandb:
         wandb.init(project="mri2ct", name=f"{args.model_type}_{args.subject}", config=vars(args))
     
@@ -100,15 +95,11 @@ def main():
     # --- 3. Setup Datasets & Model ---
     if args.use_seg:
         print(f"Loading Segmentation: {args.seg_name}...")
-        try:
-            seg_np = load_segmentation(DATA_DIR, args.subject, seg_filename=args.seg_name, pad_vals=pad_vals)
-            seg_one_hot = one_hot_encode(seg_np)
-            print(f"Segmentation encoded: {seg_one_hot.shape} (Channels={seg_one_hot.shape[0]})")
-            feats_mri = np.concatenate([feats_mri, seg_one_hot], axis=0)
-            print(f"Combined Feature Shape: {feats_mri.shape}")
-        except FileNotFoundError as e:
-            print(f"⚠️ {e}. Continuing without segmentation.")
-            
+        seg_np = load_segmentation(DATA_DIR, args.subject, seg_filename=args.seg_name, pad_vals=pad_vals)
+        seg_one_hot = one_hot_encode(seg_np)
+        print(f"Segmentation encoded: {seg_one_hot.shape} (Channels={seg_one_hot.shape[0]})")
+        feats_mri = np.concatenate([feats_mri, seg_one_hot], axis=0)
+        print(f"Combined Feature Shape: {feats_mri.shape}")
     cleanup_gpu()
 
     loader = get_dataloader(feats_mri, ct, args)
@@ -125,24 +116,16 @@ def main():
 
     # --- 4. Optimizer & Loss ---
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    
     loss_fn = CompositeLoss(weights={
         "l1": args.l1_w, 
         "l2": args.l2_w, 
         "ssim": args.ssim_w
     }).to(device)
-    
     scaler = torch.amp.GradScaler()
 
     # --- 5. Training Loop ---
     start_time = time.time()
-    epoch_iter = tqdm(
-        range(1, args.epochs + 1),
-        desc="Epochs",
-        leave=True,
-        dynamic_ncols=True
-    )
-    
+    epoch_iter = tqdm(range(1, args.epochs + 1), desc="Epochs", leave=True, dynamic_ncols=True)
     for epoch in epoch_iter:
         loss, loss_comps = train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, args.model_type)
         epoch_iter.set_postfix({"train_loss": f"{loss:.5f}"})

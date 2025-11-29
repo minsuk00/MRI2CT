@@ -16,12 +16,15 @@ from anatomix.registration import convex_adam
 ROOT = "/home/minsukc/MRI2CT"
 DATA_DIR = os.path.join(ROOT, "data")
 CKPT = os.path.join(ROOT, "anatomix/model-weights/anatomix.pth")
-OUTPUT_DIR = os.path.join(ROOT, "tuning_outputs")
+SCRATCH_ROOT =  "/scratch/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/"
+# OUTPUT_DIR = os.path.join(ROOT, "tuning_outputs")
+OUTPUT_DIR = os.path.join(SCRATCH_ROOT, "tuning_outputs")
 
 # --- 1. Define Subjects ---
 # Leave None to scan all folders in DATA_DIR that have required files
 TARGET_SUBJECTS = None 
 # TARGET_SUBJECTS = ["1ABA005_3.0x3.0x3.0_resampled", "1HNA001_3.0x3.0x3.0_resampled", "1THA001_3.0x3.0x3.0_resampled"]
+# TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled","1ABA009_3.0x3.0x3.0_resampled","1ABA011_3.0x3.0x3.0_resampled","1ABA012_3.0x3.0x3.0_resampled","1ABA014_3.0x3.0x3.0_resampled","1ABA018_3.0x3.0x3.0_resampled","1ABA019_3.0x3.0x3.0_resampled","1ABA025_3.0x3.0x3.0_resampled","1ABA029_3.0x3.0x3.0_resampled","1ABA030_3.0x3.0x3.0_resampled","1HNA001_3.0x3.0x3.0_resampled","1HNA004_3.0x3.0x3.0_resampled","1HNA006_3.0x3.0x3.0_resampled","1HNA008_3.0x3.0x3.0_resampled","1HNA010_3.0x3.0x3.0_resampled","1HNA012_3.0x3.0x3.0_resampled","1HNA013_3.0x3.0x3.0_resampled","1HNA014_3.0x3.0x3.0_resampled","1HNA015_3.0x3.0x3.0_resampled","1HNA018_3.0x3.0x3.0_resampled","1THA001_3.0x3.0x3.0_resampled","1THA002_3.0x3.0x3.0_resampled","1THA003_3.0x3.0x3.0_resampled","1THA004_3.0x3.0x3.0_resampled","1THA005_3.0x3.0x3.0_resampled","1THA010_3.0x3.0x3.0_resampled","1THA011_3.0x3.0x3.0_resampled","1THA013_3.0x3.0x3.0_resampled","1THA015_3.0x3.0x3.0_resampled","1THA016_3.0x3.0x3.0_resampled"]
 
 # --- 2. Define Parameter Search Grid ---
 grid = {
@@ -82,8 +85,10 @@ def get_region_from_id(subject_id):
     Supports SynthRAD2025 (AB, TH, HN) and SynthRAD2023 (B, P).
     """
     if len(subject_id) < 2 or not subject_id.startswith("1"):
-        return "total"
-
+        raise ValueError(
+            f"⚠️ Invalid subject ID '{subject_id}'. Expected format '1XX...'"
+        )
+        
     mapping = {
         "AB": "abdomen",
         "TH": "thorax",
@@ -100,7 +105,9 @@ def get_region_from_id(subject_id):
     if code_1 in mapping: 
         return mapping[code_1]
     
-    return "total"
+    raise ValueError(
+        f"⚠️ Region code '{region_code}' in '{subject_id}' is not recognized..."
+    )
 
 def discover_tuning_subjects(data_dir, target_list=None):
     """
@@ -415,7 +422,8 @@ def compute_dice_for_region(gt_path, pred_path, region_name):
         scores.append(dice)
         tqdm.write(f"   {organ:<15} | Dice: {dice:.4f}")
 
-    if not scores: return 0.0
+    if not scores:
+        return 0.0
     avg = np.mean(scores)
     tqdm.write(f"   ✅ Subject Avg: {avg:.4f}")
     return avg

@@ -7,17 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchio as tio
 from torch.utils.data import Dataset, DataLoader, TensorDataset
-from skimage.metrics import peak_signal_noise_ratio as psnr2d
-from skimage.metrics import structural_similarity as ssim2d
 import random
-
-# --- SSIM Setup ---
-try:
-    from fused_ssim import fused_ssim
-    HAS_FUSED_SSIM = True
-except ImportError:
-    HAS_FUSED_SSIM = False
-    print("⚠️ fused_ssim not found. Using native PyTorch fallback.")
+from fused_ssim import fused_ssim
 
 def set_seed(seed=42):
     """Sets the seed for reproducibility."""
@@ -44,13 +35,6 @@ def pad_to_multiple_np(arr, multiple=16):
     pad_H = (multiple - H % multiple) % multiple
     pad_W = (multiple - W % multiple) % multiple
     return np.pad(arr, ((0, pad_D), (0, pad_H), (0, pad_W)), mode='constant'), (pad_D, pad_H, pad_W)
-
-def unpad_np(arr, pad_vals):
-    pad_D, pad_H, pad_W = pad_vals
-    s_d = slice(None, -pad_D) if pad_D > 0 else slice(None)
-    s_h = slice(None, -pad_H) if pad_H > 0 else slice(None)
-    s_w = slice(None, -pad_W) if pad_W > 0 else slice(None)
-    return arr[s_d, s_h, s_w]
 
 def load_image_pair(root, subj_id):
     ct_path = glob.glob(os.path.join(root, subj_id, "ct_resampled.nii*"))[0]
@@ -156,7 +140,31 @@ def get_dataloader(feats_mri, ct_target, args):
         raise ValueError(f"Unknown model type: {args.model_type}")
 
 # --- Loss & Metrics ---
-def compute_metrics_cpu(pred, target, pad_vals):
+def unpad_np(arr, pad_vals):
+    pad_D, pad_H, pad_W = pad_vals
+    s_d = slice(None, -pad_D) if pad_D > 0 else slice(None)
+    s_h = slice(None, -pad_H) if pad_H > 0 else slice(None)
+    s_w = slice(None, -pad_W) if pad_W > 0 else slice(None)
+    return arr[s_d, s_h, s_w]
+    
+def unpad_torch(data, pad_vals):
+    """
+    data: (B, C, D, H, W) 5D Tensor
+    pad_vals: [d_pad, h_pad, w_pad]
+    """
+    if pad_vals is None:
+        return data
+
+    d_pad, h_pad, w_pad = pad_vals
+    b, c, d, h, w = data.shape
+    
+    d_end = d - d_pad if d_pad > 0 else d
+    h_end = h - h_pad if h_pad > 0 else h
+    w_end = w - w_pad if w_pad > 0 else w
+    
+    return data[..., :d_end, :h_end, :w_end]
+    
+def compute_metrics_deprecated(pred, target, pad_vals):
     pred = unpad_np(pred, pad_vals)
     target = unpad_np(target, pad_vals)
     
@@ -178,35 +186,28 @@ def compute_metrics_cpu(pred, target, pad_vals):
             val = psnr2d(t_slice, p_slice, data_range=1.0)
             psnrs.append(val)
             
-        ssims.append(ssim2d(t_slice, p_slice, data_range=1.0))
+        ssims.append(fused_ssim(p_slice, t_slice , train=False))
         
     return mae, np.mean(psnrs) if psnrs else 0.0, np.mean(ssims) if ssims else 0.0
 
-def gaussian_window(window_size, sigma):
-    gauss = torch.Tensor([np.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
-    return gauss/gauss.sum()
+def compute_metrics(pred, target, data_range=1.0):
+    b, c, d, h, w = pred.shape
+    pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
+    targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
 
-def create_window(window_size, channel):
-    _1D_window = gaussian_window(window_size, 1.5).unsqueeze(1)
-    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
-    return window
+    # SSIM
+    ssim_val = fused_ssim(pred_2d, targ_2d, train=False).item()
 
-def ssim_native(img1, img2, window_size=11, size_average=True):
-    channel = img1.size(1)
-    window = create_window(window_size, channel).to(img1.device).type_as(img1)
-    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
-    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
-    mu1_sq = mu1.pow(2)
-    mu2_sq = mu2.pow(2)
-    mu1_mu2 = mu1 * mu2
-    sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
-    C1 = 0.01**2
-    C2 = 0.03**2
-    ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
-    return ssim_map.mean() if size_average else ssim_map.mean(1).mean(1).mean(1)
+    # PSNR
+    mse = torch.mean((pred_2d - targ_2d) ** 2, dim=[1, 2, 3])
+    mse = torch.clamp(mse, min=1e-10) 
+    psnr_2d = 10.0 * torch.log10((data_range ** 2) / mse)
+    psnr_val = torch.mean(psnr_2d).item()
+
+    # MAE
+    mae_val = torch.mean(torch.abs(pred - target)).item()
+    
+    return mae_val, psnr_val, ssim_val
 
 class CompositeLoss(nn.Module):
     def __init__(self, weights={"l1": 1.0, "l2": 0.0, "ssim": 0.0}):
@@ -235,12 +236,9 @@ class CompositeLoss(nn.Module):
                 pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
                 targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
                 
-                if HAS_FUSED_SSIM:
-                    pred32 = pred_2d.float()
-                    targ32 = targ_2d.float()
-                    ssim_score = fused_ssim(pred32, targ32, train=True)
-                else:
-                    ssim_score = ssim_native(pred_2d, targ_2d)
+                pred32 = pred_2d.float()
+                targ32 = targ_2d.float()
+                ssim_score = fused_ssim(pred32, targ32, train=True)
                 
                 val_ssim_loss = 1.0 - ssim_score
                 total_loss += self.weights["ssim"] * val_ssim_loss
