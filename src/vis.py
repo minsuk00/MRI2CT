@@ -102,4 +102,4 @@ def visualize_ct_feature_comparison(
     plt.close(fig)
 
     if use_wandb:
-        wandb.log({"eval/visualization": wandb.Image(save_path)})
+        wandb.log({"val/visualization": wandb.Image(save_path)}, step=epoch)
