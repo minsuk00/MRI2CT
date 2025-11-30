@@ -158,84 +158,155 @@ def get_target_label_mask(seg_volume, region_name):
     mask = np.isin(seg_volume, target_ids)
     return np.where(mask, seg_volume, 0) 
 
-def save_registration_vis(fixed_path, moving_path, warped_path, fseg_path, mseg_path, wseg_path, region_name, save_path):
+def save_registration_vis(fixed_path, moving_path, warped_path, fseg_path, mseg_path, wseg_path, disp_path, region_name, save_path):
     try:
+        # Load Data
         fix = nib.load(fixed_path).get_fdata()
         mov = nib.load(moving_path).get_fdata()
         wrp = nib.load(warped_path).get_fdata()
+        
         fix_seg = nib.load(fseg_path).get_fdata().astype(np.int32)
         mov_seg = nib.load(mseg_path).get_fdata().astype(np.int32)
         wrp_seg = nib.load(wseg_path).get_fdata().astype(np.int32)
         
-        z = int(fix.shape[2] // 2)
-        fix_filt = get_target_label_mask(fix_seg, region_name)
-        mov_filt = get_target_label_mask(mov_seg, region_name)
-        wrp_filt = get_target_label_mask(wrp_seg, region_name)
+        disp = nib.load(disp_path).get_fdata()
 
-        def sl(vol, normalize=False):
+        # Select Middle Slice
+        z = int(fix.shape[2] // 2)
+
+        # Helper: Normalize and rotate
+        def get_sl(vol, normalize=False):
             s = np.rot90(vol[..., z])
             if normalize:
                 denom = s.max() - s.min()
                 if denom > 0: s = (s - s.min()) / denom
             return s
 
+        # Prepare Slices (Full Volume)
+        f_sl = get_sl(fix, True)
+        m_sl = get_sl(mov, True)
+        w_sl = get_sl(wrp, True)
+
+        fs_sl = get_sl(fix_seg)
+        ms_sl = get_sl(mov_seg)
+        ws_sl = get_sl(wrp_seg)
+
+        # Prepare Slices (Target Regions Only)
+        # Note: Relies on get_target_label_mask being available in global scope
+        fix_filt = get_target_label_mask(fix_seg, region_name)
+        mov_filt = get_target_label_mask(mov_seg, region_name)
+        wrp_filt = get_target_label_mask(wrp_seg, region_name)
+
+        fs_filt_sl = get_sl(fix_filt)
+        ms_filt_sl = get_sl(mov_filt)
+        ws_filt_sl = get_sl(wrp_filt)
+
+        # Calculate Displacement Magnitude
+        # Check dims: if 5D (x,y,z,1,3) squeeze, if 4D (x,y,z,3) use as is
+        if disp.ndim == 5: disp = disp.squeeze() 
+        # Assuming channels are last (x, y, z, 3). If channels are first, use axis=0
+        axis_ch = -1 if disp.shape[-1] == 3 else 0
+        disp_mag_vol = np.linalg.norm(disp, axis=axis_ch)
+        d_sl = get_sl(disp_mag_vol)
+
+        # Colormaps
         max_label = max(fix_seg.max(), mov_seg.max(), wrp_seg.max())
         seg_cmap = create_random_colormap(int(max_label))
         red_cmap = create_binary_colormap('red')
         green_cmap = create_binary_colormap('green')
+        mag_cmap = 'jet'
 
-        fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+        # Plotting Setup (4 Rows x 4 Cols)
+        fig, axes = plt.subplots(4, 4, figsize=(20, 20))
         plt.subplots_adjust(hspace=0.3, wspace=0.1)
-        
-        # Row 1: Intensity
-        axes[0,0].imshow(sl(fix, True), cmap='gray',vmin=0,vmax=1)
+
+        # --- ROW 1: Intensity Inputs & Result ---
+        axes[0,0].imshow(f_sl, cmap='gray', vmin=0, vmax=1)
         axes[0,0].set_title("Fixed (CT)")
-        axes[0,1].imshow(sl(mov, True), cmap='gray',vmin=0,vmax=1)
+        
+        axes[0,1].imshow(m_sl, cmap='gray', vmin=0, vmax=1)
         axes[0,1].set_title("Moving (MRI)")
-        axes[0,2].imshow(sl(wrp, True), cmap='gray',vmin=0,vmax=1)
-        axes[0,2].set_title("Warped MRI")
         
-        rgb = np.zeros((*sl(fix).shape, 3))
-        rgb[..., 0] = sl(fix, True)
-        rgb[..., 1] = sl(wrp, True)
-        axes[0,3].imshow(rgb); axes[0,3].set_title("Overlay (R=CT, G=Warp)")
+        axes[0,2].imshow(w_sl, cmap='gray', vmin=0, vmax=1)
+        axes[0,2].set_title("Warped (Reg. MRI)")
 
-        # Row 2: All Labels
-        axes[1,0].imshow(sl(fix_seg), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
-        axes[1,0].set_title("Fixed Seg (All)")
-        axes[1,1].imshow(sl(mov_seg), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
-        axes[1,1].set_title("Moving Seg (All)")
-        axes[1,2].imshow(sl(wrp_seg), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
-        axes[1,2].set_title("Warped Seg (All)")
+        axes[0,3].axis('off') # EMPTY
+
+        # --- ROW 2: Overlays & Displacement ---
+        # Pre-Registration Overlay
+        rgb_pre = np.zeros((*f_sl.shape, 3))
+        rgb_pre[..., 0] = f_sl # R = CT
+        rgb_pre[..., 1] = m_sl # G = Moving
+        axes[1,0].imshow(rgb_pre)
+        axes[1,0].set_title("Pre-Reg (R=CT, G=MR)")
+
+        # Post-Registration Overlay
+        rgb_post = np.zeros((*f_sl.shape, 3))
+        rgb_post[..., 0] = f_sl # R = CT
+        rgb_post[..., 1] = w_sl # G = Warped
+        axes[1,1].imshow(rgb_post)
+        axes[1,1].set_title("Post-Reg (R=CT, G=Warped MR)")
+
+        # Displacement with Colorbar
+        im_d = axes[1,2].imshow(d_sl, cmap=mag_cmap)
+        axes[1,2].set_title("Disp. Magnitude")
+        cbar = plt.colorbar(im_d, ax=axes[1,2], fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=8)
+
+        axes[1,3].axis('off') # EMPTY
+
+        # --- ROW 3: Segmentation (ALL) ---
+        axes[2,0].imshow(fs_sl, cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[2,0].set_title("Fixed Seg (All)")
+
+        axes[2,1].imshow(ms_sl, cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[2,1].set_title("Moving Seg (All)")
+
+        axes[2,2].imshow(ws_sl, cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[2,2].set_title("Warped Seg (All)")
+
+        # Mask Overlay
+        f_bin = (fs_sl > 0).astype(int)
+        w_bin = (ws_sl > 0).astype(int)
         
-        # Binary Overlay
-        f_bin = (sl(fix_seg) > 0).astype(int)
-        w_bin = (sl(wrp_seg) > 0).astype(int)
-        axes[1,3].imshow(f_bin, cmap=red_cmap, interpolation='nearest', vmin=0, vmax=1)
-        axes[1,3].imshow(w_bin, cmap=green_cmap, interpolation='nearest', vmin=0, vmax=1)
-        axes[1,3].set_title("Overlay: R=Fixed CT, G=Warped MR")
+        axes[2,3].imshow(f_sl, cmap='gray', alpha=0.5) 
+        axes[2,3].imshow(f_bin, cmap=red_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[2,3].imshow(w_bin, cmap=green_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[2,3].set_title("All Seg Overlap (R=Fix, G=Warped MR)")
 
-        # Row 3: Targets
-        axes[2,0].imshow(sl(fix_filt), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
-        axes[2,0].set_title("Fixed Seg (Targets)")
-        axes[2,1].imshow(sl(mov_filt), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
-        axes[2,1].set_title("Moving Seg (Targets)")
-        axes[2,2].imshow(sl(wrp_filt), cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
-        axes[2,2].set_title("Warped Seg (Targets)")
-        
-        f_filt_bin = (sl(fix_filt) > 0).astype(int)
-        w_filt_bin = (sl(wrp_filt) > 0).astype(int)
-        axes[2,3].imshow(f_filt_bin, cmap=red_cmap, interpolation='nearest', vmin=0, vmax=1)
-        axes[2,3].imshow(w_filt_bin, cmap=green_cmap, interpolation='nearest', vmin=0, vmax=1)
-        axes[2,3].set_title("Overlay: R=Fixed CT, G=Warped MR")
+        # --- ROW 4: Target Regions (FILTERED) ---
+        axes[3,0].imshow(fs_filt_sl, cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[3,0].set_title("Fixed Seg (Targets)")
 
-        for ax in axes.flatten(): ax.axis('off')
-        plt.tight_layout()
+        axes[3,1].imshow(ms_filt_sl, cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[3,1].set_title("Moving Seg (Targets)")
+
+        axes[3,2].imshow(ws_filt_sl, cmap=seg_cmap, interpolation='nearest', vmin=0, vmax=max_label)
+        axes[3,2].set_title("Warped Seg (Targets)")
+
+        # Target Mask Overlay
+        f_filt_bin = (fs_filt_sl > 0).astype(int)
+        w_filt_bin = (ws_filt_sl > 0).astype(int)
+
+        axes[3,3].imshow(f_sl, cmap='gray', alpha=0.5)
+        axes[3,3].imshow(f_filt_bin, cmap=red_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[3,3].imshow(w_filt_bin, cmap=green_cmap, interpolation='nearest', vmin=0, vmax=1)
+        axes[3,3].set_title("Target Overlap (R=Fix, G=Warped MR)")
+
+        # Cleanup axes
+        for r in range(4):
+            for c in range(4):
+                if not (r==1 and c==2): # Don't turn off axis for Disp (colorbar needs it sometimes)
+                   axes[r,c].axis('off')
+                else:
+                   axes[r,c].set_xticks([])
+                   axes[r,c].set_yticks([])
+
         plt.savefig(save_path)
         plt.close(fig)
     except Exception as e:
         print(f"⚠️ Visualization failed: {e}")
-
+        
 def compute_dice_region(gt, pred, region_name):
     target_map = REGION_MAPS.get(region_name)
     if not target_map:
@@ -296,6 +367,13 @@ def run_batch_pipeline():
         # Local output directory per subject
         result_dir = os.path.join(subj_dir, "registration_output")
         os.makedirs(result_dir, exist_ok=True)
+
+        # # If both the moved image and segmentation exist, skip this subject
+        # final_img_path = os.path.join(result_dir, "moved_mr.nii.gz")
+        # final_seg_path = os.path.join(result_dir, "labels_moved.nii.gz")
+        # if os.path.exists(final_img_path) and os.path.exists(final_seg_path):
+        #     Optional: tqmd.write(f"Skipping {subj_id} (Already done)")
+        #     continue
 
         # --- A. Load & Preprocess ---
         raw_files = {
@@ -390,7 +468,7 @@ def run_batch_pipeline():
             vis_path = os.path.join(result_dir, "registration_qc.png")
             save_registration_vis(
                 raw_files['fixed'], raw_files['moving'], final_img_path,
-                raw_files['fixed_seg'], raw_files['moving_seg'], final_seg_path,
+                raw_files['fixed_seg'], raw_files['moving_seg'], final_seg_path, final_disp_path,
                 region, vis_path
             )
 

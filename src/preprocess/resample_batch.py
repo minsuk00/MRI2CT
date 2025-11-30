@@ -6,12 +6,13 @@ import SimpleITK as sitk
 from tqdm import tqdm
 
 INPUT_DIR = "/scratch/jjparkcv_root/jjparkcv98/minsukc/SynthRAD2025/Task1"
-# OUTPUT_DIR = "/home/minsukc/MRI2CT/data"
-OUTPUT_DIR = "/scratch/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/data"
+OUTPUT_DIR = "/home/minsukc/MRI2CT/data"
+# OUTPUT_DIR = "/scratch/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/data"
 
 # Number of volumes to process PER REGION. Set to None to process all.
 # NUM_VOLUMES = None  # e.g., 5 or None
-NUM_VOLUMES = 10
+# NUM_VOLUMES = 10
+NUM_VOLUMES = 35
 
 # Target spacing in x y z (mm)
 TARGET_SPACING = [3.0, 3.0, 3.0]
@@ -66,10 +67,17 @@ def main():
             out_patient_dir = os.path.join(OUTPUT_DIR, f"{patient_id}_{spacing_str}_resampled")
             os.makedirs(out_patient_dir, exist_ok=True)
 
+            out_mr_path = os.path.join(out_patient_dir, "mr_resampled.nii.gz")
+            out_ct_path = os.path.join(out_patient_dir, "ct_resampled.nii.gz")
+            # Skip if both main files already exist
+            if os.path.exists(out_mr_path) and os.path.exists(out_ct_path):
+                print(f"Skipping {patient_id} (already done)") # Optional log
+                continue
+
             # --- Resample ---
             # Returns (original_array, resampled_array)
-            mr_orig, mr_res = resample_volume(mr_path, os.path.join(out_patient_dir, "mr_resampled.nii.gz"), TARGET_SPACING)
-            ct_orig, ct_res = resample_volume(ct_path, os.path.join(out_patient_dir, "ct_resampled.nii.gz"), TARGET_SPACING)
+            mr_orig, mr_res = resample_volume(mr_path, out_mr_path, TARGET_SPACING)
+            ct_orig, ct_res = resample_volume(ct_path, out_ct_path, TARGET_SPACING)
             
             mask_orig, mask_res = None, None
             if os.path.exists(mask_path):

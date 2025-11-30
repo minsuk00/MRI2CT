@@ -15,9 +15,9 @@ ROOT = "/home/minsukc/MRI2CT"
 DATA_DIR = os.path.join(ROOT, "data")
 
 # OPTION A: Define specific folders to process (leave None to process ALL)
-# TARGET_LIST = None 
+TARGET_LIST = None 
 # TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled"] 
-TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled","1ABA009_3.0x3.0x3.0_resampled","1ABA011_3.0x3.0x3.0_resampled","1ABA012_3.0x3.0x3.0_resampled","1ABA014_3.0x3.0x3.0_resampled","1ABA018_3.0x3.0x3.0_resampled","1ABA019_3.0x3.0x3.0_resampled","1ABA025_3.0x3.0x3.0_resampled","1ABA029_3.0x3.0x3.0_resampled","1ABA030_3.0x3.0x3.0_resampled","1HNA001_3.0x3.0x3.0_resampled","1HNA004_3.0x3.0x3.0_resampled","1HNA006_3.0x3.0x3.0_resampled","1HNA008_3.0x3.0x3.0_resampled","1HNA010_3.0x3.0x3.0_resampled","1HNA012_3.0x3.0x3.0_resampled","1HNA013_3.0x3.0x3.0_resampled","1HNA014_3.0x3.0x3.0_resampled","1HNA015_3.0x3.0x3.0_resampled","1HNA018_3.0x3.0x3.0_resampled","1THA001_3.0x3.0x3.0_resampled","1THA002_3.0x3.0x3.0_resampled","1THA003_3.0x3.0x3.0_resampled","1THA004_3.0x3.0x3.0_resampled","1THA005_3.0x3.0x3.0_resampled","1THA010_3.0x3.0x3.0_resampled","1THA011_3.0x3.0x3.0_resampled","1THA013_3.0x3.0x3.0_resampled","1THA015_3.0x3.0x3.0_resampled","1THA016_3.0x3.0x3.0_resampled"]
+# TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled","1ABA009_3.0x3.0x3.0_resampled","1ABA011_3.0x3.0x3.0_resampled","1ABA012_3.0x3.0x3.0_resampled","1ABA014_3.0x3.0x3.0_resampled","1ABA018_3.0x3.0x3.0_resampled","1ABA019_3.0x3.0x3.0_resampled","1ABA025_3.0x3.0x3.0_resampled","1ABA029_3.0x3.0x3.0_resampled","1ABA030_3.0x3.0x3.0_resampled","1HNA001_3.0x3.0x3.0_resampled","1HNA004_3.0x3.0x3.0_resampled","1HNA006_3.0x3.0x3.0_resampled","1HNA008_3.0x3.0x3.0_resampled","1HNA010_3.0x3.0x3.0_resampled","1HNA012_3.0x3.0x3.0_resampled","1HNA013_3.0x3.0x3.0_resampled","1HNA014_3.0x3.0x3.0_resampled","1HNA015_3.0x3.0x3.0_resampled","1HNA018_3.0x3.0x3.0_resampled","1THA001_3.0x3.0x3.0_resampled","1THA002_3.0x3.0x3.0_resampled","1THA003_3.0x3.0x3.0_resampled","1THA004_3.0x3.0x3.0_resampled","1THA005_3.0x3.0x3.0_resampled","1THA010_3.0x3.0x3.0_resampled","1THA011_3.0x3.0x3.0_resampled","1THA013_3.0x3.0x3.0_resampled","1THA015_3.0x3.0x3.0_resampled","1THA016_3.0x3.0x3.0_resampled"]
 
 
 # --- PERFORMANCE SETTINGS ---
@@ -181,9 +181,9 @@ def run_batch_segmentation():
 
         # --- CT Segmentation ---
         if os.path.exists(ct_out):
-            print("✅ CT Segmentation exists.")
+            tqdm.write("✅ CT Segmentation exists.")
         else:
-            print("🧠 Running CT Seg (Task: total)...")
+            tqdm.write("🧠 Running CT Seg (Task: total)...")
             try:
                 totalsegmentator(
                     input=subj['ct'], output=ct_out, ml=True, 
@@ -191,27 +191,27 @@ def run_batch_segmentation():
                 )
                 # quiet = True, preview = True, skip_saving = True
             except Exception as e:
-                print(f"💥 CT Seg Failed: {e}")
+                tqdm.write(f"💥 CT Seg Failed: {e}")
 
         # --- MR Segmentation ---
         if os.path.exists(mr_out):
-            print("✅ MR Segmentation exists.")
+            tqdm.write("✅ MR Segmentation exists.")
         else:
-            print("🧠 Running MR Seg (Task: total_mr)...")
+            tqdm.write("🧠 Running MR Seg (Task: total_mr)...")
             try:
                 totalsegmentator(
                     input=subj['mr'], output=mr_out, ml=True, 
                     task="total_mr", fastest=FAST_MODE, device=DEVICE, quiet = True
                 )
             except Exception as e:
-                print(f"💥 MR Seg Failed: {e}")
+                tqdm.write(f"💥 MR Seg Failed: {e}")
 
         # --- QA Visualization ---
         if os.path.exists(ct_out) and os.path.exists(mr_out):
             if not os.path.exists(qa_path):
                 save_qa_plot(subj['ct'], ct_out, subj['mr'], mr_out, qa_path)
         
-        print(f"✨ Subject done in {time.time() - start_time:.1f}s")
+        tqdm.write(f"✨ Subject done in {time.time() - start_time:.1f}s")
 
 if __name__ == "__main__":
     run_batch_segmentation()
