@@ -52,7 +52,7 @@ def load_image_pair(root, subj_id):
     print(f"Data Loaded | MRI: {mri.shape}, CT: {ct.shape}")
     return mri, ct, pad_vals
 
-def load_segmentation(root, subj_id, seg_filename="labels_moved_*.nii.gz", pad_vals=None):
+def load_segmentation(root, subj_id, seg_filename="labels_moved*.nii.gz", pad_vals=None):
     seg_path = glob.glob(os.path.join(root, subj_id, "registration_output", seg_filename))[0]
     
     if not os.path.exists(seg_path):
@@ -81,7 +81,7 @@ def one_hot_encode(seg, num_classes=None):
     return one_hot
 
 # --- Dataset & Loader ---
-class RandomPatchDataset(Dataset):
+class RandomPatchDataset_single(Dataset):
     def __init__(self, feats, target, patch_size=(96, 96, 96), samples_per_epoch=100):
         self.feats = feats
         self.target = target
@@ -108,37 +108,185 @@ class RandomPatchDataset(Dataset):
         
         return torch.from_numpy(f_patch).float(), torch.from_numpy(t_patch).unsqueeze(0).float()
 
-def get_dataloader(feats_mri, ct_target, args):
-    if args.model_type == "mlp":
-        print("Creating MLP Dataloader (Flattened voxels + Coords)...")
-        total_channels = feats_mri.shape[0]
-        feats_t = torch.from_numpy(feats_mri).permute(1, 2, 3, 0).reshape(-1, total_channels).float()
-        
-        D, H, W = ct_target.shape
-        z = torch.linspace(0, 1, D)
-        y = torch.linspace(0, 1, H)
-        x = torch.linspace(0, 1, W)
-        zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
-        coords_t = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3).float()
-        
-        target_t = torch.from_numpy(ct_target).reshape(-1, 1).float()
-        
-        ds = TensorDataset(feats_t, coords_t, target_t)
-        return DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+# ds = RandomPatchDataset_single(
+#     feats_mri, 
+#     ct_target, 
+#     patch_size=(args.patch_size, args.patch_size, args.patch_size), 
+#     samples_per_epoch=args.patches_per_epoch
+# )
+# return DataLoader(ds, batch_size=1, shuffle=True, num_workers=2, pin_memory=True)
 
-    elif args.model_type == "cnn":
-        print(f"Creating CNN Dataloader (Patch-based {args.patch_size}^3)...")
-        ds = RandomPatchDataset(
-            feats_mri, 
-            ct_target, 
-            patch_size=(args.patch_size, args.patch_size, args.patch_size), 
-            samples_per_epoch=args.patches_per_epoch
+# --- TorchIO Adapter ---
+class TioAdapter:
+    def __init__(self, loader):
+        self.loader = loader
+        self.dataset = self 
+    def __len__(self):
+        return len(self.loader)
+    def __iter__(self):
+        for batch in self.loader:
+            yield batch['input'][tio.DATA], batch['target'][tio.DATA]
+
+# --- Simple Stochastic Datasets ---
+class StochasticVoxelDataset(Dataset):
+    """
+    Optimized MLP Dataset.
+    Instead of 1 voxel per call, returns a CHUNK of voxels per call.
+    This reduces Python overhead by factor of `chunk_size`.
+    """
+    def __init__(self, data_list, dataset_len, chunk_size=4096):
+        self.subjects = []
+        self.weights = []
+        self.chunk_size = chunk_size
+        self.dataset_len = dataset_len # Virtual length (number of chunks to yield per epoch)
+        
+        for feats, target in data_list:
+            # feats: [C, D, H, W] -> Transpose to [D, H, W, C] for fast channel slicing
+            feats_t = np.transpose(feats, (1, 2, 3, 0))
+            self.subjects.append((feats_t, target))
+            self.weights.append(target.size)
+            
+        total_voxels = sum(self.weights)
+        self.probs = [w / total_voxels for w in self.weights]
+        
+    def __len__(self):
+        return self.dataset_len
+        
+    def __getitem__(self, idx):
+        # 1. Pick Subject
+        subj_idx = np.random.choice(len(self.subjects), p=self.probs)
+        feats, target = self.subjects[subj_idx]
+        
+        # 2. Pick 'chunk_size' Random Voxels at once (Vectorized)
+        D, H, W, C = feats.shape
+        
+        # Random coordinates
+        z = np.random.randint(0, D, size=self.chunk_size)
+        y = np.random.randint(0, H, size=self.chunk_size)
+        x = np.random.randint(0, W, size=self.chunk_size)
+        
+        # 3. Extract (NumPy advanced indexing is fast)
+        # feat_chunk: [chunk_size, C]
+        feat_chunk = feats[z, y, x] 
+        # targ_chunk: [chunk_size]
+        targ_chunk = target[z, y, x]
+        
+        # 4. Coords [0,1]
+        # Normalize and stack
+        z_n = z / (D - 1)
+        y_n = y / (H - 1)
+        x_n = x / (W - 1)
+        
+        # [chunk_size, 3]
+        coords_chunk = np.stack([x_n, y_n, z_n], axis=1).astype(np.float32)
+        
+        return (
+            torch.from_numpy(feat_chunk).float(),
+            torch.from_numpy(coords_chunk).float(),
+            torch.from_numpy(targ_chunk).unsqueeze(1).float() # [chunk, 1]
         )
-        return DataLoader(ds, batch_size=1, shuffle=True, num_workers=2, pin_memory=True)
-    
-    else:
-        raise ValueError(f"Unknown model type: {args.model_type}")
 
+def collate_flatten(batch):
+    """
+    Flattens a list of chunks into a single batch.
+    Input: List of (Chunk, C) tensors
+    Output: (Batch*Chunk, C) tensor
+    """
+    feats, coords, targs = zip(*batch)
+    
+    # Stack -> [Batch, Chunk, C] -> View -> [Batch*Chunk, C]
+    feats = torch.stack(feats).view(-1, feats[0].shape[-1])
+    coords = torch.stack(coords).view(-1, coords[0].shape[-1])
+    targs = torch.stack(targs).view(-1, targs[0].shape[-1])
+    
+    return feats, coords, targs
+        
+# --- Unified Dataloaders ---
+def get_dataloader_single(feats_mri, ct_target, args):
+    """Compatibility wrapper for single subject script"""
+    return get_dataloader_multi([(feats_mri, ct_target)], args)
+
+def get_dataloader_multi(data_list, args):
+    """
+    Args:
+        data_list: List of tuples [(feats_mri, ct_target), ...]
+    """
+    # 1. MLP LOADING (Stochastic)
+    if args.model_type == "mlp":
+        print(f"⚡ Creating MLP Dataloader (Vectorized Stochastic) for {len(data_list)} subjects...")
+        
+        # Optimization: Fetch 4096 points per __getitem__ call
+        chunk_size = 4096
+        # Adjust loader batch size to match target total batch size
+        # e.g., Target 131072 // 4096 = 32 batches per step
+        loader_batch_size = args.batch_size // chunk_size
+        # We want 500 update steps per epoch
+        dataset_len = args.steps_per_epoch * loader_batch_size
+        
+        ds = StochasticVoxelDataset(data_list, dataset_len=dataset_len, chunk_size=chunk_size)
+        
+        return DataLoader(
+            ds, 
+            batch_size=loader_batch_size, 
+            shuffle=True, 
+            num_workers=4, 
+            pin_memory=True,
+            collate_fn=collate_flatten # Flattens chunks into one big batch
+        )
+    # 2. CNN LOADING (TorchIO SubjectsDataset)
+    elif args.model_type == "cnn":
+        print(f"⚡ Creating CNN Dataloader for {len(data_list)} subjects...")
+        subjects = []
+        for feats, target in data_list:
+            # Auto-pad subjects smaller than patch_size
+            c, d, h, w = feats.shape
+            
+            p_d = max(0, args.patch_size - d)
+            p_h = max(0, args.patch_size - h)
+            p_w = max(0, args.patch_size - w)
+            
+            if p_d > 0 or p_h > 0 or p_w > 0:
+                pad_d1, pad_d2 = p_d // 2, p_d - p_d // 2
+                pad_h1, pad_h2 = p_h // 2, p_h - p_h // 2
+                pad_w1, pad_w2 = p_w // 2, p_w - p_w // 2
+                
+                # Pad (C, D, H, W) -> pad last 3 dims
+                feats = np.pad(feats, ((0,0), (pad_d1, pad_d2), (pad_h1, pad_h2), (pad_w1, pad_w2)), mode='constant') # pad with 0
+                target = np.pad(target, ((pad_d1, pad_d2), (pad_h1, pad_h2), (pad_w1, pad_w2)), mode='constant')
+                # print(f"   ⚠️ Auto-padded subject from {(d,h,w)} to {feats.shape[1:]}")
+
+            t_feats = torch.from_numpy(feats).float()
+            t_ct = torch.from_numpy(target).unsqueeze(0).float()
+            
+            # Recalculate prob_map on PADDED tensor so padding (0) counts as air
+            prob_map = (t_ct > 0.01).float()
+            
+            subjects.append(tio.Subject(
+                input=tio.ScalarImage(tensor=t_feats),
+                target=tio.ScalarImage(tensor=t_ct),
+                prob_map=tio.Image(tensor=prob_map)
+            ))
+            
+        dataset = tio.SubjectsDataset(subjects)
+        
+        # Queue parameters
+        patch_size = (args.patch_size, args.patch_size, args.patch_size)
+        sampler = tio.WeightedSampler(patch_size=patch_size, probability_map='prob_map')
+        
+        queue = tio.Queue(
+            subjects_dataset=dataset,
+            max_length=max(args.patches_per_epoch, 50),
+            samples_per_volume=args.patches_per_epoch,
+            sampler=sampler,
+            num_workers=0, # Faster for in-memory
+            shuffle_subjects=True,
+            shuffle_patches=True,
+        )
+        
+        loader = DataLoader(queue, batch_size=1, num_workers=0, pin_memory=False)
+        return TioAdapter(loader)
+
+    
 # --- Loss & Metrics ---
 def unpad_np(arr, pad_vals):
     pad_D, pad_H, pad_W = pad_vals

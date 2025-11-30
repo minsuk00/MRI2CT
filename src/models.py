@@ -87,3 +87,45 @@ class CNNTranslator(nn.Module):
         x = self.net(x)
         # return x
         return torch.clamp(x, 0, 1)
+
+
+class CNNTranslator(nn.Module):
+    def __init__(self, in_channels=16, hidden_channels=32, depth=3, final_activation="relu_clamp"):
+        """
+        Args:
+            in_channels (int): Input feature dimension.
+            hidden_channels (int): Number of filters in hidden layers.
+            depth (int): Total number of Conv3d layers.
+            final_activation (str): "sigmoid", "relu_clamp", or "none".
+        """
+        super().__init__()
+        self.final_activation = final_activation
+        
+        layers = []
+        
+        # --- 1. First Layer (Input -> Hidden) ---
+        layers.append(nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1))
+        layers.append(nn.ReLU(inplace=True))
+        
+        # --- 2. Middle Layers (Hidden -> Hidden) ---
+        # We add (depth - 2) middle layers because first and last are handled separately
+        for _ in range(depth - 2):
+            layers.append(nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=1))
+            layers.append(nn.ReLU(inplace=True))
+            
+        # --- 3. Last Layer (Hidden -> 1) ---
+        layers.append(nn.Conv3d(hidden_channels, 1, kernel_size=3, padding=1))
+        
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.net(x)
+        
+        if self.final_activation == "sigmoid":
+            return torch.sigmoid(x)
+        elif self.final_activation == "relu_clamp":
+            return torch.clamp(torch.relu(x), 0, 1)
+        elif self.final_activation == "none":
+            return x
+        else:
+            raise ValueError(f"Unknown activation: {self.final_activation}")

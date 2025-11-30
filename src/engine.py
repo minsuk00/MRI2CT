@@ -91,5 +91,7 @@ def evaluate(model, feats_mri, ct, device, model_type, pad_vals):
     pred_ct_tensor_unpad = unpad_torch(pred_ct_tensor, pad_vals)
     ct_tensor_unpad = unpad_torch(ct_tensor, pad_vals)
     metrics = compute_metrics(pred_ct_tensor_unpad, ct_tensor_unpad)
-    pred_ct_numpy_unpad = pred_ct_tensor_unpad.squeeze().cpu().numpy()
-    return metrics, pred_ct_numpy_unpad
+    # pred_ct_numpy_unpad = pred_ct_tensor_unpad.squeeze().cpu().numpy()
+    # return metrics, pred_ct_numpy_unpad
+    pred_ct_tensor = pred_ct_tensor.squeeze().cpu().numpy()
+    return metrics, pred_ct_tensor

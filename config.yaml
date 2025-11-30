@@ -1,26 +1,38 @@
 # Training Basics
-epochs: 200
-val_interval: 40
-lr: 3.0e-4
-batch_size: 131072
+val_interval: 10
+# val_interval: 5
+# val_interval: 2
+lr: 3e-4
 seed: 42
-subject: "1ABA103_3x3x3_resampled"
+subject: "1ABA005_3.0x3.0x3.0_resampled" # for train_single
+# subjects: ["1ABA005_3.0x3.0x3.0_resampled", "1ABA005_3.0x3.0x3.0_resampled"] 
+subjects: null # for train_multi
 no_wandb: false
 
 # Model Configuration
 model_type: "cnn"      # Options: "mlp", "cnn"
+use_seg: false
+seg_name: "labels_moved.nii.gz"
+
+# MLP Config
+epochs_mlp: 200
+steps_per_epoch: 1000
+# steps_per_epoch: 500
+# steps_per_epoch: 100 # TODO: change
+batch_size: 131072
 no_fourier: false      # If true, disables Fourier features for MLP
 sigma: 10.0            # Fourier feature scale
 
-# Segmentation Input
-use_seg: true
-seg_name: "labels_moved_*.nii.gz"
-
-# CNN Specific
+# CNN Config
+epochs_cnn: 50
 patch_size: 96
-patches_per_epoch: 100
+patches_per_epoch: 50
+# patches_per_epoch: 30 # TODO: change
+cnn_depth: 3           # Total layers (Conv-ReLU blocks). Minimum 2.
+cnn_hidden: 32         # Number of filters in hidden layers
+final_activation: "relu_clamp"  # Options: "sigmoid", "relu_clamp", "none"
 
 # Loss Weights
-l1_w: 0.0
-l2_w: 1.0
-ssim_w: 0.0
+l1_w: 1.0
+l2_w: 0.0
+ssim_w: 1.0

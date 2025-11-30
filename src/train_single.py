@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 # Local imports
 from anatomix.model.network import Unet
-from utils import load_image_pair, cleanup_gpu, CompositeLoss, set_seed, load_segmentation, one_hot_encode, get_dataloader
+from utils import load_image_pair, cleanup_gpu, CompositeLoss, set_seed, load_segmentation, one_hot_encode, get_dataloader_single
 from models import MLPTranslator, CNNTranslator
 from vis import visualize_ct_feature_comparison
 from engine import train_one_epoch, evaluate
@@ -46,23 +46,39 @@ def parse_args():
     # CNN Config
     parser.add_argument("--patch_size", type=int, help="Cube size for CNN patch training")
     parser.add_argument("--patches_per_epoch", type=int, help="Number of patches per epoch")
-    
+    parser.add_argument("--cnn_depth", type=int, default=3, help="Number of layers in CNN")
+    parser.add_argument("--cnn_hidden", type=int, default=32, help="Hidden channels for CNN")
+    parser.add_argument("--final_activation", type=str, default="relu_clamp", 
+                        choices=["sigmoid", "relu_clamp", "none"],
+                        help="Final layer activation function")
     # Loss Weights
     parser.add_argument("--l1_w", type=float, help="L1 Loss Weight")
     parser.add_argument("--l2_w", type=float, help="MSE Loss Weight")
     parser.add_argument("--ssim_w", type=float, help="SSIM Loss Weight")
     
     # Load Config File
-    if os.path.exists(os.path.join(ROOT_DIR, "config.yaml"):
-        with open(temp_args.config, 'r') as f:
+    config_path = os.path.join(ROOT_DIR, "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
             config = yaml.safe_load(f)
-        # Set defaults in parser based on config
-        parser.set_defaults(**config)
+        parser.set_defaults(**config) # Set defaults in parser based on config
     else:
         raise FileNotFoundError("Config file not found.")
-    # Parse Args again (CLI overrides Config)
+    # Parse Args (CLI overrides Config)
     args = parser.parse_args()
 
+    if args.epochs is not None:
+        print(f"⚙️ Epochs set via CLI override: {args.epochs}")
+    elif args.model_type == "mlp":
+        args.epochs = args.epochs_mlp
+        print(f"⚙️ Epochs set via Config (MLP): {args.epochs}")
+    elif args.model_type == "cnn":
+        args.epochs = args.epochs_cnn
+        print(f"⚙️ Epochs set via Config (CNN): {args.epochs}")
+    else:
+        args.epochs = 200
+        print(f"⚠️ Epochs defaulted: {args.epochs}")
+        
     return args
     
 def main():
@@ -75,7 +91,9 @@ def main():
     
     use_wandb = not args.no_wandb
     if use_wandb:
-        wandb.init(project="mri2ct", name=f"{args.model_type}_{args.subject}", config=vars(args))
+        run = wandb.init(project="mri2ct", name=f"{args.model_type}_{args.subject}", config=vars(args))
+        print(f"__WANDB_URL__:{run.get_url()}")
+        print(f"__WANDB_ID__:{run.id}")
     
     # --- 1. Load Data (Raw) ---
     mri, ct, pad_vals = load_image_pair(DATA_DIR, args.subject)
@@ -102,7 +120,7 @@ def main():
         print(f"Combined Feature Shape: {feats_mri.shape}")
     cleanup_gpu()
 
-    loader = get_dataloader(feats_mri, ct, args)
+    loader = get_dataloader_single(feats_mri, ct, args)
     total_channels = feats_mri.shape[0]
 
     if args.model_type == "mlp":
@@ -112,8 +130,14 @@ def main():
             fourier_scale=args.sigma
         ).to(device)
     elif args.model_type == "cnn":
-        model = CNNTranslator(in_channels=total_channels).to(device)
-
+        print(f"Building CNN: Depth={args.cnn_depth}, Hidden={args.cnn_hidden}, Act={args.final_activation}")
+        model = CNNTranslator(
+            in_channels=total_channels,
+            hidden_channels=args.cnn_hidden,
+            depth=args.cnn_depth,
+            final_activation=args.final_activation
+        ).to(device)
+    
     # --- 4. Optimizer & Loss ---
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = CompositeLoss(weights={
@@ -123,6 +147,30 @@ def main():
     }).to(device)
     scaler = torch.amp.GradScaler()
 
+    def run_validation(epoch_idx, current_loss):
+        try:
+            (mae, psnr, ssim), pred_ct = evaluate(model, feats_mri, ct, device, args.model_type, pad_vals=pad_vals)
+            
+            print(f"Epoch {epoch_idx:03d} | Loss: {current_loss:.5f} | MAE: {mae:.4f} | PSNR: {psnr:.2f} | SSIM: {ssim:.4f}")
+            
+            if use_wandb: 
+                # wandb.log({"epoch": epoch_idx, "val/mae": mae, "val/psnr": psnr, "val/ssim": ssim}, step=epoch_idx)
+                wandb.log({"val/mae": mae, "val/psnr": psnr, "val/ssim": ssim}, step=epoch_idx)
+            
+            visualize_ct_feature_comparison(
+                pred_ct, ct, mri, feat_extractor, args.subject, 
+                ROOT_DIR, epoch=epoch_idx, use_wandb=use_wandb
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"⚠️ OOM during Validation at epoch {epoch_idx}. Skipping visualization.")
+                cleanup_gpu()
+            else:
+                raise e
+    # --- Pre-Training Evaluation (Epoch 0) ---
+    print("🎨 Running initial visualization (Epoch 0)...")
+    run_validation(0, 0.0)
+    
     # --- 5. Training Loop ---
     start_time = time.time()
     epoch_iter = tqdm(range(1, args.epochs + 1), desc="Epochs", leave=True, dynamic_ncols=True)
@@ -131,32 +179,15 @@ def main():
         epoch_iter.set_postfix({"train_loss": f"{loss:.5f}"})
         
         if use_wandb: 
-            log_data = {"epoch": epoch, "loss/total": loss}
+            # log_data = {"epoch": epoch, "loss/total": loss}
+            log_data = {"loss/total": loss}
             for k, v in loss_comps.items():
                 clean_k = k.replace("loss_", "loss/")
                 log_data[clean_k] = v
-            wandb.log(log_data)
+            wandb.log(log_data, step=epoch)
 
         if ((epoch - 1) % args.val_interval == 0) or (epoch == args.epochs):
-            # Run Evaluation
-            try:
-                (mae, psnr, ssim), pred_ct = evaluate(model, feats_mri, ct, device, args.model_type, pad_vals=pad_vals)
-                
-                print(f"Epoch {epoch:03d} | Loss: {loss:.5f} | MAE: {mae:.4f} | PSNR: {psnr:.2f} | SSIM: {ssim:.4f}")
-                
-                if use_wandb: 
-                    wandb.log({"epoch": epoch, "eval/mae": mae, "eval/psnr": psnr, "eval/ssim": ssim})
-                
-                visualize_ct_feature_comparison(
-                    pred_ct, ct, mri, feat_extractor, args.subject, 
-                    ROOT_DIR, epoch=epoch, use_wandb=use_wandb
-                )
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"⚠️ OOM during Validation at epoch {epoch}. Skipping visualization.")
-                    cleanup_gpu()
-                else:
-                    raise e
+            run_validation(epoch,loss)
 
     # --- 6. Finish ---
     save_path = os.path.join(ROOT_DIR, "results", "models", f"model_{datetime.now():%Y%m%d_%H%M}.pt")
