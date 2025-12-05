@@ -1,3 +1,4 @@
 [submodule "anatomix"]
 	path = anatomix
 	url = https://github.com/neel-dey/anatomix.git
+	ignore = dirty
