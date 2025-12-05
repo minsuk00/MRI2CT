@@ -61,24 +61,24 @@ def parse_args():
     # Model
     parser.add_argument("-M", "--model_type", type=str, choices=["mlp", "cnn"])
     parser.add_argument("--no_fourier", action="store_true")
-    parser.add_argument("--sigma", type=float, default=10.0)
-    
-    # Seg
+    parser.add_argument("--sigma", type=float)
+    parser.add_argument("--steps_per_epoch", type=int)
     parser.add_argument("--use_seg", action="store_true")
     parser.add_argument("--seg_name", type=str, default="labels_moved.nii.gz")
-    parser.add_argument("--seg_classes", type=int, default=60)
+    parser.add_argument("--seg_classes", type=int, default=51)
+    parser.add_argument("--dropout", type=float)
 
     # CNN
-    parser.add_argument("--patch_size", type=int, default=96)
-    parser.add_argument("--patches_per_epoch", type=int, default=100)
-    parser.add_argument("--cnn_depth", type=int, default=3)
-    parser.add_argument("--cnn_hidden", type=int, default=32)
-    parser.add_argument("--final_activation", type=str, default="relu_clamp")
+    parser.add_argument("--patch_size", type=int)
+    parser.add_argument("--samples_per_volume", type=int)
+    parser.add_argument("--cnn_depth", type=int)
+    parser.add_argument("--cnn_hidden", type=int)
+    parser.add_argument("--final_activation", type=str)
 
     # Loss
-    parser.add_argument("--l1_w", type=float, default=1.0)
-    parser.add_argument("--l2_w", type=float, default=1.0)
-    parser.add_argument("--ssim_w", type=float, default=0.1)
+    parser.add_argument("--l1_w", type=float)
+    parser.add_argument("--l2_w", type=float)
+    parser.add_argument("--ssim_w", type=float)
     
     # Parse initial args to get config path
     temp_args, _ = parser.parse_known_args()
@@ -196,7 +196,8 @@ def main():
         model = MLPTranslator(
             in_feat_dim=total_channels, 
             use_fourier=not args.no_fourier, 
-            fourier_scale=args.sigma
+            fourier_scale=args.sigma,
+            dropout=args.dropout,
         ).to(device)
     else:
         print(f"Building CNN: Depth={args.cnn_depth}, Hidden={args.cnn_hidden}, Act={args.final_activation}")
@@ -204,7 +205,8 @@ def main():
             in_channels=total_channels, 
             hidden_channels=args.cnn_hidden, 
             depth=args.cnn_depth, 
-            final_activation=args.final_activation
+            final_activation=args.final_activation,
+            dropout=args.dropout,
         ).to(device)
 
     # 6. Optimizer & Loss
@@ -216,6 +218,14 @@ def main():
     }).to(device)
     scaler = torch.amp.GradScaler()
 
+    if args.model_type == "mlp":
+        # MLP: defined explicitly by args
+        epoch_step_inc = args.steps_per_epoch
+    else:
+        # CNN: (steps_per_epoch per subject * Num subjs) / Batch Size
+        total_patches = args.steps_per_epoch * len(train_subjects)
+        epoch_step_inc = total_patches // args.batch_size
+        
     # --- Validation Function ---
     def run_validation(epoch_idx, current_loss):
         """Runs evaluation on ALL validation subjects."""
@@ -223,7 +233,9 @@ def main():
         val_metrics = {'mae': [], 'psnr': [], 'ssim': []}
         
         # We define a helper to handle visualization for just the first val subject
-        viz_done = False 
+        # viz_done = False 
+        viz_count = 0 
+        viz_limit = 3
 
         for v_data in val_meta_list:
             try:
@@ -237,14 +249,22 @@ def main():
                 val_metrics['ssim'].append(ssim)
                 
                 # Visualize the FIRST validation subject
-                if not viz_done:
-                    print(f"   🔎 Val ({v_data['id']}): MAE={mae:.4f}, PSNR={psnr:.2f}")
+                # if not viz_done:
+                #     print(f"   🔎 Val ({v_data['id']}): MAE={mae:.4f}, PSNR={psnr:.2f}")
+                #     if use_wandb:
+                #         visualize_ct_feature_comparison(
+                #             pred_ct_padded, v_data['ct'], v_data['mri'], feat_extractor, 
+                #             v_data['id'], ROOT_DIR, epoch=epoch_idx, use_wandb=True
+                #         )
+                #     viz_done = True
+                if viz_count < viz_limit:
+                    print(f"   🔎 Val Viz [{viz_count+1}/{viz_limit}] ({v_data['id']}): MAE={mae:.4f}, PSNR={psnr:.2f}")
                     if use_wandb:
                         visualize_ct_feature_comparison(
                             pred_ct_padded, v_data['ct'], v_data['mri'], feat_extractor, 
-                            v_data['id'], ROOT_DIR, epoch=epoch_idx, use_wandb=True
+                            v_data['id'], ROOT_DIR, epoch=epoch_idx, use_wandb=True, idx = viz_count+1
                         )
-                    viz_done = True
+                    viz_count += 1
                     
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -280,10 +300,11 @@ def main():
     for epoch in epoch_iter:
         loss, loss_comps = train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, args.model_type)
         epoch_iter.set_postfix({"train_loss": f"{loss:.5f}"})
-        
+
+        current_steps = epoch * epoch_step_inc
         if use_wandb:
             # log = {"epoch": epoch, "loss/total": loss}
-            log = {"loss/total": loss}
+            log = {"loss/total": loss, "info/steps": current_steps}
             for k, v in loss_comps.items(): log[k.replace("loss_", "loss/")] = v
             wandb.log(log, step=epoch)
 

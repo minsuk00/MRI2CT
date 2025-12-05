@@ -7,30 +7,49 @@ import re
 from tqdm import tqdm
 import numpy as np
 
+csv_file = "experiment_results.csv"
+# csv_file = "experiment_results_E200.csv"
+
 # --- 1. Define Hyperparameters ---
 subject = "1ABA005_3.0x3.0x3.0_resampled"
 epochs = 50
+# epochs = 200
 # epochs = 1
 
 # Common Settings
-use_segs = [True, False]
+# use_segs = [True, False]
+use_segs = [True]
 
 # Loss Combinations
 loss_configs = [
-    {"l1": 1.0, "l2": 0.0, "ssim": 0.0, "name": "L1_Only"},
+    # {"l1": 1.0, "l2": 0.0, "ssim": 0.0, "name": "L1_Only"},
     # {"l1": 0.0, "l2": 1.0, "ssim": 0.0, "name": "L2_Only"},
-    # {"l1": 1.0, "l2": 0.0, "ssim": 1.0, "name": "L1_SSIM_1.0"},
-    {"l1": 1.0, "l2": 0.0, "ssim": 0.1, "name": "L1_SSIM_0.1"},
+    # {"l1": 1.0, "l2": 1.0, "ssim": 0.0, "name": "L1_L2"},
+    # {"l1": 0.0, "l2": 0.0, "ssim": 1.0, "name": "SSIM_1.0"},
+    {"l1": 1.0, "l2": 0.0, "ssim": 1.0, "name": "L1_SSIM_1.0"},
+    # {"l1": 0.0, "l2": 1.0, "ssim": 1.0, "name": "L2_SSIM_1.0"},
+    # {"l1": 1.0, "l2": 0.0, "ssim": 10.0, "name": "L1_SSIM_10.0"},
+    # {"l1": 1.0, "l2": 0.0, "ssim": 0.1, "name": "L1_SSIM_0.1"},
+    # {"l1": 1.0, "l2": 1.0, "ssim": 0.1, "name": "L1_L2_SSIM_0.1"},
 ]
 
 # MLP Specifics
-fourier_options = [True, False]
-sigmas = [1.0, 10.0, 20.0]
+# fourier_options = [True, False]
+fourier_options = [True]
+# sigmas = [1.0, 10.0, 20.0]
+# sigmas = [5.0, 7.5, 10.0, 12.5]
+sigmas = [2.5, 5.0, 10.0]
+# sigmas = [5.0]
 
 # CNN Specifics
-cnn_depths = [3, 5]
-cnn_hiddens = [32, 64]
-cnn_activations = ["relu_clamp", "sigmoid", "none"]
+# cnn_depths = [3, 5]
+# cnn_depths = [5]
+cnn_depths = [5, 7, 9]
+# cnn_hiddens = [32, 64]
+# cnn_hiddens = [64]
+cnn_hiddens = [64, 128]
+# cnn_activations = ["relu_clamp", "sigmoid", "none"]
+cnn_activations = ["sigmoid"]
 
 # --- 2. Generate Valid Experiments Lists ---
 experiments = []
@@ -64,7 +83,6 @@ for loss_conf, seg, depth, hidden, act in cnn_combos:
 print(f"✅ Generated {len(experiments)} total valid experiments.")
 
 # --- 3. Setup Logging ---
-csv_file = "experiment_results.csv"
 # Added SSIM and PSNR columns
 fieldnames = ["timestamp", "model", "loss_name", "seg", "fourier", "sigma", 
               "cnn_depth", "cnn_hidden", "activation", 

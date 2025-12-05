@@ -1,6 +1,6 @@
 # Training Basics
-val_interval: 10
-# val_interval: 5
+# val_interval: 10
+val_interval: 5
 # val_interval: 2
 lr: 3e-4
 seed: 42
@@ -13,24 +13,28 @@ no_wandb: false
 model_type: "cnn"      # Options: "mlp", "cnn"
 use_seg: false
 seg_name: "labels_moved.nii.gz"
+dropout: 0.2
+# dropout: 0.0
 
 # MLP Config
-epochs_mlp: 200
+epochs_mlp: 500
 steps_per_epoch: 1000
 # steps_per_epoch: 500
 # steps_per_epoch: 100 # TODO: change
 batch_size: 131072
 no_fourier: false      # If true, disables Fourier features for MLP
-sigma: 10.0            # Fourier feature scale
+sigma: 5.0            # Fourier feature scale
 
 # CNN Config
-epochs_cnn: 50
+epochs_cnn: 200
 patch_size: 96
-patches_per_epoch: 50
-# patches_per_epoch: 30 # TODO: change
-cnn_depth: 3           # Total layers (Conv-ReLU blocks). Minimum 2.
-cnn_hidden: 32         # Number of filters in hidden layers
-final_activation: "relu_clamp"  # Options: "sigmoid", "relu_clamp", "none"
+# samples_per_volume: 50
+samples_per_volume: 10
+# samples_per_volume: 30 # TODO: change
+cnn_depth: 9           # Total layers (Conv-ReLU blocks). Minimum 2.
+# cnn_hidden: 32         # Number of filters in hidden layers
+cnn_hidden: 128         # Number of filters in hidden layers
+final_activation: "sigmoid"  # Options: "sigmoid", "relu_clamp", "none"
 
 # Loss Weights
 l1_w: 1.0

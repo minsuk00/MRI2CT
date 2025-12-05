@@ -41,13 +41,14 @@ def parse_args():
     parser.add_argument("--no_fourier", action="store_true", help="Disable Fourier positional encodings for MLP")
     parser.add_argument("--sigma", type=float, help="Scale (std dev) for Random Fourier Features")
     parser.add_argument("--use_seg", action="store_true", help="Use MRI segmentation mask as input")
-    parser.add_argument("--seg_name", type=str, default="labels_moved.nii.gz", help="Segmentation filename")
+    parser.add_argument("--seg_name", type=str, help="Segmentation filename")
+    parser.add_argument("--dropout", type=float)
 
     # CNN Config
     parser.add_argument("--patch_size", type=int, help="Cube size for CNN patch training")
-    parser.add_argument("--patches_per_epoch", type=int, help="Number of patches per epoch")
-    parser.add_argument("--cnn_depth", type=int, default=3, help="Number of layers in CNN")
-    parser.add_argument("--cnn_hidden", type=int, default=32, help="Hidden channels for CNN")
+    parser.add_argument("--samples_per_volume", type=int, help="Number of samples per volume")
+    parser.add_argument("--cnn_depth", type=int, help="Number of layers in CNN")
+    parser.add_argument("--cnn_hidden", type=int, help="Hidden channels for CNN")
     parser.add_argument("--final_activation", type=str, default="relu_clamp", 
                         choices=["sigmoid", "relu_clamp", "none"],
                         help="Final layer activation function")
@@ -127,7 +128,8 @@ def main():
         model = MLPTranslator(
             in_feat_dim=total_channels, 
             use_fourier=not args.no_fourier, 
-            fourier_scale=args.sigma
+            fourier_scale=args.sigma,
+            dropout=args.dropout,
         ).to(device)
     elif args.model_type == "cnn":
         print(f"Building CNN: Depth={args.cnn_depth}, Hidden={args.cnn_hidden}, Act={args.final_activation}")
@@ -135,7 +137,8 @@ def main():
             in_channels=total_channels,
             hidden_channels=args.cnn_hidden,
             depth=args.cnn_depth,
-            final_activation=args.final_activation
+            final_activation=args.final_activation,
+            dropout=args.dropout,
         ).to(device)
     
     # --- 4. Optimizer & Loss ---

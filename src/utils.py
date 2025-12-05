@@ -275,10 +275,11 @@ def get_dataloader_multi(data_list, args):
         
         queue = tio.Queue(
             subjects_dataset=dataset,
-            max_length=max(args.patches_per_epoch, 50),
-            samples_per_volume=args.patches_per_epoch,
+            max_length=max(args.samples_per_volume, 50),
+            # samples_per_volume=args.patches_per_epoch,
+            samples_per_volume=args.samples_per_volume,
             sampler=sampler,
-            num_workers=0, # Faster for in-memory
+            num_workers=1,
             shuffle_subjects=True,
             shuffle_patches=True,
         )

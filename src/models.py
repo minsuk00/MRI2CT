@@ -25,7 +25,7 @@ class FourierFeatureMapping(nn.Module):
 
 
 class MLPTranslator(nn.Module):
-    def __init__(self, in_feat_dim=16, use_fourier=True, fourier_scale=10.0, hidden=256, out_dim=1):
+    def __init__(self, in_feat_dim=16, use_fourier=True, fourier_scale=10.0, hidden=256, out_dim=1, dropout=0.0):
         super().__init__()
         self.use_fourier = use_fourier
         
@@ -42,10 +42,16 @@ class MLPTranslator(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(combined_dim, hidden),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+
             nn.Linear(hidden, hidden),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            
             nn.Linear(hidden, hidden),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            
             nn.Linear(hidden, out_dim),
             nn.Sigmoid(), # Output 0-1
         )
@@ -60,37 +66,7 @@ class MLPTranslator(nn.Module):
         return self.net(x)
 
 class CNNTranslator(nn.Module):
-    def __init__(self, in_channels=16):
-        super().__init__()
-        # self.net = nn.Sequential(
-        #     nn.Conv3d(in_channels, 32, kernel_size=3, padding=1),
-        #     nn.ReLU(inplace=True),
-        #     nn.Conv3d(32, 64, kernel_size=3, padding=1),
-        #     nn.ReLU(inplace=True),
-        #     nn.Conv3d(64, 32, kernel_size=3, padding=1),
-        #     nn.ReLU(inplace=True),
-        #     nn.Conv3d(32, 1, kernel_size=3, padding=1),
-        #     # nn.Sigmoid()
-        #     nn.ReLU(inplace=True) 
-        # )
-        
-        self.net = nn.Sequential(
-            nn.Conv3d(in_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(32, 1, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        x = self.net(x)
-        # return x
-        return torch.clamp(x, 0, 1)
-
-
-class CNNTranslator(nn.Module):
-    def __init__(self, in_channels=16, hidden_channels=32, depth=3, final_activation="relu_clamp"):
+    def __init__(self, in_channels=16, hidden_channels=32, depth=3, final_activation="relu_clamp", dropout=0.0):
         """
         Args:
             in_channels (int): Input feature dimension.
@@ -106,12 +82,16 @@ class CNNTranslator(nn.Module):
         # --- 1. First Layer (Input -> Hidden) ---
         layers.append(nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1))
         layers.append(nn.ReLU(inplace=True))
+        if dropout > 0:
+            layers.append(nn.Dropout3d(p=dropout))
         
         # --- 2. Middle Layers (Hidden -> Hidden) ---
         # We add (depth - 2) middle layers because first and last are handled separately
         for _ in range(depth - 2):
             layers.append(nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=1))
             layers.append(nn.ReLU(inplace=True))
+            if dropout > 0:
+                layers.append(nn.Dropout3d(p=dropout))
             
         # --- 3. Last Layer (Hidden -> 1) ---
         layers.append(nn.Conv3d(hidden_channels, 1, kernel_size=3, padding=1))

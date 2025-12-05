@@ -11,3 +11,4 @@ tuning_outputs/
 results/
 data/
 *.pyc
+/anatomix/

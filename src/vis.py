@@ -9,7 +9,7 @@ import wandb
 @torch.no_grad()
 def visualize_ct_feature_comparison(
     pred_ct, gt_ct, gt_mri, model, subj_id, 
-    root_dir, epoch=None, use_wandb=False
+    root_dir, epoch=None, use_wandb=False, idx = 1
 ):
     device = next(model.parameters()).device
     
@@ -102,4 +102,4 @@ def visualize_ct_feature_comparison(
     plt.close(fig)
 
     if use_wandb:
-        wandb.log({"val/visualization": wandb.Image(save_path)}, step=epoch)
+        wandb.log({f"val/visualization_{idx}": wandb.Image(save_path)}, step=epoch)
