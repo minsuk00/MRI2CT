@@ -283,8 +283,10 @@ def get_dataloader_multi(data_list, args):
             shuffle_subjects=True,
             shuffle_patches=True,
         )
-        
-        loader = DataLoader(queue, batch_size=1, num_workers=0, pin_memory=False)
+
+        print(f"WORKING WITH CNN PATCH SIZE: {args.cnn_batch_size}")
+        loader = DataLoader(queue, batch_size=args.cnn_batch_size, num_workers=0, pin_memory=False)
+        # loader = DataLoader(queue, batch_size=1, num_workers=0, pin_memory=False)
         return TioAdapter(loader)
 
     

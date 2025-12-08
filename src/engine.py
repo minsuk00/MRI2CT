@@ -12,12 +12,12 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_typ
     # 1. List (e.g. single batch list) -> len(list)
     # 2. Has dataset (Standard DataLoader) -> len(dataset)
     # 3. Fallback (Custom/Iterable) -> len(loader)
-    if isinstance(loader, list):
-        dataset_size = len(loader)
-    elif hasattr(loader, 'dataset'):
-        dataset_size = len(loader.dataset)
-    else:
-        dataset_size = len(loader)
+    # if isinstance(loader, list):
+    #     dataset_size = len(loader)
+    # elif hasattr(loader, 'dataset'):
+    #     dataset_size = len(loader.dataset)
+    # else:
+    #     dataset_size = len(loader)
 
     for batch in tqdm(loader, leave=False):
         if model_type == "mlp":
@@ -42,13 +42,16 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_typ
         scaler.update()
         
         curr_batch_size = yb.size(0)
-        total_loss += loss.item() * curr_batch_size
+        # total_loss += loss.item() * curr_batch_size
+        total_loss += loss.item()
         
         for k, v in components.items():
             comp_accumulator[k] = comp_accumulator.get(k, 0.0) + (v * curr_batch_size)
 
-    avg_loss = total_loss / dataset_size
-    avg_components = {k: v / dataset_size for k, v in comp_accumulator.items()}
+    # avg_loss = total_loss / dataset_size
+    # avg_components = {k: v / dataset_size for k, v in comp_accumulator.items()}
+    avg_loss = total_loss / len(loader)
+    avg_components = {k: v / len(loader) for k, v in comp_accumulator.items()}
 
     return avg_loss, avg_components
 
