@@ -25,7 +25,7 @@ class FourierFeatureMapping(nn.Module):
 
 
 class MLPTranslator(nn.Module):
-    def __init__(self, in_feat_dim=16, use_fourier=True, fourier_scale=10.0, hidden=256, out_dim=1, dropout=0.0):
+    def __init__(self, in_feat_dim=16, use_fourier=True, fourier_scale=10.0, hidden_channels=256, depth=4, out_dim=1, dropout=0.0):
         super().__init__()
         self.use_fourier = use_fourier
         
@@ -37,24 +37,27 @@ class MLPTranslator(nn.Module):
             # Only use Anatomix features
             combined_dim = in_feat_dim
         
-        print(f"Combined feature dimension: {combined_dim}")
-        
-        self.net = nn.Sequential(
-            nn.Linear(combined_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
+        print(f"MLP Structure: In={combined_dim} -> [{hidden_channels} x {depth}] -> Out={out_dim} | Dropout: {dropout}")
 
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
+        layers = []
+        
+        # --- 1. Input Layer ---
+        layers.append(nn.Linear(combined_dim, hidden_channels))
+        layers.append(nn.ReLU(inplace=True))
+        if dropout > 0: layers.append(nn.Dropout(p=dropout))
+        
+        # --- 2. Hidden Layers ---
+        # depth - 2 because we manually add Input and Output layers
+        for _ in range(depth - 2):
+            layers.append(nn.Linear(hidden_channels, hidden_channels))
+            layers.append(nn.ReLU(inplace=True))
+            if dropout > 0: layers.append(nn.Dropout(p=dropout))
             
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            
-            nn.Linear(hidden, out_dim),
-            nn.Sigmoid(), # Output 0-1
-        )
+        # --- 3. Output Layer ---
+        layers.append(nn.Linear(hidden_channels, out_dim))
+        layers.append(nn.Sigmoid()) # Output 0-1
+        
+        self.net = nn.Sequential(*layers)
 
     def forward(self, feats, coords):
         if self.use_fourier:

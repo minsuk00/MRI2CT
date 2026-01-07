@@ -24,10 +24,57 @@ def cleanup_gpu():
     torch.cuda.ipc_collect()
 
 def minmax(arr, minclip=None, maxclip=None):
-    if not (minclip is None and maxclip is None):
-        arr = np.clip(arr, minclip, maxclip)
-    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-    return arr
+    """Handles both Numpy and Torch inputs."""
+    if torch.is_tensor(arr):
+        if minclip is not None and maxclip is not None:
+            arr = torch.clamp(arr, minclip, maxclip)
+        denom = arr.max() - arr.min()
+        if denom == 0: return torch.zeros_like(arr)
+        return (arr - arr.min()) / denom
+    else:
+        if not (minclip is None) & (maxclip is None):
+            arr = np.clip(arr, minclip, maxclip)
+        denom = arr.max() - arr.min()
+        if denom == 0: return np.zeros_like(arr)
+        return (arr - arr.min()) / denom
+
+def one_hot_encode(seg, num_classes=None):
+    """Handles both Numpy and Torch inputs. Returns (C, D, H, W)."""
+    if torch.is_tensor(seg):
+        # Torch implementation
+        if num_classes is None:
+            num_classes = int(seg.max()) + 1
+        
+        # F.one_hot needs Long type and expects indices in last dim usually, 
+        # but here input is (C=1, D, H, W) or (D, H, W)
+        if seg.ndim == 4: seg = seg.squeeze(0) # Remove channel dim
+        
+        seg = seg.long()
+        seg_flat = seg.view(-1)
+        # Mask out values out of range
+        mask = (seg_flat >= 0) & (seg_flat < num_classes)
+        seg_flat = seg_flat * mask # Zero out invalid
+        
+        # Encode
+        one_hot = F.one_hot(seg_flat, num_classes=num_classes).float() # [N, C]
+        
+        # Reshape back: [D, H, W, C] -> Permute to [C, D, H, W]
+        D, H, W = seg.shape
+        one_hot = one_hot.view(D, H, W, num_classes).permute(3, 0, 1, 2)
+        return one_hot
+        
+    else:
+        # Numpy implementation
+        if num_classes is None:
+            num_classes = int(seg.max()) + 1
+        seg_flat = seg.flatten()
+        seg_flat[seg_flat >= num_classes] = 0
+        
+        one_hot = np.eye(num_classes, dtype=np.float32)[seg_flat]
+        D, H, W = seg.shape
+        one_hot = one_hot.reshape(D, H, W, num_classes)
+        one_hot = np.transpose(one_hot, (3, 0, 1, 2))
+        return one_hot
 
 def pad_to_multiple_np(arr, multiple=16):
     D, H, W = arr.shape
@@ -35,6 +82,29 @@ def pad_to_multiple_np(arr, multiple=16):
     pad_H = (multiple - H % multiple) % multiple
     pad_W = (multiple - W % multiple) % multiple
     return np.pad(arr, ((0, pad_D), (0, pad_H), (0, pad_W)), mode='constant'), (pad_D, pad_H, pad_W)
+
+def get_subject_paths(root, subj_id, seg_name="labels_moved.nii.gz"):
+    paths = {}
+    
+    # 1. CT
+    ct = glob.glob(os.path.join(root, subj_id, "ct_resampled.nii*"))
+    if not ct:
+        raise FileNotFoundError(f"CT missing for {subj_id}")
+    paths['ct'] = ct[0]
+    
+    # 2. MRI
+    mr = glob.glob(os.path.join(root, subj_id, "registration_output", "moved_*.nii*"))
+    if not mr:
+        raise FileNotFoundError(f"MRI missing for {subj_id}")
+    paths['mri'] = mr[0]
+    
+    # 3. Seg (Optional check, but we return path if found)
+    seg = glob.glob(os.path.join(root, subj_id, "registration_output", seg_name))
+    if not seg:
+        raise FileNotFoundError(f"Segmentation missing for {subj_id}")
+    paths['seg'] = seg[0]
+            
+    return paths
 
 def load_image_pair(root, subj_id):
     ct_path = glob.glob(os.path.join(root, subj_id, "ct_resampled.nii*"))[0]
@@ -56,7 +126,7 @@ def load_segmentation(root, subj_id, seg_filename="labels_moved*.nii.gz", pad_va
     seg_path = glob.glob(os.path.join(root, subj_id, "registration_output", seg_filename))[0]
     
     if not os.path.exists(seg_path):
-        raise FileNotFoundError(f"Segmentation not found for {subj_id} in {paths_to_check}")
+        raise FileNotFoundError(f"Segmentation not found for {subj_id} in {seg_path}")
 
     seg_img = tio.LabelMap(seg_path)
     seg = seg_img.data[0].numpy().astype(np.int16)
@@ -68,227 +138,190 @@ def load_segmentation(root, subj_id, seg_filename="labels_moved*.nii.gz", pad_va
     print(f"Seg Loaded  | Shape: {seg.shape}, Max Label: {seg.max()}")
     return seg
 
-def one_hot_encode(seg, num_classes=None):
-    if num_classes is None:
-        num_classes = int(seg.max()) + 1
-        
-    seg_flat = seg.flatten()
-    one_hot = np.eye(num_classes, dtype=np.float32)[seg_flat]
-    
-    D, H, W = seg.shape
-    one_hot = one_hot.reshape(D, H, W, num_classes)
-    one_hot = np.transpose(one_hot, (3, 0, 1, 2))
-    return one_hot
 
+
+class ProjectPreprocessing(tio.Transform):
+    """
+    Applies MinMax Norm, One-Hot Encoding, and Prob Map creation
+    AFTER loading from disk but BEFORE patching.
+    """
+    def __init__(self, use_seg=False, seg_classes=51, patch_size=96, **kwargs):
+        super().__init__(**kwargs)
+        self.use_seg = use_seg
+        self.seg_classes = seg_classes
+        self.patch_size = patch_size
+
+    def apply_transform(self, subject):
+        # 0. Safety Padding (Prevent Crash on Small Volumes)
+        # We check one image (CT) to determine if padding is needed
+        shape = subject['ct'].spatial_shape # (W, H, D) order in TorchIO
+        
+        # Calc padding for multiple of 16
+        mult = 16
+        pad_w = (mult - shape[0] % mult) % mult
+        pad_h = (mult - shape[1] % mult) % mult
+        pad_d = (mult - shape[2] % mult) % mult
+        
+        # Also ensure minimum patch size
+        pad_w = max(pad_w, max(0, self.patch_size - shape[0]))
+        pad_h = max(pad_h, max(0, self.patch_size - shape[1]))
+        pad_d = max(pad_d, max(0, self.patch_size - shape[2]))
+
+        if pad_w > 0 or pad_h > 0 or pad_d > 0:
+            # Symmetric padding is safer, but pad_to_multiple usually does one-side.
+            # Let's stick to 'end' padding to match numpy behavior if possible, 
+            # or split. TorchIO Pad splits by default.
+            # Let's padding_mode='constant' (0)
+            # Pad args: (w_ini, w_fin, h_ini, h_fin, ...)
+            pad = (0, pad_w, 0, pad_h, 0, pad_d) # Pad at end to match pad_to_multiple_np logic
+            pad_transform = tio.Pad(pad, padding_mode=0)
+            subject = pad_transform(subject)
+            
+            # Update vol_shape metadata to match PADDED size
+            if 'vol_shape' in subject:
+                new_shape = subject['ct'].spatial_shape 
+                subject['vol_shape'] = torch.tensor(new_shape).float().view(1, 1, 1, 3)
+
+        # 1. Normalize CT (-450 to 450)
+        ct_data = subject['ct'].data
+        # subject['ct'].set_data(minmax(ct_data, -450, 450))
+        subject['ct'].set_data(minmax(ct_data, -450, 450).to(torch.float32))
+
+        # 2. Normalize MRI
+        mr_data = subject['mri'].data
+        # subject['mri'].set_data(minmax(mr_data))
+        subject['mri'].set_data(minmax(mr_data).to(torch.float32))
+
+        # 3. Probability Map
+        # Re-access data in case it was padded
+        prob = (subject['ct'].data > 0.01).to(torch.float32)
+        # prob = (prob > 0.5).long()  # re-threshold to avoid interpolation artifacts
+
+        subject.add_image(tio.LabelMap(tensor=prob, affine=subject['mri'].affine), 'prob_map')
+        # prob_map = tio.LabelMap.from_image(subject['ct']) 
+        # prob_map.set_data(prob)
+        # subject.add_image(prob_map, 'prob_map')
+
+        # 4. Segmentation One-Hot
+        if self.use_seg and 'seg' in subject:
+            seg_hot = one_hot_encode(subject['seg'].data, num_classes=self.seg_classes)
+            subject['seg'].set_data(seg_hot)
+            
+        return subject
+    
 # --- Dataset & Loader ---
-class RandomPatchDataset_single(Dataset):
-    def __init__(self, feats, target, patch_size=(96, 96, 96), samples_per_epoch=100):
-        self.feats = feats
-        self.target = target
-        self.patch_size = np.array(patch_size)
-        self.samples = samples_per_epoch
-        self.dims = np.array(target.shape) # D, H, W
-        
-    def __len__(self):
-        return self.samples
-    
-    def __getitem__(self, idx):
-        # Fix: Sample coordinates individually to avoid array errors in np.random.randint
-        max_start = np.maximum(self.dims - self.patch_size, 0)
-        
-        start_d = np.random.randint(0, max_start[0] + 1)
-        start_h = np.random.randint(0, max_start[1] + 1)
-        start_w = np.random.randint(0, max_start[2] + 1)
-        
-        start = np.array([start_d, start_h, start_w])
-        end = start + self.patch_size
-        
-        f_patch = self.feats[:, start[0]:end[0], start[1]:end[1], start[2]:end[2]]
-        t_patch = self.target[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
-        
-        return torch.from_numpy(f_patch).float(), torch.from_numpy(t_patch).unsqueeze(0).float()
+def get_augmentations():
+    """
+    Returns the augmentation pipeline.
+    Includes Physics-based (BiasField) and Spatial (Elastic/Affine) transforms.
+    """
+    return tio.Compose([
+        tio.RandomFlip(axes=(0, 1, 2), p=0.5),
+        tio.RandomBiasField(p=0.5), # Bias Field: Simulates MRI intensity inhomogeneity
+        tio.RandomNoise(std=0.02, p=0.25), # Noise: Simulates sensor noise
+        tio.RandomAffine(scales=(0.9, 1.1), degrees=10, translation=5, p=0.5), # Rigid Transformation
+        tio.RandomElasticDeformation(num_control_points=7, max_displacement=7, p=0.25), # Non-rigid Transformation
+    ])
 
-# ds = RandomPatchDataset_single(
-#     feats_mri, 
-#     ct_target, 
-#     patch_size=(args.patch_size, args.patch_size, args.patch_size), 
-#     samples_per_epoch=args.patches_per_epoch
-# )
-# return DataLoader(ds, batch_size=1, shuffle=True, num_workers=2, pin_memory=True)
 
-# --- TorchIO Adapter ---
 class TioAdapter:
-    def __init__(self, loader):
+    """
+    Yields (MRI, CT, Seg) tuples from the queue.
+    """
+    def __init__(self, loader, has_seg=False):
         self.loader = loader
         self.dataset = self 
+        self.has_seg = has_seg
+        
     def __len__(self):
         return len(self.loader)
+    
     def __iter__(self):
         for batch in self.loader:
-            yield batch['input'][tio.DATA], batch['target'][tio.DATA]
+            mri = batch['mri'][tio.DATA]
+            ct = batch['ct'][tio.DATA]
 
-# --- Simple Stochastic Datasets ---
-class StochasticVoxelDataset(Dataset):
-    """
-    Optimized MLP Dataset.
-    Instead of 1 voxel per call, returns a CHUNK of voxels per call.
-    This reduces Python overhead by factor of `chunk_size`.
-    """
-    def __init__(self, data_list, dataset_len, chunk_size=4096):
-        self.subjects = []
-        self.weights = []
-        self.chunk_size = chunk_size
-        self.dataset_len = dataset_len # Virtual length (number of chunks to yield per epoch)
-        
-        for feats, target in data_list:
-            # feats: [C, D, H, W] -> Transpose to [D, H, W, C] for fast channel slicing
-            feats_t = np.transpose(feats, (1, 2, 3, 0))
-            self.subjects.append((feats_t, target))
-            self.weights.append(target.size)
+            # tio.LOCATION: [Batch, 6] -> (i_ini, j_ini, k_ini, i_fin, j_fin, k_fin)
+            loc = batch[tio.LOCATION]
             
-        total_voxels = sum(self.weights)
-        self.probs = [w / total_voxels for w in self.weights]
-        
-    def __len__(self):
-        return self.dataset_len
-        
-    def __getitem__(self, idx):
-        # 1. Pick Subject
-        subj_idx = np.random.choice(len(self.subjects), p=self.probs)
-        feats, target = self.subjects[subj_idx]
-        
-        # 2. Pick 'chunk_size' Random Voxels at once (Vectorized)
-        D, H, W, C = feats.shape
-        
-        # Random coordinates
-        z = np.random.randint(0, D, size=self.chunk_size)
-        y = np.random.randint(0, H, size=self.chunk_size)
-        x = np.random.randint(0, W, size=self.chunk_size)
-        
-        # 3. Extract (NumPy advanced indexing is fast)
-        # feat_chunk: [chunk_size, C]
-        feat_chunk = feats[z, y, x] 
-        # targ_chunk: [chunk_size]
-        targ_chunk = target[z, y, x]
-        
-        # 4. Coords [0,1]
-        # Normalize and stack
-        z_n = z / (D - 1)
-        y_n = y / (H - 1)
-        x_n = x / (W - 1)
-        
-        # [chunk_size, 3]
-        coords_chunk = np.stack([x_n, y_n, z_n], axis=1).astype(np.float32)
-        
-        return (
-            torch.from_numpy(feat_chunk).float(),
-            torch.from_numpy(coords_chunk).float(),
-            torch.from_numpy(targ_chunk).unsqueeze(1).float() # [chunk, 1]
-        )
+            # Custom attr vol_shape: [Batch, 1, 3] -> Squeeze to [Batch, 3]
+            # vol_shape = batch['vol_shape']
+            vol_shape = batch['vol_shape'].view(mri.shape[0], 3)
 
-def collate_flatten(batch):
-    """
-    Flattens a list of chunks into a single batch.
-    Input: List of (Chunk, C) tensors
-    Output: (Batch*Chunk, C) tensor
-    """
-    feats, coords, targs = zip(*batch)
-    
-    # Stack -> [Batch, Chunk, C] -> View -> [Batch*Chunk, C]
-    feats = torch.stack(feats).view(-1, feats[0].shape[-1])
-    coords = torch.stack(coords).view(-1, coords[0].shape[-1])
-    targs = torch.stack(targs).view(-1, targs[0].shape[-1])
-    
-    return feats, coords, targs
-        
-# --- Unified Dataloaders ---
-def get_dataloader_single(feats_mri, ct_target, args):
-    """Compatibility wrapper for single subject script"""
-    return get_dataloader_multi([(feats_mri, ct_target)], args)
+            
+            if self.has_seg:
+                seg = batch['seg'][tio.DATA]
+                yield mri, ct, seg, loc, vol_shape
+            else:
+                yield mri, ct, None, loc, vol_shape
 
-def get_dataloader_multi(data_list, args):
+def get_dataloader(data_path_list, args):
     """
-    Args:
-        data_list: List of tuples [(feats_mri, ct_target), ...]
+    Unified Lazy Loader for both MLP and CNN.
+    data_path_list: List of dicts {'mri': str_path, 'ct': str_path, 'seg': str_path}
     """
-    # 1. MLP LOADING (Stochastic)
+    print(f"⚡ Creating Lazy Loader for {len(data_path_list)} subjects...")
+    
+    subjects = []
+    for item in data_path_list:
+        subject_dict = {
+            'mri': tio.ScalarImage(item['mri']),
+            'ct': tio.ScalarImage(item['ct']),
+        }
+        if args.use_seg and 'seg' in item:
+            subject_dict['seg'] = tio.LabelMap(item['seg'])
+        
+        subject = tio.Subject(**subject_dict)
+        
+        subject['vol_shape'] = torch.tensor(subject.spatial_shape).float()
+        subjects.append(subject)  
+    
+    # --- Transforms Pipeline ---
+    # 1. Preprocess 
+    preprocess = ProjectPreprocessing(
+        use_seg=args.use_seg, seg_classes=args.seg_classes, patch_size=args.patch_size
+    )    
+    # 2. Augment (Optional)
+    augment = get_augmentations() if args.augment else None
+    
+    # 3. Combine
+    if augment:
+        transforms = tio.Compose([preprocess, augment])
+        print("   🎨 Augmentations Enabled (Lazy)")
+    else:
+        transforms = preprocess
+        
+    dataset = tio.SubjectsDataset(subjects, transform=transforms)
+    
+    # --- Queue ---
+    patch_size = (args.patch_size, args.patch_size, args.patch_size)
+    # sampler = tio.WeightedSampler(patch_size=patch_size, probability_map='prob_map')
     if args.model_type == "mlp":
-        print(f"⚡ Creating MLP Dataloader (Vectorized Stochastic) for {len(data_list)} subjects...")
-        
-        # Optimization: Fetch 4096 points per __getitem__ call
-        chunk_size = 4096
-        # Adjust loader batch size to match target total batch size
-        # e.g., Target 131072 // 4096 = 32 batches per step
-        loader_batch_size = args.batch_size // chunk_size
-        # We want 500 update steps per epoch
-        dataset_len = args.steps_per_epoch * loader_batch_size
-        
-        ds = StochasticVoxelDataset(data_list, dataset_len=dataset_len, chunk_size=chunk_size)
-        
-        return DataLoader(
-            ds, 
-            batch_size=loader_batch_size, 
-            shuffle=True, 
-            num_workers=4, 
-            pin_memory=True,
-            collate_fn=collate_flatten # Flattens chunks into one big batch
-        )
-    # 2. CNN LOADING (TorchIO SubjectsDataset)
-    elif args.model_type == "cnn":
-        print(f"⚡ Creating CNN Dataloader for {len(data_list)} subjects...")
-        subjects = []
-        for feats, target in data_list:
-            # Auto-pad subjects smaller than patch_size
-            c, d, h, w = feats.shape
-            
-            p_d = max(0, args.patch_size - d)
-            p_h = max(0, args.patch_size - h)
-            p_w = max(0, args.patch_size - w)
-            
-            if p_d > 0 or p_h > 0 or p_w > 0:
-                pad_d1, pad_d2 = p_d // 2, p_d - p_d // 2
-                pad_h1, pad_h2 = p_h // 2, p_h - p_h // 2
-                pad_w1, pad_w2 = p_w // 2, p_w - p_w // 2
-                
-                # Pad (C, D, H, W) -> pad last 3 dims
-                feats = np.pad(feats, ((0,0), (pad_d1, pad_d2), (pad_h1, pad_h2), (pad_w1, pad_w2)), mode='constant') # pad with 0
-                target = np.pad(target, ((pad_d1, pad_d2), (pad_h1, pad_h2), (pad_w1, pad_w2)), mode='constant')
-                # print(f"   ⚠️ Auto-padded subject from {(d,h,w)} to {feats.shape[1:]}")
-
-            t_feats = torch.from_numpy(feats).float()
-            t_ct = torch.from_numpy(target).unsqueeze(0).float()
-            
-            # Recalculate prob_map on PADDED tensor so padding (0) counts as air
-            prob_map = (t_ct > 0.01).float()
-            
-            subjects.append(tio.Subject(
-                input=tio.ScalarImage(tensor=t_feats),
-                target=tio.ScalarImage(tensor=t_ct),
-                prob_map=tio.Image(tensor=prob_map)
-            ))
-            
-        dataset = tio.SubjectsDataset(subjects)
-        
-        # Queue parameters
-        patch_size = (args.patch_size, args.patch_size, args.patch_size)
+        print("   🎲 Sampler: Uniform (Full Grid Coverage)")
+        sampler = tio.UniformSampler(patch_size=patch_size)
+    else:
+        print("   ⚖️ Sampler: Weighted (Body Focus)")
         sampler = tio.WeightedSampler(patch_size=patch_size, probability_map='prob_map')
-        
-        queue = tio.Queue(
-            subjects_dataset=dataset,
-            max_length=max(args.samples_per_volume, 50),
-            # samples_per_volume=args.patches_per_epoch,
-            samples_per_volume=args.samples_per_volume,
-            sampler=sampler,
-            num_workers=1,
-            shuffle_subjects=True,
-            shuffle_patches=True,
-        )
-
-        print(f"WORKING WITH CNN PATCH SIZE: {args.cnn_batch_size}")
-        loader = DataLoader(queue, batch_size=args.cnn_batch_size, num_workers=0, pin_memory=False)
-        # loader = DataLoader(queue, batch_size=1, num_workers=0, pin_memory=False)
-        return TioAdapter(loader)
-
+    # sampler = tio.WeightedSampler(patch_size=patch_size, probability_map='prob_map')
+    
+    queue = tio.Queue(
+        subjects_dataset=dataset,
+        max_length=max(args.patches_per_volume, 300), # Large buffer for diversity
+        samples_per_volume=args.patches_per_volume,
+        sampler=sampler,
+        num_workers=2, # Pre-load in background
+        shuffle_subjects=True,
+        shuffle_patches=True,
+    )
+    
+    # Batch size logic
+    # MLP uses batch size 1 here because it subsamples points later
+    batch_size = args.cnn_batch_size if args.model_type == "cnn" else 1
+    # MLP processes 1 patch per step (subsamples mlp_batch_size voxels from that 1 patch)
+    # CNN can process multiple patches per step (uses all voxels for these patches)
+    
+    loader = DataLoader(queue, batch_size=batch_size, num_workers=0, pin_memory=False)
+    return TioAdapter(loader, has_seg=args.use_seg)
     
 # --- Loss & Metrics ---
 def unpad_np(arr, pad_vals):
@@ -343,17 +376,23 @@ def compute_metrics_deprecated(pred, target, pad_vals):
 
 def compute_metrics(pred, target, data_range=1.0):
     b, c, d, h, w = pred.shape
-    pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
-    targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
-
+    # pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
+    # targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
+    pred_2d = pred.permute(0, 4, 1, 2, 3).reshape(-1, c, h, w)
+    targ_2d = target.permute(0, 4, 1, 2, 3).reshape(-1, c, h, w)
+    
     # SSIM
     ssim_val = fused_ssim(pred_2d, targ_2d, train=False).item()
 
     # PSNR
-    mse = torch.mean((pred_2d - targ_2d) ** 2, dim=[1, 2, 3])
+    # mse = torch.mean((pred_2d - targ_2d) ** 2, dim=[1, 2, 3])
+    # mse = torch.clamp(mse, min=1e-10) 
+    # psnr_2d = 10.0 * torch.log10((data_range ** 2) / mse)
+    # psnr_val = torch.mean(psnr_2d).item()
+    mse = torch.mean((pred - target) ** 2, dim=[1, 2, 3, 4])
     mse = torch.clamp(mse, min=1e-10) 
-    psnr_2d = 10.0 * torch.log10((data_range ** 2) / mse)
-    psnr_val = torch.mean(psnr_2d).item()
+    psnr = 10 * torch.log10((data_range ** 2) / mse)
+    psnr_val = torch.mean(psnr).item()
 
     # MAE
     mae_val = torch.mean(torch.abs(pred - target)).item()
