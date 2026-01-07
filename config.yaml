@@ -3,7 +3,8 @@
 # val_interval: 5
 val_interval: 1
 
-lr: 3e-4
+# lr: 3e-4
+lr: 1e-3
 seed: 42
 subject: "1ABA005_3.0x3.0x3.0_resampled" # for train_single
 subjects: ["1ABA005_3.0x3.0x3.0_resampled", "1ABA005_3.0x3.0x3.0_resampled"]
@@ -15,7 +16,8 @@ epochs_mlp: 500
 epochs_cnn: 200
 
 # Model Configuration
-model_type: "cnn"      # Options: "mlp", "cnn"
+# model_type: "cnn"      # Options: "mlp", "cnn"
+model_type: "MLP"
 use_seg: false
 seg_name: "labels_moved.nii.gz"
 # dropout: 0.2
