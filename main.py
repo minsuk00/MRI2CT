@@ -9,6 +9,7 @@ import warnings
 import datetime
 from types import SimpleNamespace
 from glob import glob
+import json
 
 import numpy as np
 import torch
@@ -46,40 +47,37 @@ def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
+    
 def cleanup_gpu():
     gc.collect()
     torch.cuda.empty_cache()
 
 def minmax(arr, minclip=None, maxclip=None):
-    if torch.is_tensor(arr):
-        if minclip is not None and maxclip is not None:
-            arr = torch.clamp(arr, minclip, maxclip)
-        denom = arr.max() - arr.min()
-        if denom == 0: return torch.zeros_like(arr)
-        return (arr - arr.min()) / denom
-    else:
-        if not (minclip is None) and not (maxclip is None):
-            arr = np.clip(arr, minclip, maxclip)
-        denom = arr.max() - arr.min()
-        if denom == 0: return np.zeros_like(arr)
-        return (arr - arr.min()) / denom
+    if not torch.is_tensor(arr):
+        arr = torch.as_tensor(arr)
+    
+    if minclip is not None and maxclip is not None:
+        arr = torch.clamp(arr, minclip, maxclip)
+    
+    denom = arr.max() - arr.min()
+    if denom == 0: 
+        print("MinMax - Denominator is 0. returning zero-like tensor")
+        return torch.zeros_like(arr)
+    return (arr - arr.min()) / denom
 
-def pad_to_multiple_np(arr, multiple=16):
-    D, H, W = arr.shape
-    pad_D = (multiple - D % multiple) % multiple
-    pad_H = (multiple - H % multiple) % multiple
-    pad_W = (multiple - W % multiple) % multiple
-    return np.pad(arr, ((0, pad_D), (0, pad_H), (0, pad_W)), mode='constant'), (pad_D, pad_H, pad_W)
-
-def unpad_torch(data, pad_vals):
-    if pad_vals is None: return data
-    d_pad, h_pad, w_pad = pad_vals
-    b, c, d, h, w = data.shape
-    d_end = d - d_pad if d_pad > 0 else d
-    h_end = h - h_pad if h_pad > 0 else h
-    w_end = w - w_pad if w_pad > 0 else w
-    return data[..., :d_end, :h_end, :w_end]
+def unpad(data, original_shape):
+    """
+    Slices the input tensor to match original_shape.
+    Assumes padding was applied at the END (anchor='start').
+    data: (B, C, W, H, D) or (B, C, D, H, W) - we assume dim order matches shape
+    """
+    if original_shape is None:
+        return data
+    
+    # original_shape comes in as (W, H, D) from TorchIO spatial_shape
+    w_orig, h_orig, d_orig = original_shape
+    # Slice the last 3 dimensions
+    return data[..., :w_orig, :h_orig, :d_orig]
 
 def compute_metrics(pred, target, data_range=1.0):
     b, c, d, h, w = pred.shape
@@ -116,7 +114,7 @@ def get_subject_paths(root, subj_id):
             
     return paths
 
-def load_image_pair(root, subj_id):
+def load_image_pair(root, subj_id, args):
     """Used for Validation Loading"""
     data_path = os.path.join(root, "data")
     ct_path = glob(os.path.join(data_path, subj_id, "ct_resampled.nii*"))[0]
@@ -125,58 +123,91 @@ def load_image_pair(root, subj_id):
     mr_img = tio.ScalarImage(mr_path)
     ct_img = tio.ScalarImage(ct_path)
     
-    mri = mr_img.data[0].numpy()
-    ct = ct_img.data[0].numpy()
+    # Normalize (Numpy)
+    mri = minmax(mr_img.data[0]).numpy()
+    ct = minmax(ct_img.data[0], minclip=-450, maxclip=450).numpy()
     
-    mri = minmax(mri)
-    ct = minmax(ct, minclip=-450, maxclip=450)
+    # Capture Original Shape (W, H, D)
+    orig_shape = mri.shape
+    # Calculate Target Shape (Multiple of 16)
+    # target_shape = [(d + 15) // 16 * 16 for d in orig_shape] # round up to multiple of 16
+    # target_shape = [max(args.patch_size, (d + 15) // 16 * 16) for d in orig_shape]
+    target_shape = [max(args.patch_size, (d + 31) // 32 * 32) for d in orig_shape]
     
-    mri, pad_vals = pad_to_multiple_np(mri, multiple=16)
-    ct, _ = pad_to_multiple_np(ct, multiple=16)
+    # Pad Numpy Arrays (pad at the end)
+    # np.pad takes list of (before, after) tuples
+    # We want (0, target - original) for each dim
+    pad_width = [(0, t - o) for t, o in zip(target_shape, orig_shape)]
     
-    print(f"[DEBUG] Valid Data Loaded {subj_id} | MRI: {mri.shape}, CT: {ct.shape}")
-    return mri, ct, pad_vals
+    mri_padded = np.pad(mri, pad_width, mode='constant', constant_values=0)
+    ct_padded = np.pad(ct, pad_width, mode='constant', constant_values=0)
+
+    assert mri_padded.shape == tuple(target_shape), "MRI Padding Mismatch!"
+    # Check Anchor Start: The top-left corner should be identical
+    assert np.allclose(mri_padded[:orig_shape[0], :orig_shape[1], :orig_shape[2]], mri), "Anchor Start Failed! Data shifted."
+    # Check Padding Area: The newly added area should be 0
+    if target_shape[0] > orig_shape[0]:
+        assert mri_padded[orig_shape[0]:, ...].sum() == 0, "Padding area is not zero!"
+    
+    print(f"[DEBUG] Valid {subj_id} | Orig: {orig_shape} -> Padded: {target_shape}")
+    return mri_padded, ct_padded, orig_shape
 
 # ==========================================
 # 2. DATA PIPELINE (TORCHIO)
 # ==========================================
 class ProjectPreprocessing(tio.Transform):
-    def __init__(self, patch_size=96, **kwargs):
+    def __init__(self, patch_size=96, enable_safety_padding=False, **kwargs):       
         super().__init__(**kwargs)
         self.patch_size = patch_size
+        self.enable_safety_padding = enable_safety_padding
 
     def apply_transform(self, subject):
-        # 0. Safety Padding
-        shape = subject['ct'].spatial_shape
-        mult = 16
-        pad_w = (mult - shape[0] % mult) % mult
-        pad_h = (mult - shape[1] % mult) % mult
-        pad_d = (mult - shape[2] % mult) % mult
-        
-        pad_w = max(pad_w, max(0, self.patch_size - shape[0]))
-        pad_h = max(pad_h, max(0, self.patch_size - shape[1]))
-        pad_d = max(pad_d, max(0, self.patch_size - shape[2]))
-
-        if pad_w > 0 or pad_h > 0 or pad_d > 0:
-            pad = (0, pad_w, 0, pad_h, 0, pad_d)
-            pad_transform = tio.Pad(pad, padding_mode=0)
-            subject = pad_transform(subject)
-            if 'vol_shape' in subject:
-                new_shape = subject['ct'].spatial_shape 
-                subject['vol_shape'] = torch.tensor(new_shape).float().view(1, 1, 1, 3)
-
-        # 1. Normalize CT
+        # 1. Normalize CT & MRI
         ct_data = subject['ct'].data
-        subject['ct'].set_data(minmax(ct_data, -450, 450).to(torch.float32))
-
-        # 2. Normalize MRI
+        subject['ct'].set_data(minmax(ct_data, -450, 450).float())
         mr_data = subject['mri'].data
-        subject['mri'].set_data(minmax(mr_data).to(torch.float32))
+        subject['mri'].set_data(minmax(mr_data).float())
 
+        if self.enable_safety_padding:
+            safety_margin = self.patch_size // 2  # 48 voxels
+            safety_padder = tio.Pad(safety_margin, padding_mode=0)
+            subject = safety_padder(subject)
+
+        # 2. Smart Padding (Multiple of 16 AND >= Patch Size)
+        current_shape = subject['ct'].spatial_shape # (W, H, D)
+        # Store original shape for unpadding later
+        subject['original_shape'] = torch.tensor(current_shape)
+        # Calculate target shape: max(patch_size, next_multiple_of_16)
+        target_shape = []
+        for dim in current_shape:
+            # Ensure multiple of 16 AND at least patch_size
+            # mult_16 = (int(dim) + 15) // 16 * 16
+            mult_16 = (int(dim) + 31) // 32 * 32
+            target_shape.append(max(self.patch_size, mult_16))
+            
+        # Calculate diff: Target - Current
+        # need padding tuple: (w_in, w_out, h_in, h_out, d_in, d_out)
+        # set 'in' to 0 and 'out' to diff to anchor at start.
+        padding_params = []
+        for curr, targ in zip(current_shape, target_shape):
+            diff = int(targ - curr)
+            padding_params.extend([0, diff]) # Append (0, diff)
+            
+        if any(p > 0 for p in padding_params):
+            padder = tio.Pad(padding_params, padding_mode=0)
+            subject = padder(subject)
+
+        # vol_shape: NEW Padded Size
+        subject['vol_shape'] = torch.tensor(subject['ct'].spatial_shape).float()
+        
         # 3. Probability Map
         prob = (subject['ct'].data > 0.01).to(torch.float32)
         subject.add_image(tio.LabelMap(tensor=prob, affine=subject['mri'].affine), 'prob_map')
 
+        final_shape = subject['mri'].data.shape[1:]
+        if final_shape[0] % 32 != 0:
+            print(f"[WARNING] Training volume width {final_shape[0]} is not multiple of 32!")
+            
         return subject
 
 def get_augmentations():
@@ -201,7 +232,7 @@ class TioAdapter:
             mri = batch['mri'][tio.DATA]
             ct = batch['ct'][tio.DATA]
             loc = batch[tio.LOCATION]
-            vol_shape = batch['vol_shape'].view(mri.shape[0], 3)
+            vol_shape = batch['vol_shape'].view(mri.shape[0], 3) 
             
             yield mri, ct, loc, vol_shape
 
@@ -215,10 +246,10 @@ def get_dataloader(data_path_list, args):
         }
         
         subject = tio.Subject(**subject_dict)
-        subject['vol_shape'] = torch.tensor(subject.spatial_shape).float()
         subjects.append(subject)  
-    
-    preprocess = ProjectPreprocessing(patch_size=args.patch_size)    
+
+    use_safety = (args.model_type.lower() == "cnn" and args.enable_safety_padding)
+    preprocess = ProjectPreprocessing(patch_size=args.patch_size, enable_safety_padding=use_safety)    
     augment = get_augmentations() if args.augment else None
     
     if augment:
@@ -232,15 +263,17 @@ def get_dataloader(data_path_list, args):
     patch_size = (args.patch_size, args.patch_size, args.patch_size)
     if args.model_type.lower() == "mlp":
         sampler = tio.UniformSampler(patch_size=patch_size)
+        # sampler = tio.WeightedSampler(patch_size=patch_size, probability_map='prob_map')
     else:
         sampler = tio.WeightedSampler(patch_size=patch_size, probability_map='prob_map')
     
     queue = tio.Queue(
         subjects_dataset=dataset,
-        max_length=max(args.patches_per_volume, 300), 
         samples_per_volume=args.patches_per_volume,
+        max_length=max(args.patches_per_volume, args.data_queue_max_length), 
         sampler=sampler,
-        num_workers=2, 
+        # num_workers=4, 
+        num_workers=0, 
         shuffle_subjects=True,
         shuffle_patches=True,
     )
@@ -293,56 +326,56 @@ class CompositeLoss(nn.Module):
 
 def get_mlp_samples(features, target, locations, vol_shapes, num_samples=16384):
     """
-    features: [B, C, W, H, D] # [1, 16, 96, 96, 96]
-    target: [B, 1, D, H, W] # [1, 1, 96, 96, 96]
-    locations: [B, 6] -> (i_ini, j_ini, k_ini, ...) # [ 34,  25,   0, 130, 121,  96]
-    vol_shapes: [B, 3] -> (W, H, D) # [155., 122.,  91. -> 96. (updated)]
+    Dimension-Agnostic Sampling.
+    
+    This function ignores whether the dimensions are (D,H,W) or (W,H,D).
+    It simply matches:
+      - Tensor spatial dim 0 -> Metadata index 0
+      - Tensor spatial dim 1 -> Metadata index 1
+      - Tensor spatial dim 2 -> Metadata index 2
     """
-    B, C, dim_w, dim_h, dim_d = features.shape
+    # 1. Capture Raw Dimensions
+    # features shape: (Batch, Channel, Dim0, Dim1, Dim2)
+    B, C, *spatial_dims = features.shape
+    device = features.device
 
-    # 1. Permute to [B, W, H, D, C] for easier flattening
-    # Moves Channel to last dim. Spatial dims (W,H,D) stay in 1,2,3
+    # 2. Permute Features for flattening
+    # From (B, C, d0, d1, d2) -> (B, d0, d1, d2, C) -> Flatten
     feats_flat = features.permute(0, 2, 3, 4, 1).reshape(-1, C)
+    
+    # Target shape: (B, C, d0, d1, d2) -> Flatten same way
     targ_flat = target.permute(0, 2, 3, 4, 1).reshape(-1, 1)
     
-    # 2. Generate GLOBAL Coordinates
-    # Local grid matches feature dims: (W, H, D)
-    w_local = torch.arange(dim_w, device=features.device).float()
-    h_local = torch.arange(dim_h, device=features.device).float()
-    d_local = torch.arange(dim_d, device=features.device).float()
+    # 3. Generate Local Grids (Index-Matched)
+    # We create a list of ranges: [0..d0-1, 0..d1-1, 0..d2-1]
+    ranges = [torch.arange(d, device=device).float() for d in spatial_dims]
     
-    # 'ij' indexing preserves order: Dim0=W, Dim1=H, Dim2=D
-    grid_w, grid_h, grid_d = torch.meshgrid(w_local, h_local, d_local, indexing='ij')
-    
-    # Stack in (x, y, z) order which corresponds to (W, H, D)
-    # Shape: [1, W, H, D, 3]
-    coords_local = torch.stack([grid_w, grid_h, grid_d], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1, 1)
-    
-    # --- 3. Global Normalization ---
-    # offsets and shapes are already in (x, y, z) / (W, H, D) order from utils.py
-    
-    off_w = locations[:, 0].view(B, 1, 1, 1).float().to(features.device)
-    off_h = locations[:, 1].view(B, 1, 1, 1).float().to(features.device)
-    off_d = locations[:, 2].view(B, 1, 1, 1).float().to(features.device)
-    
-    max_w = vol_shapes[:, 0].view(B, 1, 1, 1).float().to(features.device)
-    max_h = vol_shapes[:, 1].view(B, 1, 1, 1).float().to(features.device)
-    max_d = vol_shapes[:, 2].view(B, 1, 1, 1).float().to(features.device)
-    
-    # Normalize: (Local + Offset) / Max
-    # Index 0 is W(x), 1 is H(y), 2 is D(z). Everything aligns now.
-    global_x = (coords_local[..., 0] + off_w) / (max_w - 1)
-    global_y = (coords_local[..., 1] + off_h) / (max_h - 1)
-    global_z = (coords_local[..., 2] + off_d) / (max_d - 1)
-    
-    # Stack [B, W, H, D, 3]
-    coords_global = torch.stack([global_x, global_y, global_z], dim=-1)
+    # Meshgrid 'ij' ensures the output grids match input order
+    # grids[0] varies along dim 0, grids[1] along dim 1, etc.
+    grids = torch.meshgrid(*ranges, indexing='ij')
+
+    # 4. Global Normalization (The Fix)
+    norm_grids = []
+    for i, grid in enumerate(grids):
+        # Metadata is (B, 3). We grab column i to match tensor dim i.
+        off = locations[:, i].view(B, 1, 1, 1).float().to(device)
+        max_val = vol_shapes[:, i].view(B, 1, 1, 1).float().to(device)
+        
+        # Normalize: (local_index + offset) / (total_size - 1)
+        # This maps the very first voxel to 0.0 and the very last (padded) voxel to 1.0
+        norm_coord = (grid.unsqueeze(0) + off) / (max_val - 1)
+        norm_grids.append(norm_coord)
+
+    # 5. Stack Coordinates
+    # Result: (B, d0, d1, d2, 3)
+    coords_global = torch.stack(norm_grids, dim=-1)
     coords_flat = coords_global.reshape(-1, 3)
     
-    # 4. Random Subsampling
-    # Optional: You can add the "Valid Mask" logic here if you want to skip air
+    # 6. Random Sampling
     total_voxels = feats_flat.shape[0]
     actual_samples = min(num_samples, total_voxels)
+    
+    # Randomly select indices
     indices = torch.randperm(total_voxels)[:actual_samples]
 
     return feats_flat[indices], coords_flat[indices], targ_flat[indices]
@@ -351,17 +384,30 @@ def get_mlp_samples(features, target, locations, vol_shapes, num_samples=16384):
 # 4. VISUALIZATION
 # ==========================================
 @torch.no_grad()
-def visualize_ct_feature_comparison(pred_ct, gt_ct, gt_mri, model, subj_id, root_dir, epoch=None, use_wandb=False, idx=1):
+def visualize_ct_feature_comparison(pred_ct, gt_ct, gt_mri, model, subj_id, root_dir, original_shape, epoch=None, use_wandb=False, idx=1):
     device = next(model.parameters()).device
     
     def extract_feats_np(volume_np):
         inp = torch.from_numpy(volume_np[None, None]).float().to(device)
         feats = model(inp)
         return feats.squeeze(0).cpu().numpy()
-
+        
+    # NOTE: extract features from the PADDED volumes first
     feats_gt = extract_feats_np(gt_ct)
     feats_pred = extract_feats_np(pred_ct)
     feats_mri = extract_feats_np(gt_mri)
+    
+    # --- NOW unpad everything for visualization ---
+    if original_shape:
+        w, h, d = original_shape
+        # Unpad Volumes
+        gt_ct = gt_ct[:w, :h, :d]
+        gt_mri = gt_mri[:w, :h, :d]
+        pred_ct = pred_ct[:w, :h, :d]
+        # Unpad Features (C, W, H, D) -> slice last 3 dimensions
+        feats_gt = feats_gt[..., :w, :h, :d]
+        feats_pred = feats_pred[..., :w, :h, :d]
+        feats_mri = feats_mri[..., :w, :h, :d]
     
     C, H, W, D = feats_gt.shape
 
@@ -395,7 +441,6 @@ def visualize_ct_feature_comparison(pred_ct, gt_ct, gt_mri, model, subj_id, root
     slice_indices = np.linspace(0.1 * D, 0.9 * D, 5, dtype=int)
     fig, axes = plt.subplots(len(slice_indices), 8, figsize=(30, 3.5 * len(slice_indices)))
     plt.subplots_adjust(wspace=0.05, hspace=0.15)
-
     
     for i, z in enumerate(slice_indices):
         items = [
@@ -431,11 +476,12 @@ def visualize_ct_feature_comparison(pred_ct, gt_ct, gt_mri, model, subj_id, root
     save_dir = os.path.join(root_dir, "results", "vis")
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"{subj_id}_epoch{epoch}.png")
-    plt.savefig(save_path, dpi=100, bbox_inches="tight")
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    # plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     
     if use_wandb: 
-        wandb.log({f"val/viz_{idx}": wandb.Image(save_path)}, step=epoch)
+        wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(save_path)}, step=epoch)
 
 def log_aug_viz(val_data, args, epoch, root_dir):
     """
@@ -475,7 +521,8 @@ def log_aug_viz(val_data, args, epoch, root_dir):
         plt.tight_layout()
 
         save_path = os.path.join(root_dir, "results", "vis_aug.png")
-        plt.savefig(save_path)
+        plt.savefig(save_path, dpi=200)
+        # plt.savefig(save_path)
         plt.close(fig)
         wandb.log({"val/aug_example": wandb.Image(save_path)}, step=epoch)
     except Exception as e:
@@ -485,109 +532,224 @@ def log_aug_viz(val_data, args, epoch, root_dir):
 # 5. CORE ENGINE (TRAIN/EVAL)
 # ==========================================
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_type, feat_extractor, args):
-    feat_extractor.eval() 
     model.train()
+    feat_extractor.eval()
     
     total_loss = 0.0
+    total_grad_norm = 0.0
     comp_accumulator = {}
-    num_batches = len(loader)
     
-    for mri, ct, location, vol_shape in tqdm(loader, leave=False, desc="Train Step"):
-        mri, ct = mri.to(device), ct.to(device)
+    # 1. Create the Infinite Iterator from your TioAdapter
+    loader_iter = iter(loader)
+    # 2. Set the target steps (e.g., 1000)
+    target_steps = args.steps_per_epoch
+    progress = tqdm(range(target_steps), desc="Train Step", leave=False, dynamic_ncols=True)
+    
+    for step in progress:
+        optimizer.zero_grad()
+        step_loss = 0.0
         
-        # 1. Feature Extraction
-        with torch.no_grad():
-            features = feat_extractor(mri) 
-
-        # 2. Forward Pass
-        optimizer.zero_grad(set_to_none=True)
-        
-        with torch.amp.autocast(device_type="cuda" if "cuda" in device.type else "cpu"):
+        # 3. Accumulation Loop
+        for _ in range(args.accum_steps):
+            try:
+                # TioAdapter already yields (mri, ct, loc, vol_shape) as Tensors
+                mri, ct, location, vol_shape = next(loader_iter)
+            except StopIteration:
+                # Restart the adapter's iterator
+                loader_iter = iter(loader)
+                mri, ct, location, vol_shape = next(loader_iter)
+            
+            mri, ct = mri.to(device), ct.to(device)
+            
+            # 4. Feature Extraction
+            with torch.no_grad():
+                features = feat_extractor(mri)
+            
+            # 5. Forward Pass
             if model_type.lower() == "mlp":
                 f_pts, c_pts, t_pts = get_mlp_samples(features, ct, location, vol_shape, num_samples=args.mlp_batch_size)
                 pred = model(f_pts, c_pts)
                 loss, components = loss_fn(pred, t_pts)
-            
             elif model_type.lower() == "cnn":
                 pred = model(features)
                 loss, components = loss_fn(pred, ct)
-        
-        if torch.isnan(loss):
-            print("[ERROR] Loss is NaN!")
-            exit()
+            
+            # Accumulate Loss Components
+            for k, v in components.items():
+                comp_accumulator[k] = comp_accumulator.get(k, 0.0) + (v / args.accum_steps)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        
-        total_loss += loss.item()
-        for k, v in components.items():
-            comp_accumulator[k] = comp_accumulator.get(k, 0.0) + v
+            loss = loss / args.accum_steps
+            loss.backward()
+            step_loss += loss.item()
 
-    avg_loss = total_loss / num_batches
-    avg_components = {k: v / num_batches for k, v in comp_accumulator.items()}
-    
-    return avg_loss, avg_components
+        # 6. Optimizer Step
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        total_grad_norm += grad_norm.item()
+        total_loss += step_loss
+        progress.set_postfix({"loss": f"{step_loss:.5f}"})
+
+    # 7. Final Averages
+    avg_loss = total_loss / target_steps
+    avg_grad_norm = total_grad_norm / target_steps
+    avg_components = {k: v / target_steps for k, v in comp_accumulator.items()}
+
+    return avg_loss, avg_components, avg_grad_norm
 
 @torch.no_grad()
-def evaluate(model, feats_mri, ct, device, model_type, pad_vals):
+def evaluate(model, feats_mri, ct, device, model_type, original_shape):
     model.eval()
     
+    # Handle CT GT input (Numpy or Tensor)
     if isinstance(ct, np.ndarray):
         ct_tensor = torch.from_numpy(ct).float().to(device)
     else:
         ct_tensor = ct.float().to(device)
-    
     if ct_tensor.ndim == 3: ct_tensor = ct_tensor.unsqueeze(0).unsqueeze(0)
     
     pred_ct_tensor = None
 
     if model_type.lower() == "mlp":
-        C, dim_w, dim_h, dim_d = feats_mri.shape
-        feats_flat = torch.from_numpy(feats_mri).permute(1, 2, 3, 0).reshape(-1, C).float().to(device)
-        
-        w_local = torch.arange(dim_w, device=device).float()
-        h_local = torch.arange(dim_h, device=device).float()
-        d_local = torch.arange(dim_d, device=device).float()
-        grid_w, grid_h, grid_d = torch.meshgrid(w_local, h_local, d_local, indexing='ij')
+        # feats_mri input is typically numpy (C, d0, d1, d2) from your validation loader
+        # We convert to tensor (1, C, d0, d1, d2) just to get shapes easily
+        if isinstance(feats_mri, np.ndarray):
+            f_tensor = torch.from_numpy(feats_mri).unsqueeze(0).float().to(device)
+        else:
+            f_tensor = feats_mri.unsqueeze(0).float().to(device)
 
-        # Normalize 0..1
-        norm_w = grid_w / (dim_w - 1)
-        norm_h = grid_h / (dim_h - 1)
-        norm_d = grid_d / (dim_d - 1)
-        # Stack [W, H, D, 3] -> (x, y, z)
-        coords = torch.stack([norm_w, norm_h, norm_d], dim=-1).reshape(-1, 3)
+        B, C, *spatial_dims = f_tensor.shape
         
+        # 1. Flatten Features: (1, d0, d1, d2, C) -> (N, C)
+        feats_flat = f_tensor.permute(0, 2, 3, 4, 1).reshape(-1, C)
+        
+        # 2. Generate Linear Grids 0..1 (Global)
+        # Since validation creates the FULL volume, we don't need 'locations'.
+        # We just need 0.0 to 1.0 across the entire dimension.
+        ranges = [torch.linspace(0, 1, d, device=device) for d in spatial_dims]
+        
+        # 3. Meshgrid
+        grids = torch.meshgrid(*ranges, indexing='ij')
+        
+        # 4. Stack (d0, d1, d2, 3) -> Flatten -> (N, 3)
+        coords = torch.stack(grids, dim=-1).reshape(-1, 3)
+        
+        # 5. Inference Loop (Chunked to save VRAM)
         preds = []
-        batch_size = 100000
+        batch_size = 800000 
         for i in range(0, feats_flat.size(0), batch_size):
             f_batch = feats_flat[i:i+batch_size]
             c_batch = coords[i:i+batch_size]
             preds.append(model(f_batch, c_batch))
         
         pred_flat = torch.cat(preds, dim=0)
-        pred_ct_tensor = pred_flat.reshape(1, 1, dim_w, dim_h, dim_d)
+        
+        # Reshape back to (1, 1, d0, d1, d2)
+        # We use *spatial_dims to unpack the list [d0, d1, d2]
+        pred_ct_tensor = pred_flat.reshape(1, 1, *spatial_dims)
 
     elif model_type.lower() == "cnn":
         feats_t = torch.from_numpy(feats_mri).unsqueeze(0).float().to(device)
         pred_ct_tensor = model(feats_t)
 
-    pred_ct_tensor_unpad = unpad_torch(pred_ct_tensor, pad_vals)
-    ct_tensor_unpad = unpad_torch(ct_tensor, pad_vals)
+    # Metrics
+    pred_ct_tensor_unpad = unpad(pred_ct_tensor, original_shape)
+    ct_tensor_unpad = unpad(ct_tensor, original_shape)
+    
     metrics = compute_metrics(pred_ct_tensor_unpad, ct_tensor_unpad)
     pred_ct = pred_ct_tensor.squeeze().cpu().numpy()
+    
     return metrics, pred_ct
+    
+# Validation Helper
+def run_validation(epoch_idx, model, val_meta_list, device, feat_extractor, args, loss_fn, avg_train_loss=0.0, viz_limit=3, train_monitor_data=None):
+    model.eval()
+    val_metrics = {'mae': [], 'psnr': [], 'ssim': [], 'loss': []}
+    viz_count = 0 
 
+    if args.wandb and train_monitor_data:
+        print(f"   🔎 Visualizing Training Monitor ({train_monitor_data['id']})")
+        try:
+            # Run inference on the training subject
+            _, pred_ct = evaluate(
+                model, 
+                train_monitor_data['feats'], 
+                train_monitor_data['ct'], 
+                device, 
+                args.model_type, 
+                train_monitor_data['orig_shape']
+            )
+            # Log it with a special index (999) so it stands out in WandB
+            visualize_ct_feature_comparison(
+                pred_ct, train_monitor_data['ct'], train_monitor_data['mri'], feat_extractor, 
+                train_monitor_data['id'], args.root_dir, 
+                original_shape=train_monitor_data['orig_shape'],
+                epoch=epoch_idx, use_wandb=True, idx=-1 
+            )
+        except Exception as e:
+            print(f"   ⚠️ Training Viz Failed: {e}")
+
+    # NOTE: Augmentation is not actually applied during validation. This is just for visualization.
+    if args.augment and args.wandb and val_meta_list:
+        log_aug_viz(val_meta_list[0], args, epoch_idx, args.root_dir)
+        
+    for v_data in val_meta_list:
+        (mae, psnr, ssim), pred_ct = evaluate(model, v_data['feats'], v_data['ct'], device, args.model_type, v_data['orig_shape'])
+
+        with torch.no_grad():
+            # Convert Prediction to Tensor
+            pred_t = torch.from_numpy(pred_ct).float().to(device)
+            if pred_t.ndim == 3: 
+                pred_t = pred_t.unsqueeze(0).unsqueeze(0)
+
+            # Convert Ground Truth to Tensor
+            gt_t = torch.from_numpy(v_data['ct']).float().to(device)
+            if gt_t.ndim == 3:
+                gt_t = gt_t.unsqueeze(0).unsqueeze(0)
+
+            val_loss_item, _ = loss_fn(pred_t, gt_t)
+            # val_metrics['loss'].append(val_loss_item)
+            val_metrics['loss'].append(val_loss_item.item())
+        
+        val_metrics['mae'].append(mae)
+        val_metrics['psnr'].append(psnr)
+        val_metrics['ssim'].append(ssim)
+        
+        if args.wandb and viz_count < viz_limit:
+            print(f"   🔎 Val Viz [{viz_count+1}/{viz_limit}] ({v_data['id']})")
+            visualize_ct_feature_comparison(
+                pred_ct, v_data['ct'], v_data['mri'], feat_extractor, 
+                v_data['id'], args.root_dir, 
+                original_shape=v_data['orig_shape'],
+                epoch=epoch_idx, use_wandb=True, idx = viz_count,
+            )
+            viz_count += 1
+
+    avg_mae = np.mean(val_metrics['mae']) if val_metrics['mae'] else 0.0
+    avg_psnr = np.mean(val_metrics['psnr']) if val_metrics['psnr'] else 0.0
+    avg_ssim = np.mean(val_metrics['ssim']) if val_metrics['ssim'] else 0.0
+    avg_val_loss = np.mean(val_metrics['loss']) if val_metrics['loss'] else 0.0
+    
+    print(f"Ep {epoch_idx} | Avg Train Loss: {avg_train_loss:.5f} | Avg Val Loss: {avg_val_loss:.5f} | Val MAE: {avg_mae:.4f} | PSNR: {avg_psnr:.2f} | SSIM: {avg_ssim:.3f}")
+    if args.wandb:
+        wandb.log({"val/loss": avg_val_loss, "val/mae": avg_mae, "val/psnr": avg_psnr, "val/ssim": avg_ssim}, step=epoch_idx)
+        
 # ==========================================
 # 6. ORCHESTRATION
 # ==========================================
-def discover_subjects(data_dir, target_list=None):
+def discover_subjects(data_dir, target_list=None, region=None): # region: AB, TH, HN
     if target_list:
         candidates = target_list
+        print(f"[DEBUG] 🎯 Using explicit target_list ({len(candidates)} subjects)")
     else:
         candidates = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+        
+        if region:
+            region = region.upper()
+            candidates = [c for c in candidates if region in c]
+            print(f"[DEBUG] 📍 No target_list found. Filtering for region: {region} ({len(candidates)} subjects)")
+        else:
+            print(f"[DEBUG] 📂 No target_list or region specified. Using all {len(candidates)} discovered subjects.")
     
     valid = []
     required = ["ct_resampled.nii.gz"]
@@ -607,11 +769,18 @@ def run_experiment(exp_config_dict):
             print(f"[DEBUG] 🗑️ Explicitly deleting {var} from memory")
             del globals()[var]
     cleanup_gpu()
-    
+    # Enables TF32 for significantly faster training on Ampere+ GPUs (makes the numerical precision a bit lower)
+    torch.set_float32_matmul_precision('high')
+
     # Merge configs
     final_conf_dict = copy.deepcopy(DEFAULT_CONFIG)
     final_conf_dict.update(exp_config_dict)
     args = Config(final_conf_dict)
+
+    config_json = json.dumps(vars(args), indent=4, sort_keys=True)
+    print("\n" + "🔍" + " EXPERIMENT CONFIG ".center(50, "="))
+    print(config_json)
+    print("=" * 52 + "\n")
     
     # Setup
     set_seed(args.seed)
@@ -619,7 +788,7 @@ def run_experiment(exp_config_dict):
     print(f"[DEBUG] 🟢 Starting Experiment. Device: {device}, Model: {args.model_type}")
     
     # 1. Subject Discovery
-    subjects = discover_subjects(os.path.join(args.root_dir, "data"), target_list=args.subjects)
+    subjects = discover_subjects(os.path.join(args.root_dir, "data"), target_list=args.subjects, region=args.region)
     if not subjects:
         print("[ERROR] No subjects found.")
         return
@@ -632,16 +801,32 @@ def run_experiment(exp_config_dict):
 
     # 3. W&B
     if args.wandb:
-        run_name = f"{args.model_type}_Train{len(train_subjects)}"
+        run_name = f"{args.model_type.upper()}_Train{len(train_subjects)}"
         wandb.init(project=args.project_name, name=run_name, config=vars(args), reinit=True)
+        wandb.save(os.path.abspath(__file__))
+        wandb.save(os.path.join(args.root_dir, "models.py"))
 
     # 4. Feature Extractor (Anatomix)
-    feat_extractor = Unet(3, 1, 16, 4, 16).to(device)
-    ckpt_path = os.path.join(args.root_dir, "anatomix", "model-weights", "anatomix.pth")
+    print("[DEBUG] 🏗️ Building and Compiling Anatomix...")
+    feat_extractor = Unet(
+        dimension=3,
+        input_nc=1,
+        output_nc=16,
+        num_downs=5,
+        ngf=20,
+        norm="instance",
+        interp="trilinear",
+        pooling="Avg",
+    ).to(device)
+    feat_extractor = torch.compile(feat_extractor, mode="default")
+    # ckpt_path = os.path.join(args.root_dir, "anatomix", "model-weights", "anatomix.pth")
+    ckpt_path = os.path.join(args.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
     if os.path.exists(ckpt_path):
+        print(f"Loading weights from {ckpt_path}...")
         feat_extractor.load_state_dict(torch.load(ckpt_path, map_location=device), strict=True)
     else:
-        print(f"[WARNING] Anatomix weights not found at {ckpt_path}. Using random init.")
+        print(f"[WARNING] ⚠️ Weights not found at {ckpt_path}...")
+        return
     feat_extractor.eval()
 
     # 5. Load Train Data
@@ -663,23 +848,46 @@ def run_experiment(exp_config_dict):
         avg_shape = np.mean(np.array(shapes), axis=0).astype(int)
         print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
         if np.any(avg_shape < args.patch_size):
-            print(f"⚠️ Warning: Mean shape {tuple(avg_shape)} is smaller than patch size {args.patch_size} in some dims.")
-            print(f"   Auto-padding is active to prevent crashes.")
+            print(f"⚠️ Warning: Mean shape {tuple(avg_shape)} is smaller than patch size {args.patch_size} in some dims. (Auto-padding is active to prevent crashes)")
     if not train_paths:
         print("❌ No valid training data.")
         return   
+
+    # Capture one Training Subject for Monitoring
+    train_monitor_data = None
+    if len(train_subjects) > 0:
+        print(f"[DEBUG] 📸 Capturing Training Monitor (Subject: {train_subjects[0]})...")
+        try:
+            t_id = train_subjects[0]
+            # Load it using the VALIDATION logic (Full volume, no patches)
+            mri_t, ct_t, orig_shape_t = load_image_pair(args.root_dir, t_id, args)
+            
+            # Pre-calculate features (just like we do for validation)
+            with torch.no_grad():
+                inp = torch.from_numpy(mri_t[None, None]).float().to(device)
+                feats_t = feat_extractor(inp).squeeze(0).cpu().numpy()
+            
+            train_monitor_data = {
+                'id': f"{t_id}_TRAIN_MONITOR", 
+                'ct': ct_t, 
+                'mri': mri_t, 
+                'feats': feats_t, 
+                'orig_shape': orig_shape_t
+            }
+        except Exception as e:
+            print(f"⚠️ Failed to capture training monitor: {e}")
         
     # 6. Pre-load Val Data (Features)
     val_meta_list = []
     print("[DEBUG] Pre-loading Validation Data...")
     for subj_id in tqdm(val_subjects):
         try:
-            mri, ct, pad_vals = load_image_pair(args.root_dir, subj_id)
+            mri, ct, orig_shape = load_image_pair(args.root_dir, subj_id,args)
             with torch.no_grad():
                 inp = torch.from_numpy(mri[None, None]).float().to(device)
                 feats = feat_extractor(inp).squeeze(0).cpu().numpy()
             
-            val_meta_list.append({'id': subj_id, 'ct': ct, 'mri': mri, 'feats': feats, 'pad_vals': pad_vals})
+            val_meta_list.append({'id': subj_id, 'ct': ct, 'mri': mri, 'feats': feats, 'orig_shape': orig_shape})
         except Exception as e:
             print(f"Error loading val {subj_id}: {e}")
 
@@ -700,6 +908,7 @@ def run_experiment(exp_config_dict):
             dropout=args.dropout
         ).to(device)
         epochs = args.epochs_mlp
+        # model = torch.compile(model, mode="default")
     else:
         print(f"Building CNN: Depth={args.cnn_depth}, Hidden={args.cnn_hidden}, Act={args.final_activation}")
         model = CNNTranslator(
@@ -710,61 +919,44 @@ def run_experiment(exp_config_dict):
             dropout=args.dropout
         ).to(device)
         epochs = args.epochs_cnn
+        # model = torch.compile(model, mode="default")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = CompositeLoss(weights={"l1": args.l1_w, "l2": args.l2_w, "ssim": args.ssim_w}).to(device)
-    scaler = torch.amp.GradScaler()
+    scaler = None
+    # scaler = torch.amp.GradScaler()
 
-    # 8. Loop
+    # 8. ======= Training Loop =======
     print(f"[DEBUG] 🚀 Training for {epochs} epochs...")
+    start_time = time.time()
     
-    # Validation Helper
-    def run_validation(epoch_idx, loss_val, viz_limit = 3):
-        model.eval()
-        val_metrics = {'mae': [], 'psnr': [], 'ssim': []}
-        viz_count = 0 
-
-        # NOTE: Augmentation is not actually applied during validation. This is just for visualization.
-        if args.augment and args.wandb and val_meta_list:
-            log_aug_viz(val_meta_list[0], args, epoch_idx, args.root_dir)
-            
-        for v_data in val_meta_list:
-            (mae, psnr, ssim), pred_ct = evaluate(model, v_data['feats'], v_data['ct'], device, args.model_type, v_data['pad_vals'])
-            val_metrics['mae'].append(mae)
-            val_metrics['psnr'].append(psnr)
-            val_metrics['ssim'].append(ssim)
-            
-            if args.wandb and viz_count < viz_limit:
-                print(f"   🔎 Val Viz [{viz_count+1}/{viz_limit}] ({v_data['id']}): MAE={mae:.4f}, SSIM={ssim:.3f}, PSNR={psnr:.2f}")
-                visualize_ct_feature_comparison(pred_ct, v_data['ct'], v_data['mri'], feat_extractor, v_data['id'], args.root_dir, epoch=epoch_idx, use_wandb=True)
-                viz_count += 1
-
-        avg_mae = np.mean(val_metrics['mae']) if val_metrics['mae'] else 0.0
-        avg_psnr = np.mean(val_metrics['psnr']) if val_metrics['psnr'] else 0.0
-        avg_ssim = np.mean(val_metrics['ssim']) if val_metrics['ssim'] else 0.0
-
-        print(f"Ep {epoch_idx} | Loss: {loss_val:.5f} | Val MAE: {avg_mae:.4f} | PSNR: {avg_psnr:.2f} | SSIM: {avg_ssim:.3f}")
-        if args.wandb:
-            wandb.log({"val/mae": avg_mae, "val/psnr": avg_psnr, "val/ssim": avg_ssim}, step=epoch_idx)
-
     # Pre-Training Sanity Check
     if args.sanity_check:
-        run_validation(0, 0.0)
-
-    start_time = time.time()
+        run_validation(0, model, val_meta_list, device, feat_extractor, args, loss_fn, viz_limit=args.viz_limit, train_monitor_data=train_monitor_data)
+    
     epoch_iter = tqdm(range(1, epochs + 1), desc="Epochs", leave=True, dynamic_ncols=True)
     for epoch in epoch_iter:
-        loss, loss_comps = train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, args.model_type, feat_extractor, args)
+        epoch_start = time.time()
+        
+        loss, loss_comps, grad_norm = train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, args.model_type, feat_extractor, args)
+
+        epoch_duration = time.time() - epoch_start
+        cumulative_time = time.time() - start_time
         epoch_iter.set_postfix({"train_loss": f"{loss:.5f}"})
         
         if args.wandb:
-            log = {"loss/total": loss}
-            for k, v in loss_comps.items(): log[k.replace("loss_", "loss/")] = v
+            log = {
+                "train_loss/total": loss,
+                "info/grad_norm": grad_norm,
+                "info/epoch_duration": epoch_duration, 
+                "info/cumulative_time": cumulative_time
+            }
+            for k, v in loss_comps.items(): log[k.replace("loss_", "train_loss/")] = v
             wandb.log(log, step=epoch)
 
         if (epoch % args.val_interval == 0) or (epoch == epochs):
-            run_validation(epoch, loss)
-
+            run_validation(epoch, model, val_meta_list, device, feat_extractor, args, loss_fn, avg_train_loss=loss, viz_limit=args.viz_limit, train_monitor_data=train_monitor_data)
+            
     # Save
     save_path = os.path.join(args.root_dir, "results", "models", f"{args.model_type}_{datetime.datetime.now():%Y%m%d_%H%M}.pt")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -785,39 +977,48 @@ DEFAULT_CONFIG = {
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "wandb": True,
     # "wandb": False,
-    "project_name": "mri2ct_single_file",
+    "project_name": "mri2ct",
+    "viz_limit": 2,
     
     # Data
-    "subjects": ["1ABA005_3.0x3.0x3.0_resampled", "1HNA001_3.0x3.0x3.0_resampled"], # None for all
+    "subjects": ["1ABA005_3.0x3.0x3.0_resampled", "1ABA005_3.0x3.0x3.0_resampled"], # None for all
     # "subjects": None
+    "region": None, # "AB", "TH", "HN"
     "val_split": 0.1,
-    "augment": True,
+    # "augment": True,
+    "augment": False,
     "patch_size": 96,
-    "patches_per_volume": 100,
+    # "patches_per_volume": 100,
+    "patches_per_volume": 20,
+    "data_queue_max_length": 300,
 
     # Training
-    "lr": 1e-3,
+    "lr": 3e-4,
     "val_interval": 1,
     "sanity_check": True,
+    "accum_steps": 32,
+    "steps_per_epoch": 1000,
     
     # Model Choice
     "model_type": "mlp", # "mlp" or "cnn"
     "epochs_mlp": 500,
     "epochs_cnn": 200,
+    "dropout": 0.2,
     
+    # 일단 이게 제일 좋은 듯
     # MLP Specifics
     "mlp_batch_size": 131072, # Points to sample per patch (feature vector batch)
     "fourier": True,
     "sigma": 5.0,
-    "mlp_depth": 4,
-    "mlp_hidden": 256,
-    "dropout": 0.0,
+    "mlp_depth": 6, 
+    "mlp_hidden": 512,
     
     # CNN Specifics
     "cnn_batch_size": 1,
     "cnn_depth": 9,
     "cnn_hidden": 128,
     "final_activation": "sigmoid",
+    "enable_safety_padding": True,
     
     # Loss Weights
     "l1_w": 1.0,
@@ -829,20 +1030,45 @@ DEFAULT_CONFIG = {
 if __name__ == "__main__":
     # Define experiments here
     experiments = [
-        # Experiment 1: MLP Baseline
         {
             "model_type": "mlp",
-            "lr": 1e-3,
-            "mlp_hidden": 256,
-            "epochs_mlp": 100,
+            "epochs_mlp": 1000,
+            # "mlp_depth": 4,
+            "mlp_depth": 6,
+            "mlp_hidden": 512,
+            "subjects": None,
+            # "region": "AB",
+            # "dropout": 0.2,
+            "dropout": 0,
+            # "mlp_batch_size": 884736,
+            # "mlp_batch_size": 4096,
+            # "accum_steps": 32,
+            "mlp_batch_size": 32768,
+            "accum_steps": 4,
+            # "accum_steps": 1,
+            # "patches_per_volume": 30,
+            # "patches_per_volume": 50,
+            # "patches_per_volume": 100,
+            # "fourier": False,
+            # "steps_per_epoch": 1024,
+            "steps_per_epoch": 256,
         },
-        # Experiment 2: CNN Baseline
-        {
-            "model_type": "cnn",
-            "lr": 5e-4,
-            "cnn_depth": 5,
-            "epochs_cnn": 50,
-        }
+        # {
+        #     "model_type": "cnn",
+        #     "cnn_depth": 7,
+        #     "cnn_hidden": 64,
+        #     "epochs_cnn": 200,
+        #     "subjects": None,
+        #     # "region": "AB",
+        #     "dropout": 0.2,
+        #     # "dropout": 0,
+        #     "accum_steps": 1,
+        #     # "steps_per_epoch": 1024,
+        #     "steps_per_epoch": 200,
+        #     "patches_per_volume": 30,
+        #     # "enable_safety_padding": False,
+        #     "lr": 1e-3,
+        # }
     ]
 
     print(f"📚 Found {len(experiments)} experiments to run.")
