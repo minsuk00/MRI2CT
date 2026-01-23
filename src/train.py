@@ -10,26 +10,73 @@ import datetime
 from types import SimpleNamespace
 from glob import glob
 import json
+from collections import defaultdict 
+import copy
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from tqdm import tqdm
 import nibabel as nib
 import wandb
 import torchio as tio
-import copy
-
 from fused_ssim import fused_ssim
+
 from anatomix.model.network import Unet
-from models import MLPTranslator, CNNTranslator
 
 warnings.filterwarnings("ignore", category=UserWarning, module="monai.utils.module")
 warnings.filterwarnings("ignore", message=".*SubjectsLoader in PyTorch >= 2.3.*")
+# don't sync model weight files to wandb
+os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
+
+class CNNTranslator(nn.Module):
+    def __init__(self, in_channels=16, hidden_channels=32, depth=3, final_activation="relu_clamp", dropout=0.0):
+        """
+        Args:
+            in_channels (int): Input feature dimension.
+            hidden_channels (int): Number of filters in hidden layers.
+            depth (int): Total number of Conv3d layers.
+            final_activation (str): "sigmoid", "relu_clamp", or "none".
+        """
+        super().__init__()
+        self.final_activation = final_activation
+        
+        layers = []
+        
+        # --- 1. First Layer (Input -> Hidden) ---
+        layers.append(nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1))
+        layers.append(nn.ReLU(inplace=True))
+        if dropout > 0:
+            layers.append(nn.Dropout3d(p=dropout))
+        
+        # --- 2. Middle Layers (Hidden -> Hidden) ---
+        # We add (depth - 2) middle layers because first and last are handled separately
+        for _ in range(depth - 2):
+            layers.append(nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=1))
+            layers.append(nn.ReLU(inplace=True))
+            if dropout > 0:
+                layers.append(nn.Dropout3d(p=dropout))
+            
+        # --- 3. Last Layer (Hidden -> 1) ---
+        layers.append(nn.Conv3d(hidden_channels, 1, kernel_size=3, padding=1))
+        
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.net(x)
+        
+        if self.final_activation == "sigmoid":
+            return torch.sigmoid(x)
+        elif self.final_activation == "relu_clamp":
+            return torch.clamp(torch.relu(x), 0, 1)
+        elif self.final_activation == "none":
+            return x
+        else:
+            raise ValueError(f"Unknown activation: {self.final_activation}")
+
 
 # ==========================================
 # 1. HELPER UTILITIES (SSIM, MATH, IO)
@@ -117,7 +164,13 @@ def compute_metrics(pred, target, data_range=1.0):
     # MAE
     mae_val = torch.mean(torch.abs(pred - target)).item()
     
-    return mae_val, psnr_val, ssim_val
+    # return mae_val, psnr_val, ssim_val
+    return {
+        "mae": mae_val,
+        "psnr": psnr_val,
+        "ssim": ssim_val,
+    }
+
 
 def get_subject_paths(root, subj_id):
     paths = {}
@@ -155,7 +208,8 @@ def load_image_pair(root, subj_id, args):
     # Calculate Target Shape (Multiple of 16)
     # target_shape = [(d + 15) // 16 * 16 for d in orig_shape] # round up to multiple of 16
     # target_shape = [max(args.patch_size, (d + 15) // 16 * 16) for d in orig_shape]
-    target_shape = [max(args.patch_size, (d + 31) // 32 * 32) for d in orig_shape]
+    # target_shape = [max(args.patch_size, (d + 31) // 32 * 32) for d in orig_shape]
+    target_shape = [max(args.patch_size, (d + args.res_mult-1) // args.res_mult * args.res_mult) for d in orig_shape]
     
     # Pad Numpy Arrays (pad at the end)
     # np.pad takes list of (before, after) tuples
@@ -172,17 +226,18 @@ def load_image_pair(root, subj_id, args):
     if target_shape[0] > orig_shape[0]:
         assert mri_padded[orig_shape[0]:, ...].sum() == 0, "Padding area is not zero!"
     
-    print(f"[DEBUG] Valid {subj_id} | Orig: {orig_shape} -> Padded: {target_shape}")
+    # print(f"[DEBUG] Valid {subj_id} | Orig: {orig_shape} -> Padded: {target_shape}")
     return mri_padded, ct_padded, orig_shape
 
 # ==========================================
 # 2. DATA PIPELINE (TORCHIO)
 # ==========================================
 class ProjectPreprocessing(tio.Transform):
-    def __init__(self, patch_size=96, enable_safety_padding=False, **kwargs):       
+    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, **kwargs):       
         super().__init__(**kwargs)
         self.patch_size = patch_size
         self.enable_safety_padding = enable_safety_padding
+        self.res_mult = res_mult
 
     def apply_transform(self, subject):
         # 1. Normalize CT & MRI
@@ -207,7 +262,7 @@ class ProjectPreprocessing(tio.Transform):
         for dim in current_shape:
             # Ensure multiple of 16 AND at least patch_size
             # mult_16 = (int(dim) + 15) // 16 * 16
-            mult_16 = (int(dim) + 31) // 32 * 32
+            mult_16 = (int(dim) + self.res_mult-1) // self.res_mult * self.res_mult
             target_shape.append(max(self.patch_size, mult_16))
             
         # Calculate diff: Target - Current
@@ -230,8 +285,8 @@ class ProjectPreprocessing(tio.Transform):
         subject.add_image(tio.LabelMap(tensor=prob, affine=subject['mri'].affine), 'prob_map')
 
         final_shape = subject['mri'].data.shape[1:]
-        if final_shape[0] % 32 != 0:
-            print(f"[WARNING] Training volume width {final_shape[0]} is not multiple of 32!")
+        if final_shape[0] % self.res_mult != 0:
+            print(f"[WARNING] Training volume width {final_shape[0]} is not multiple of {self.res_mult}!")
             
         return subject
 
@@ -283,7 +338,7 @@ def get_dataloader(data_path_list, args):
         subjects.append(subject)  
 
     use_safety = (args.model_type.lower() == "cnn" and args.enable_safety_padding)
-    preprocess = ProjectPreprocessing(patch_size=args.patch_size, enable_safety_padding=use_safety)    
+    preprocess = ProjectPreprocessing(patch_size=args.patch_size, enable_safety_padding=use_safety, res_mult = args.res_mult)    
     augment = get_augmentations() if args.augment else None
     
     if augment:
@@ -322,13 +377,13 @@ def get_dataloader(data_path_list, args):
 # 3. LOSS & SAMPLING
 # ==========================================
 class CompositeLoss(nn.Module):
-    def __init__(self, weights={"l1": 1.0, "l2": 0.0, "ssim": 0.0}):
+    def __init__(self, weights={"l1": 1.0, "l2": 0.0, "ssim": 0.0, "perceptual": 0.0}):
         super().__init__()
         self.weights = weights
         self.l1 = nn.L1Loss()
         self.l2 = nn.MSELoss()
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, feat_extractor=None):
         total_loss = 0.0
         loss_components = {}
         
@@ -356,6 +411,19 @@ class CompositeLoss(nn.Module):
                 total_loss += self.weights["ssim"] * val_ssim_loss
                 loss_components["loss_ssim"] = val_ssim_loss.item()
         
+        if self.weights.get("perceptual", 0) > 0:
+            if feat_extractor is None:
+                raise ValueError("[Warning] Perceptual Loss weight > 0, but no feature_extractor!!")
+            else:
+                # L1 on features of z_gt_ct, z_pred_ct
+                pred_feats = feat_extractor(pred)
+                with torch.no_grad():
+                    target_feats = feat_extractor(target)
+                val_perceptual = self.l1(pred_feats, target_feats)
+                
+                total_loss += self.weights["perceptual"] * val_perceptual
+                loss_components["loss_perceptual"] = val_perceptual.item()
+                
         return total_loss, loss_components
 
 def get_mlp_samples(features, target, locations, vol_shapes, num_samples=16384):
@@ -507,15 +575,16 @@ def visualize_ct_feature_comparison(pred_ct, gt_ct, gt_mri, model, subj_id, root
     
     fig.suptitle(f"Translation Analysis — {subj_id} (epoch {epoch})", fontsize=16, y=0.99)
 
-    save_dir = os.path.join(root_dir, "results", "vis")
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"{subj_id}_epoch{epoch}.png")
-    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    # save_dir = os.path.join(root_dir, "results", "vis")
+    # os.makedirs(save_dir, exist_ok=True)
+    # save_path = os.path.join(save_dir, f"{subj_id}_epoch{epoch}.png")
+    # plt.savefig(save_path, dpi=200, bbox_inches="tight")
     # plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    # plt.close(fig)
     
     if use_wandb: 
-        wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(save_path)}, step=epoch)
+        wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(fig)}, step=epoch)
+    # plt.close(fig)
 
 def log_aug_viz(val_data, args, epoch, root_dir):
     """
@@ -529,7 +598,7 @@ def log_aug_viz(val_data, args, epoch, root_dir):
         if ct_t.ndim == 3: ct_t = ct_t.unsqueeze(0)
 
         subject = tio.Subject(mri=tio.ScalarImage(tensor=mri_t), ct=tio.ScalarImage(tensor=ct_t))
-        preprocess = ProjectPreprocessing(patch_size=args.patch_size)
+        preprocess = ProjectPreprocessing(patch_size=args.patch_size, res_mult = args.res_mult)
         clean_subj = preprocess(subject)
         augment_transform = get_augmentations()
         aug_subj = augment_transform(clean_subj)
@@ -554,11 +623,11 @@ def log_aug_viz(val_data, args, epoch, root_dir):
         for ax in axes: ax.axis('off')
         plt.tight_layout()
 
-        save_path = os.path.join(root_dir, "results", "vis_aug.png")
-        plt.savefig(save_path, dpi=200)
+        # save_path = os.path.join(root_dir, "results", "vis_aug.png")
+        # plt.savefig(save_path, dpi=200)
         # plt.savefig(save_path)
+        wandb.log({"val/aug_example": wandb.Image(fig)}, step=epoch)
         plt.close(fig)
-        wandb.log({"val/aug_example": wandb.Image(save_path)}, step=epoch)
     except Exception as e:
         print(f"[DEBUG] Aug Viz failed: {e}")
 
@@ -614,7 +683,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_typ
                 loss, components = loss_fn(pred, t_pts)
             elif model_type.lower() == "cnn":
                 pred = model(features)
-                loss, components = loss_fn(pred, ct)
+                loss, components = loss_fn(pred, ct, feat_extractor = feat_extractor)
+                
             
             # Accumulate Loss Components
             for k, v in components.items():
@@ -637,7 +707,11 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_typ
         
         total_grad_norm += grad_norm.item()
         total_loss += step_loss
-        progress.set_postfix({"loss": f"{step_loss:.5f}"})
+        # progress.set_postfix({"loss": f"{step_loss:.5f}"})
+        progress.set_postfix({
+            "loss": f"{step_loss:.4f}",
+            "grad": f"{grad_norm.item():.4f}"
+        })
 
     # 7. Final Averages
     avg_loss = total_loss / target_steps
@@ -713,11 +787,14 @@ def evaluate(model, feats_mri, ct, device, model_type, original_shape):
 # Validation Helper
 def run_validation(epoch_idx, model, val_meta_list, device, feat_extractor, args, loss_fn, avg_train_loss=0.0, viz_limit=3, train_monitor_data=None):
     model.eval()
-    val_metrics = {'mae': [], 'psnr': [], 'ssim': [], 'loss': []}
+    # val_metrics = {'mae': [], 'psnr': [], 'ssim': [], 'loss': []}
+    val_metrics = defaultdict(list)
+    
     viz_count = 0 
+    
 
     if args.wandb and train_monitor_data:
-        print(f"   🔎 Visualizing Training Monitor ({train_monitor_data['id']})")
+        # print(f"   🔎 Visualizing Training Monitor ({train_monitor_data['id']})")
         try:
             # Run inference on the training subject
             _, pred_ct = evaluate(
@@ -743,7 +820,8 @@ def run_validation(epoch_idx, model, val_meta_list, device, feat_extractor, args
         log_aug_viz(val_meta_list[0], args, epoch_idx, args.root_dir)
         
     for v_data in val_meta_list:
-        (mae, psnr, ssim), pred_ct = evaluate(model, v_data['feats'], v_data['ct'], device, args.model_type, v_data['orig_shape'])
+        # (mae, psnr, ssim), pred_ct = evaluate(model, v_data['feats'], v_data['ct'], device, args.model_type, v_data['orig_shape'])
+        metrics_dict, pred_ct = evaluate(model, v_data['feats'], v_data['ct'], device, args.model_type, v_data['orig_shape'])
 
         with torch.no_grad():
             # Convert Prediction to Tensor
@@ -756,16 +834,21 @@ def run_validation(epoch_idx, model, val_meta_list, device, feat_extractor, args
             if gt_t.ndim == 3:
                 gt_t = gt_t.unsqueeze(0).unsqueeze(0)
 
-            val_loss_item, _ = loss_fn(pred_t, gt_t)
+            val_loss_item, _ = loss_fn(pred_t, gt_t, feat_extractor=feat_extractor)
+            # val_loss_item, _ = loss_fn(pred_t, gt_t)
             # val_metrics['loss'].append(val_loss_item)
-            val_metrics['loss'].append(val_loss_item.item())
-        
-        val_metrics['mae'].append(mae)
-        val_metrics['psnr'].append(psnr)
-        val_metrics['ssim'].append(ssim)
+            # val_metrics['loss'].append(val_loss_item.item())
+            metrics_dict['loss'] = val_loss_item.item()
+
+        for k, v in metrics_dict.items():
+            val_metrics[k].append(v)
+            
+        # val_metrics['mae'].append(mae)
+        # val_metrics['psnr'].append(psnr)
+        # val_metrics['ssim'].append(ssim)
         
         if args.wandb and viz_count < viz_limit:
-            print(f"   🔎 Val Viz [{viz_count+1}/{viz_limit}] ({v_data['id']})")
+            # print(f"   🔎 Val Viz [{viz_count+1}/{viz_limit}] ({v_data['id']})")
             visualize_ct_feature_comparison(
                 pred_ct, v_data['ct'], v_data['mri'], feat_extractor, 
                 v_data['id'], args.root_dir, 
@@ -774,14 +857,21 @@ def run_validation(epoch_idx, model, val_meta_list, device, feat_extractor, args
             )
             viz_count += 1
 
-    avg_mae = np.mean(val_metrics['mae']) if val_metrics['mae'] else 0.0
-    avg_psnr = np.mean(val_metrics['psnr']) if val_metrics['psnr'] else 0.0
-    avg_ssim = np.mean(val_metrics['ssim']) if val_metrics['ssim'] else 0.0
-    avg_val_loss = np.mean(val_metrics['loss']) if val_metrics['loss'] else 0.0
+    avg_metrics = {k: np.mean(v) for k, v in val_metrics.items()}
     
-    print(f"Ep {epoch_idx} | Avg Train Loss: {avg_train_loss:.5f} | Avg Val Loss: {avg_val_loss:.5f} | Val MAE: {avg_mae:.4f} | PSNR: {avg_psnr:.2f} | SSIM: {avg_ssim:.3f}")
+    # avg_mae = np.mean(val_metrics['mae']) if val_metrics['mae'] else 0.0
+    # avg_psnr = np.mean(val_metrics['psnr']) if val_metrics['psnr'] else 0.0
+    # avg_ssim = np.mean(val_metrics['ssim']) if val_metrics['ssim'] else 0.0
+    # avg_val_loss = np.mean(val_metrics['loss']) if val_metrics['loss'] else 0.0
+    
+    log_str = f"Ep {epoch_idx} | Train Loss: {avg_train_loss:.5f}"
+    for k, v in avg_metrics.items():
+        log_str += f" | Val {k.upper()}: {v:.3f}"
+    print(log_str)
+    
     if args.wandb:
-        wandb.log({"val/loss": avg_val_loss, "val/mae": avg_mae, "val/psnr": avg_psnr, "val/ssim": avg_ssim}, step=epoch_idx)
+        wandb_log = {f"val/{k}": v for k, v in avg_metrics.items()}
+        wandb.log(wandb_log, step=epoch_idx)
         
 # ==========================================
 # 6. ORCHESTRATION
@@ -849,28 +939,73 @@ def run_experiment(exp_config_dict):
     val_subjects = subjects[-num_val:]
     print(f"[DEBUG] Train: {len(train_subjects)} | Val: {len(val_subjects)}")
 
+    # ==========================================
+    # RESUME LOGIC - PATH DISCOVERY
+    # ==========================================
+    resume_ckpt_path = None
+    start_epoch = 1
+    
+    if args.resume_wandb_id:
+        print(f"[RESUME] 🕵️ Searching for Run ID: {args.resume_wandb_id} in {args.log_dir}...")
+        # Search for the folder that contains the Run ID (WandB format is run-DATE-ID)
+        run_folders = glob(os.path.join(args.log_dir, "wandb", f"run-*-{args.resume_wandb_id}"))
+        
+        if run_folders:
+            # Look inside 'files' subdir for .pt files
+            search_pattern = os.path.join(run_folders[0], "files", "*.pt")
+            ckpts = sorted(glob(search_pattern))
+            
+            if ckpts:
+                resume_ckpt_path = ckpts[-1] # Pick the last one (alphabetical sort works with padding)
+                print(f"[RESUME] ✅ Found checkpoint: {resume_ckpt_path}")
+            else:
+                print(f"[RESUME] ⚠️ Run folder found, but NO checkpoints inside.")
+        else:
+            print(f"[RESUME] ❌ Could not find any folder for ID {args.resume_wandb_id}")
+
     # 3. W&B
     if args.wandb:
         run_name = f"{args.model_type.upper()}_Train{len(train_subjects)}"
-        wandb.init(project=args.project_name, name=run_name, config=vars(args), reinit=True)
-        wandb.save(os.path.abspath(__file__))
-        wandb.save(os.path.join(args.root_dir, "models.py"))
+        os.makedirs(args.log_dir, exist_ok=True)
+        
+        wandb.init(
+            project=args.project_name, 
+            name=run_name, 
+            config=vars(args),
+            notes=args.wandb_note,
+            reinit=True,
+            dir=args.log_dir,
+            id=args.resume_wandb_id, 
+            resume="allow",
+        )
+        if not args.resume_wandb_id:
+            wandb.run.log_code(root=args.root_dir, include_fn=lambda path: path.endswith(".py"))
+        # wandb.save(os.path.abspath(__file__))
+        # wandb.run.log_code(root=args.root_dir, include_fn=lambda path: path.endswith(".py"))
 
     # 4. Feature Extractor (Anatomix)
     print("[DEBUG] 🏗️ Building and Compiling Anatomix...")
-    feat_extractor = Unet(
-        dimension=3,
-        input_nc=1,
-        output_nc=16,
-        num_downs=5,
-        ngf=20,
-        norm="instance",
-        interp="trilinear",
-        pooling="Avg",
-    ).to(device)
-    feat_extractor = torch.compile(feat_extractor, mode="default")
-    # ckpt_path = os.path.join(args.root_dir, "anatomix", "model-weights", "anatomix.pth")
-    ckpt_path = os.path.join(args.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
+    if args.anatomix_weights == "v1":
+        args.res_mult=16
+        feat_extractor = Unet(3, 1, 16, 4, 16).to(device)
+        ckpt_path = os.path.join(args.root_dir, "anatomix", "model-weights", "anatomix.pth")
+    elif args.anatomix_weights == "v2":
+        args.res_mult=32
+        feat_extractor = Unet(
+            dimension=3,
+            input_nc=1,
+            output_nc=16,
+            num_downs=5,
+            ngf=20,
+            norm="instance",
+            interp="trilinear",
+            pooling="Avg",
+        ).to(device)
+        feat_extractor = torch.compile(feat_extractor, mode="default")
+        ckpt_path = os.path.join(args.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
+    else:
+        raise ValueError("define which anatomix weights to use: 'new' or 'prev'")
+
     if os.path.exists(ckpt_path):
         print(f"Loading weights from {ckpt_path}...")
         feat_extractor.load_state_dict(torch.load(ckpt_path, map_location=device), strict=True)
@@ -878,6 +1013,80 @@ def run_experiment(exp_config_dict):
         print(f"[WARNING] ⚠️ Weights not found at {ckpt_path}...")
         return
     feat_extractor.eval()
+
+    total_channels = 16
+    if args.model_type.lower() == "mlp":
+        print(f"Building MLP: Depth={args.mlp_depth}, Hidden={args.mlp_hidden}, Fourier={'Yes' if args.fourier else 'No'}, Scale={args.sigma}")
+        model = MLPTranslator(
+            in_feat_dim=total_channels, 
+            use_fourier=args.fourier, 
+            fourier_scale=args.sigma,
+            hidden_channels=args.mlp_hidden, 
+            depth=args.mlp_depth,    
+            dropout=args.dropout
+        ).to(device)
+        epochs = args.epochs_mlp
+        # model = torch.compile(model, mode="default")
+    else:
+        print(f"Building CNN: Depth={args.cnn_depth}, Hidden={args.cnn_hidden}, Act={args.final_activation}")
+        model = CNNTranslator(
+            in_channels=total_channels, 
+            hidden_channels=args.cnn_hidden, 
+            depth=args.cnn_depth, 
+            final_activation=args.final_activation,
+            dropout=args.dropout
+        ).to(device)
+        epochs = args.epochs_cnn
+        # model = torch.compile(model, mode="default")
+
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    params = [
+        # Group 1: The Translator (Main model) - Uses standard LR
+        {'params': model.parameters(), 'lr': args.lr},
+    ]
+
+    if args.finetune_feat_extractor:
+        print(f"[INFO] 🔓 Fine-tuning Feature Extractor with LR={args.lr_feat_extractor}")
+        # Group 2: The Feature Extractor - Uses lower LR
+        params.append({'params': feat_extractor.parameters(), 'lr': args.lr_feat_extractor})
+        # Ensure it requires grad
+        for param in feat_extractor.parameters():
+            param.requires_grad = True
+    else:
+        print("[INFO] 🔒 Feature Extractor is FROZEN.")
+        for param in feat_extractor.parameters():
+            param.requires_grad = False
+            
+    optimizer = torch.optim.Adam(params)
+    loss_fn = CompositeLoss(weights={
+        "l1": args.l1_w, 
+        "l2": args.l2_w, 
+        "ssim": args.ssim_w, 
+        "perceptual": args.perceptual_w
+    }).to(device)    
+    scaler = None
+    # scaler = torch.amp.GradScaler()
+
+    # ==========================================
+    # LOAD CHECKPOINT STATE
+    # ==========================================
+    if resume_ckpt_path:
+        print(f"[RESUME] 📥 Loading state from disk...")
+        checkpoint = torch.load(resume_ckpt_path, map_location=device)
+        
+        # Load Model
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load Optimizer
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+        # Load Epoch
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"[RESUME] ⏭️ Jumping to Epoch {start_epoch}")
+        else:
+            print("[RESUME] ⚠️ No epoch info in checkpoint. Starting from 1.")
 
     # 5. Load Train Data
     train_paths = []
@@ -893,6 +1102,7 @@ def run_experiment(exp_config_dict):
             shapes.append(img.header.get_data_shape())
         except Exception as e:
             print(f"Skipping {subj_id}: {e}")
+            pass
     
     if shapes:
         avg_shape = np.mean(np.array(shapes), axis=0).astype(int)
@@ -946,63 +1156,44 @@ def run_experiment(exp_config_dict):
     # 7. Create Loader & Model
     loader = get_dataloader(train_paths, args)
 
-    total_channels = 16
-    if args.model_type.lower() == "mlp":
-        print(f"Building MLP: Depth={args.mlp_depth}, Hidden={args.mlp_hidden}, Fourier={'Yes' if args.fourier else 'No'}, Scale={args.sigma}")
-        model = MLPTranslator(
-            in_feat_dim=total_channels, 
-            use_fourier=args.fourier, 
-            fourier_scale=args.sigma,
-            hidden_channels=args.mlp_hidden, 
-            depth=args.mlp_depth,    
-            dropout=args.dropout
-        ).to(device)
-        epochs = args.epochs_mlp
-        # model = torch.compile(model, mode="default")
-    else:
-        print(f"Building CNN: Depth={args.cnn_depth}, Hidden={args.cnn_hidden}, Act={args.final_activation}")
-        model = CNNTranslator(
-            in_channels=total_channels, 
-            hidden_channels=args.cnn_hidden, 
-            depth=args.cnn_depth, 
-            final_activation=args.final_activation,
-            dropout=args.dropout
-        ).to(device)
-        epochs = args.epochs_cnn
-        # model = torch.compile(model, mode="default")
-
-    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    params = [
-        # Group 1: The Translator (Main model) - Uses standard LR
-        {'params': model.parameters(), 'lr': args.lr},
-    ]
-
-    if args.finetune_feat_extractor:
-        print(f"[INFO] 🔓 Fine-tuning Feature Extractor with LR={args.lr_feat_extractor}")
-        # Group 2: The Feature Extractor - Uses lower LR
-        params.append({'params': feat_extractor.parameters(), 'lr': args.lr_feat_extractor})
-        # Ensure it requires grad
-        for param in feat_extractor.parameters():
-            param.requires_grad = True
-    else:
-        print("[INFO] 🔒 Feature Extractor is FROZEN.")
-        for param in feat_extractor.parameters():
-            param.requires_grad = False
+    def save_checkpoint(suffix, current_epoch):
+        """Saves model to GPFS (via WandB) or fallback local dir."""
+        filename = f"{args.model_type}_{suffix}.pt"
+        
+        if args.wandb:
+            # Saves to /gpfs/.../wandb/run-XXX/files/
+            save_dir = wandb.run.dir
+        else:
+            save_dir = os.path.join(args.root_dir, "results", "models")
+            os.makedirs(save_dir, exist_ok=True)
             
-    optimizer = torch.optim.Adam(params)
-    loss_fn = CompositeLoss(weights={"l1": args.l1_w, "l2": args.l2_w, "ssim": args.ssim_w}).to(device)
-    scaler = None
-    # scaler = torch.amp.GradScaler()
+        save_path = os.path.join(save_dir, filename)
+        state = {
+            'epoch': current_epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': vars(args)
+        }
+        torch.save(state, save_path)
+        print(f"💾 Saved: {save_path}")
+        
+        if args.wandb:
+            wandb.log({
+                "info/checkpoint_path": save_path,
+                "info/checkpoint_dir": save_dir
+            }, commit=False)
 
     # 8. ======= Training Loop =======
     print(f"[DEBUG] 🚀 Training for {epochs} epochs...")
     start_time = time.time()
     
+    
     # Pre-Training Sanity Check
-    if args.sanity_check:
+    if args.sanity_check and not args.resume_wandb_id:
         run_validation(0, model, val_meta_list, device, feat_extractor, args, loss_fn, viz_limit=args.viz_limit, train_monitor_data=train_monitor_data)
     
-    epoch_iter = tqdm(range(1, epochs + 1), desc="Epochs", leave=True, dynamic_ncols=True)
+    epoch_iter = tqdm(range(start_epoch, epochs + 1), desc="Epochs", leave=True, dynamic_ncols=True)
+    # epoch_iter = tqdm(range(1, epochs + 1), desc="Epochs", leave=True, dynamic_ncols=True)
     for epoch in epoch_iter:
         epoch_start = time.time()
         
@@ -1020,16 +1211,17 @@ def run_experiment(exp_config_dict):
                 "info/cumulative_time": cumulative_time
             }
             for k, v in loss_comps.items(): log[k.replace("loss_", "train_loss/")] = v
-            wandb.log(log, step=epoch)
+            # wandb.log(log, step=epoch)
+            server_step = wandb.run.step if wandb.run.step is not None else 0
+            if epoch > server_step:
+                wandb.log(log, step=epoch)
 
         if (epoch % args.val_interval == 0) or (epoch == epochs):
             run_validation(epoch, model, val_meta_list, device, feat_extractor, args, loss_fn, avg_train_loss=loss, viz_limit=args.viz_limit, train_monitor_data=train_monitor_data)
-            
-    # Save
-    save_path = os.path.join(args.root_dir, "results", "models", f"{args.model_type}_{datetime.datetime.now():%Y%m%d_%H%M}.pt")
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save(model.state_dict(), save_path)
-    print(f"💾 Saved model to {save_path}")
+
+        if epoch % args.model_save_interval == 0:
+            save_checkpoint(f"epoch{epoch:05d}_{datetime.datetime.now():%Y%m%d_%H%M}", epoch)
+    save_checkpoint(f"z_FINAL_{datetime.datetime.now():%Y%m%d_%H%M}", epochs)
     
     if args.wandb: wandb.finish()
     print(f"⏱️ Total: {time.time()-start_time:.2f}s")
@@ -1041,12 +1233,14 @@ def run_experiment(exp_config_dict):
 DEFAULT_CONFIG = {
     # System
     "root_dir": "/home/minsukc/MRI2CT",
+    "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "wandb": True,
     # "wandb": False,
     "project_name": "mri2ct",
     "viz_limit": 2,
+    "model_save_interval": 50,
     
     # Data
     "subjects": ["1ABA005_3.0x3.0x3.0_resampled", "1ABA005_3.0x3.0x3.0_resampled"], # None for all
@@ -1059,7 +1253,8 @@ DEFAULT_CONFIG = {
     # "patches_per_volume": 100,
     "patches_per_volume": 20,
     "data_queue_max_length": 300,
-
+    "anatomix_weights": "v2", # "v1", "v2"
+    
     # Training
     "lr": 3e-4,
     "val_interval": 1,
@@ -1093,147 +1288,17 @@ DEFAULT_CONFIG = {
     # Loss Weights
     "l1_w": 1.0,
     "l2_w": 0.0,
-    "ssim_w": 1.0
+    "ssim_w": 1.0,
+    "perceptual_w": 0.0, # 0.0 to disable
+
+    "wandb_note": None,
+    "resume_wandb_id": None, # "3abc5def" (run-DATE-id). If None, starts fresh.
 }
 
 
 if __name__ == "__main__":
     # Define experiments here
     experiments = [
-        # {
-        #     "model_type": "mlp",
-        #     "epochs_mlp": 1000,
-        #     "mlp_depth": 4,
-        #     # "mlp_depth": 9,
-        #     # "mlp_depth": 6,
-        #     # "mlp_hidden": 512,
-        #     "mlp_hidden": 256,
-        #     "subjects": None,
-        #     # "region": "AB",
-        #     # "dropout": 0.2,
-        #     "dropout": 0,
-        #     # "mlp_batch_size": 884736,
-        #     # "mlp_batch_size": 4096,
-        #     # "accum_steps": 32,
-        #     "mlp_batch_size": 32768,
-        #     "accum_steps": 4,
-        #     # "accum_steps": 1,
-        #     # "patches_per_volume": 30,
-        #     # "patches_per_volume": 50,
-        #     # "patches_per_volume": 100,
-        #     # "fourier": False,
-        #     # "steps_per_epoch": 1024,
-        #     "steps_per_epoch": 512,
-        #     # "lr": 1e-3,
-        #     "augment": True,
-        # },
-        # {
-        #     "model_type": "cnn",
-        #     "cnn_depth": 7,
-        #     "cnn_hidden": 64,
-        #     # "cnn_depth": 9,
-        #     # "cnn_hidden": 128,
-        #     "epochs_cnn": 200,
-        #     "subjects": None,
-        #     # "region": "AB",
-        #     # "dropout": 0.2,
-        #     "dropout": 0,
-        #     "accum_steps": 1,
-        #     # "steps_per_epoch": 1024,
-        #     "steps_per_epoch": 200,
-        #     "patches_per_volume": 30,
-        #     # "enable_safety_padding": False,
-        #     # "lr": 1e-3,
-        #     "augment": True,
-        #     # "final_activation": "none",
-        #     # "finetune_feat_extractor": True,
-        # },
-        # { # finetune_feat_extractor
-        #     "model_type": "cnn",
-        #     "cnn_depth": 7,
-        #     "cnn_hidden": 64,
-        #     "subjects": None,
-        #     "region": "AB",
-        #     "epochs_cnn": 30,
-        #     "dropout": 0,
-        #     "accum_steps": 1,
-        #     "steps_per_epoch": 512,
-        #     "patches_per_volume": 30,
-        #     "lr": 1e-3,
-        #     "augment": True,
-        #     "finetune_feat_extractor": True,
-        # },
-        # { # base
-        #     "model_type": "cnn",
-        #     "cnn_depth": 7,
-        #     "cnn_hidden": 64,
-        #     "subjects": None,
-        #     "region": "AB",
-        #     "epochs_cnn": 30,
-        #     "dropout": 0,
-        #     "accum_steps": 1,
-        #     "steps_per_epoch": 512,
-        #     "patches_per_volume": 30,
-        #     "lr": 1e-3,
-        #     "augment": True,
-        # },
-        # { # dropout
-        #     "model_type": "cnn",
-        #     "cnn_depth": 7,
-        #     "cnn_hidden": 64,
-        #     "subjects": None,
-        #     "region": "AB",
-        #     "epochs_cnn": 30,
-        #     "dropout": 0.2,
-        #     "accum_steps": 1,
-        #     "steps_per_epoch": 512,
-        #     "patches_per_volume": 30,
-        #     "lr": 1e-3,
-        #     "augment": True,
-        # },
-        # { # activation
-        #     "model_type": "cnn",
-        #     "cnn_depth": 7,
-        #     "cnn_hidden": 64,
-        #     "subjects": None,
-        #     "region": "AB",
-        #     "epochs_cnn": 30,
-        #     "dropout": 0,
-        #     "accum_steps": 1,
-        #     "steps_per_epoch": 512,
-        #     "patches_per_volume": 30,
-        #     "lr": 1e-3,
-        #     "augment": True,
-        #     "final_activation": "none",
-        # },
-        # { # small cnn
-        #     "model_type": "cnn",
-        #     "cnn_depth": 4,
-        #     "cnn_hidden": 64,
-        #     "subjects": None,
-        #     "region": "AB",
-        #     "epochs_cnn": 30,
-        #     "dropout": 0,
-        #     "accum_steps": 1,
-        #     "steps_per_epoch": 512,
-        #     "patches_per_volume": 30,
-        #     "lr": 1e-3,
-        #     "augment": True,
-        # },
-        # { # big cnn
-        #     "model_type": "cnn",
-        #     "cnn_depth": 9,
-        #     "cnn_hidden": 64,
-        #     "subjects": None,
-        #     "region": "AB",
-        #     "epochs_cnn": 30,
-        #     "dropout": 0,
-        #     "accum_steps": 1,
-        #     "steps_per_epoch": 512,
-        #     "patches_per_volume": 30,
-        #     "lr": 1e-3,
-        #     "augment": True,
-        # },
         {
             "model_type": "cnn",
             "cnn_depth": 9,
@@ -1244,9 +1309,17 @@ if __name__ == "__main__":
             # "region": "AB",
             "dropout": 0,
             "accum_steps": 1,
-            "steps_per_epoch": 200,
+            "cnn_batch_size": 4,
+            "steps_per_epoch": 50,
             "patches_per_volume": 30,
             "augment": True,
+            "perceptual_w": 0.1, 
+            "wandb_note": "test_run",
+            
+            # "cnn_batch_size": 1,
+            # "steps_per_epoch": 5,
+            # "model_save_interval": 1,
+            # "resume_wandb_id": "wxvrgfy6", 
         },
     ]
 
