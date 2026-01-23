@@ -65,6 +65,27 @@ def minmax(arr, minclip=None, maxclip=None):
         return torch.zeros_like(arr)
     return (arr - arr.min()) / denom
 
+# Robust Scaling for MRI
+def robust_scale(arr, p_min=1, p_max=99):
+    """Scales array based on percentiles to handle MRI outliers."""
+    if not torch.is_tensor(arr):
+        arr = torch.as_tensor(arr)
+        
+    # Calculate percentiles
+    # NOTE: quantile requires float32/64
+    v_min = torch.quantile(arr.float(), p_min / 100.0)
+    v_max = torch.quantile(arr.float(), p_max / 100.0)
+    
+    # Clip to percentiles
+    arr = torch.clamp(arr, v_min, v_max)
+    
+    # MinMax Scale to [0, 1] based on the clipped range
+    denom = v_max - v_min
+    if denom == 0:
+        return torch.zeros_like(arr)
+        
+    return (arr - v_min) / denom
+    
 def unpad(data, original_shape):
     """
     Slices the input tensor to match original_shape.
@@ -124,7 +145,9 @@ def load_image_pair(root, subj_id, args):
     ct_img = tio.ScalarImage(ct_path)
     
     # Normalize (Numpy)
-    mri = minmax(mr_img.data[0]).numpy()
+    # mri = minmax(mr_img.data[0]).numpy()
+    mri_tensor = mr_img.data[0]
+    mri = robust_scale(mri_tensor).numpy()
     ct = minmax(ct_img.data[0], minclip=-450, maxclip=450).numpy()
     
     # Capture Original Shape (W, H, D)
@@ -166,7 +189,9 @@ class ProjectPreprocessing(tio.Transform):
         ct_data = subject['ct'].data
         subject['ct'].set_data(minmax(ct_data, -450, 450).float())
         mr_data = subject['mri'].data
-        subject['mri'].set_data(minmax(mr_data).float())
+        # subject['mri'].set_data(minmax(mr_data).float())
+        subject['mri'].set_data(robust_scale(mr_data).float())
+
 
         if self.enable_safety_padding:
             safety_margin = self.patch_size // 2  # 48 voxels
@@ -211,13 +236,22 @@ class ProjectPreprocessing(tio.Transform):
         return subject
 
 def get_augmentations():
-    return tio.Compose([
+    # 1. Geometric Transforms: Apply to BOTH MRI and CT (to keep them aligned)
+    spatial_transforms = tio.Compose([
         tio.RandomFlip(axes=(0, 1, 2), p=0.5),
-        tio.RandomBiasField(p=0.5),
-        tio.RandomNoise(std=0.02, p=0.25),
         tio.RandomAffine(scales=(0.9, 1.1), degrees=10, translation=5, p=0.5),
         tio.RandomElasticDeformation(num_control_points=7, max_displacement=7, p=0.25),
     ])
+
+    # 2. Intensity Transforms: Apply ONLY to MRI (the input)
+    #    Protect the CT (ground truth) from noise/bias artifacts.
+    intensity_transforms = tio.Compose([
+        tio.RandomBiasField(p=0.5, include=['mri']), 
+        tio.RandomNoise(std=0.02, p=0.25, include=['mri']),
+        tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.5, include=['mri'])
+    ])
+
+    return tio.Compose([spatial_transforms, intensity_transforms])
 
 class TioAdapter:
     def __init__(self, loader):
@@ -272,8 +306,8 @@ def get_dataloader(data_path_list, args):
         samples_per_volume=args.patches_per_volume,
         max_length=max(args.patches_per_volume, args.data_queue_max_length), 
         sampler=sampler,
-        # num_workers=4, 
-        num_workers=0, 
+        num_workers=3, 
+        # num_workers=0, 
         shuffle_subjects=True,
         shuffle_patches=True,
     )
@@ -533,7 +567,10 @@ def log_aug_viz(val_data, args, epoch, root_dir):
 # ==========================================
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_type, feat_extractor, args):
     model.train()
-    feat_extractor.eval()
+    if args.finetune_feat_extractor:
+        feat_extractor.train()
+    else:
+        feat_extractor.eval()
     
     total_loss = 0.0
     total_grad_norm = 0.0
@@ -560,10 +597,15 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_typ
                 mri, ct, location, vol_shape = next(loader_iter)
             
             mri, ct = mri.to(device), ct.to(device)
-            
+
             # 4. Feature Extraction
-            with torch.no_grad():
+            if args.finetune_feat_extractor:
+                # Normal forward pass (Gradients ON)
                 features = feat_extractor(mri)
+            else:
+                # Frozen pass (Gradients OFF)
+                with torch.no_grad():
+                    features = feat_extractor(mri)
             
             # 5. Forward Pass
             if model_type.lower() == "mlp":
@@ -583,7 +625,14 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device, model_typ
             step_loss += loss.item()
 
         # 6. Optimizer Step
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(feat_extractor.parameters()), 1.0)
+        
+        all_params = list(model.parameters())
+        if args.finetune_feat_extractor:
+            all_params += list(feat_extractor.parameters())
+        # Clip norms for everything
+        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         optimizer.step()
         
         total_grad_norm += grad_norm.item()
@@ -794,6 +843,7 @@ def run_experiment(exp_config_dict):
         return
 
     # 2. Train/Val Split
+    random.shuffle(subjects)
     num_val = max(1, int(len(subjects) * args.val_split)) # By default, use at least 1 validation subject
     train_subjects = subjects[:-num_val]
     val_subjects = subjects[-num_val:]
@@ -921,7 +971,25 @@ def run_experiment(exp_config_dict):
         epochs = args.epochs_cnn
         # model = torch.compile(model, mode="default")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    params = [
+        # Group 1: The Translator (Main model) - Uses standard LR
+        {'params': model.parameters(), 'lr': args.lr},
+    ]
+
+    if args.finetune_feat_extractor:
+        print(f"[INFO] 🔓 Fine-tuning Feature Extractor with LR={args.lr_feat_extractor}")
+        # Group 2: The Feature Extractor - Uses lower LR
+        params.append({'params': feat_extractor.parameters(), 'lr': args.lr_feat_extractor})
+        # Ensure it requires grad
+        for param in feat_extractor.parameters():
+            param.requires_grad = True
+    else:
+        print("[INFO] 🔒 Feature Extractor is FROZEN.")
+        for param in feat_extractor.parameters():
+            param.requires_grad = False
+            
+    optimizer = torch.optim.Adam(params)
     loss_fn = CompositeLoss(weights={"l1": args.l1_w, "l2": args.l2_w, "ssim": args.ssim_w}).to(device)
     scaler = None
     # scaler = torch.amp.GradScaler()
@@ -998,6 +1066,8 @@ DEFAULT_CONFIG = {
     "sanity_check": True,
     "accum_steps": 32,
     "steps_per_epoch": 1000,
+    "finetune_feat_extractor": False,
+    "lr_feat_extractor": 1e-5,
     
     # Model Choice
     "model_type": "mlp", # "mlp" or "cnn"
@@ -1030,45 +1100,154 @@ DEFAULT_CONFIG = {
 if __name__ == "__main__":
     # Define experiments here
     experiments = [
-        {
-            "model_type": "mlp",
-            "epochs_mlp": 1000,
-            # "mlp_depth": 4,
-            "mlp_depth": 6,
-            "mlp_hidden": 512,
-            "subjects": None,
-            # "region": "AB",
-            # "dropout": 0.2,
-            "dropout": 0,
-            # "mlp_batch_size": 884736,
-            # "mlp_batch_size": 4096,
-            # "accum_steps": 32,
-            "mlp_batch_size": 32768,
-            "accum_steps": 4,
-            # "accum_steps": 1,
-            # "patches_per_volume": 30,
-            # "patches_per_volume": 50,
-            # "patches_per_volume": 100,
-            # "fourier": False,
-            # "steps_per_epoch": 1024,
-            "steps_per_epoch": 256,
-        },
+        # {
+        #     "model_type": "mlp",
+        #     "epochs_mlp": 1000,
+        #     "mlp_depth": 4,
+        #     # "mlp_depth": 9,
+        #     # "mlp_depth": 6,
+        #     # "mlp_hidden": 512,
+        #     "mlp_hidden": 256,
+        #     "subjects": None,
+        #     # "region": "AB",
+        #     # "dropout": 0.2,
+        #     "dropout": 0,
+        #     # "mlp_batch_size": 884736,
+        #     # "mlp_batch_size": 4096,
+        #     # "accum_steps": 32,
+        #     "mlp_batch_size": 32768,
+        #     "accum_steps": 4,
+        #     # "accum_steps": 1,
+        #     # "patches_per_volume": 30,
+        #     # "patches_per_volume": 50,
+        #     # "patches_per_volume": 100,
+        #     # "fourier": False,
+        #     # "steps_per_epoch": 1024,
+        #     "steps_per_epoch": 512,
+        #     # "lr": 1e-3,
+        #     "augment": True,
+        # },
         # {
         #     "model_type": "cnn",
         #     "cnn_depth": 7,
         #     "cnn_hidden": 64,
+        #     # "cnn_depth": 9,
+        #     # "cnn_hidden": 128,
         #     "epochs_cnn": 200,
         #     "subjects": None,
         #     # "region": "AB",
-        #     "dropout": 0.2,
-        #     # "dropout": 0,
+        #     # "dropout": 0.2,
+        #     "dropout": 0,
         #     "accum_steps": 1,
         #     # "steps_per_epoch": 1024,
         #     "steps_per_epoch": 200,
         #     "patches_per_volume": 30,
         #     # "enable_safety_padding": False,
+        #     # "lr": 1e-3,
+        #     "augment": True,
+        #     # "final_activation": "none",
+        #     # "finetune_feat_extractor": True,
+        # },
+        # { # finetune_feat_extractor
+        #     "model_type": "cnn",
+        #     "cnn_depth": 7,
+        #     "cnn_hidden": 64,
+        #     "subjects": None,
+        #     "region": "AB",
+        #     "epochs_cnn": 30,
+        #     "dropout": 0,
+        #     "accum_steps": 1,
+        #     "steps_per_epoch": 512,
+        #     "patches_per_volume": 30,
         #     "lr": 1e-3,
-        # }
+        #     "augment": True,
+        #     "finetune_feat_extractor": True,
+        # },
+        # { # base
+        #     "model_type": "cnn",
+        #     "cnn_depth": 7,
+        #     "cnn_hidden": 64,
+        #     "subjects": None,
+        #     "region": "AB",
+        #     "epochs_cnn": 30,
+        #     "dropout": 0,
+        #     "accum_steps": 1,
+        #     "steps_per_epoch": 512,
+        #     "patches_per_volume": 30,
+        #     "lr": 1e-3,
+        #     "augment": True,
+        # },
+        # { # dropout
+        #     "model_type": "cnn",
+        #     "cnn_depth": 7,
+        #     "cnn_hidden": 64,
+        #     "subjects": None,
+        #     "region": "AB",
+        #     "epochs_cnn": 30,
+        #     "dropout": 0.2,
+        #     "accum_steps": 1,
+        #     "steps_per_epoch": 512,
+        #     "patches_per_volume": 30,
+        #     "lr": 1e-3,
+        #     "augment": True,
+        # },
+        # { # activation
+        #     "model_type": "cnn",
+        #     "cnn_depth": 7,
+        #     "cnn_hidden": 64,
+        #     "subjects": None,
+        #     "region": "AB",
+        #     "epochs_cnn": 30,
+        #     "dropout": 0,
+        #     "accum_steps": 1,
+        #     "steps_per_epoch": 512,
+        #     "patches_per_volume": 30,
+        #     "lr": 1e-3,
+        #     "augment": True,
+        #     "final_activation": "none",
+        # },
+        # { # small cnn
+        #     "model_type": "cnn",
+        #     "cnn_depth": 4,
+        #     "cnn_hidden": 64,
+        #     "subjects": None,
+        #     "region": "AB",
+        #     "epochs_cnn": 30,
+        #     "dropout": 0,
+        #     "accum_steps": 1,
+        #     "steps_per_epoch": 512,
+        #     "patches_per_volume": 30,
+        #     "lr": 1e-3,
+        #     "augment": True,
+        # },
+        # { # big cnn
+        #     "model_type": "cnn",
+        #     "cnn_depth": 9,
+        #     "cnn_hidden": 64,
+        #     "subjects": None,
+        #     "region": "AB",
+        #     "epochs_cnn": 30,
+        #     "dropout": 0,
+        #     "accum_steps": 1,
+        #     "steps_per_epoch": 512,
+        #     "patches_per_volume": 30,
+        #     "lr": 1e-3,
+        #     "augment": True,
+        # },
+        {
+            "model_type": "cnn",
+            "cnn_depth": 9,
+            "cnn_hidden": 128,
+            # "epochs_cnn": 200,
+            "epochs_cnn": 500,
+            "subjects": None,
+            # "region": "AB",
+            "dropout": 0,
+            "accum_steps": 1,
+            "steps_per_epoch": 200,
+            "patches_per_volume": 30,
+            "augment": True,
+        },
     ]
 
     print(f"📚 Found {len(experiments)} experiments to run.")
