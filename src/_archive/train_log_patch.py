@@ -52,7 +52,7 @@ def cleanup_gpu():
     gc.collect()
     torch.cuda.empty_cache()
 
-def anatomix_normalize(tensor, percentile_range = None, clip_range=None):
+def anatomix_normalize(tensor, min_percentile=0.0, max_percentile=100.0, clip_range=None):
     if not torch.is_tensor(tensor):
         tensor = torch.as_tensor(tensor, dtype=torch.float32)
     
@@ -65,25 +65,13 @@ def anatomix_normalize(tensor, percentile_range = None, clip_range=None):
             print(f"[WARNING] CT Window has 0 width: {clip_range}")
             return torch.zeros_like(tensor)
         return (tensor - min_c) / denom
-    
-    # 2. MRI path: Percentile Normalization (Instance-level)
-    if percentile_range is not None:
-        min_percentile, max_percentile = percentile_range
-        v_min = torch.quantile(tensor.float(), min_percentile / 100.0)
-        v_max = torch.quantile(tensor.float(), max_percentile / 100.0)
-        tensor = torch.clamp(tensor, v_min, v_max)
-    
-        denom = v_max - v_min
-        if denom == 0:
-            print(f"[WARNING] MRI Volume is constant (Val: {v_min:.4f}). Returning zeros.")
-            return torch.zeros_like(tensor)
-            
-        return (tensor - v_min) / denom
 
-    # 3. just minmax normalization
-    v_min = tensor.min()
-    v_max = tensor.max()
-    # tensor = torch.clamp(tensor, v_min, v_max)
+    # 2. MRI path: Percentile Normalization (Instance-level)
+    # v_min = tensor.min()
+    v_min = torch.quantile(tensor.float(), min_percentile / 100.0)
+    v_max = torch.quantile(tensor.float(), max_percentile / 100.0)
+    tensor = torch.clamp(tensor, v_min, v_max)
+
     denom = v_max - v_min
     if denom == 0:
         print(f"[WARNING] MRI Volume is constant (Val: {v_min:.4f}). Returning zeros.")
@@ -240,8 +228,9 @@ class DataPreprocessing(tio.Transform):
 
     def apply_transform(self, subject):
         subject['ct'].set_data(anatomix_normalize(subject['ct'].data, clip_range=(-450, 450)).float())
-        subject['mri'].set_data(anatomix_normalize(subject['mri'].data, percentile_range=(0,99.99)).float())
-        # subject['mri'].set_data(anatomix_normalize(subject['mri'].data).float())
+        # subject['mri'].set_data(anatomix_normalize(subject['mri'].data, max_percentile=99.99).float())
+        subject['mri'].set_data(anatomix_normalize(subject['mri'].data, min_percentile=0.5, max_percentile=99.5).float())
+        
         
         # Save original shape
         subject['original_shape'] = torch.tensor(subject['ct'].spatial_shape)
@@ -291,31 +280,34 @@ class DataPreprocessing(tio.Transform):
 
 def get_augmentations():
     return tio.Compose([
-        # Applied to BOTH MRI and CT identically
+        # Applied to BOTH MRI and CT identically to preserve alignment.
         tio.OneOf({
+            # A. Elastic Deformation (The heavy lifter)
             tio.RandomElasticDeformation(
                 num_control_points=7, 
-                max_displacement=4, 
+                max_displacement=6, 
                 locked_borders=2, 
                 image_interpolation='bspline' 
             ): 0.3, 
+            # B. Affine (Position/Orientation)
             tio.RandomAffine(
-                scales=(0.95, 1.1), 
-                degrees=7, 
-                translation=4,
+                scales=(0.9, 1.1), 
+                degrees=15, 
+                translation=10,
                 default_pad_value='minimum'
             ): 0.7,
         }, p=0.8), 
         tio.RandomFlip(axes=(0, 1, 2), p=0.5),
-        tio.Clamp(0, 1),
-        
+
+        # Applied ONLY to MRI. 
         tio.Compose([
             tio.RandomBiasField(coefficients=0.3, p=0.4),
             tio.RandomGamma(log_gamma=(-0.2, 0.2), p=0.4),
         ], include=['mri']) ,
-        tio.Clamp(0, 1),
+        
+        tio.Clamp(0, 1)
     ])
-    
+
 # ==========================================
 # 3. TRAINER CLASS
 # ==========================================
@@ -337,7 +329,68 @@ class Trainer:
         self.start_epoch = 0
         self.global_start_time = None 
         self._load_resume()
+    
+    @torch.no_grad()
+    def _log_training_patch(self, mri, ct, epoch, step):
+        """
+        NEW: 학습 중인 배치의 첫 번째 패치(MRI, CT)를 3방향(Axial, Sagittal, Coronal)으로 시각화.
+        Min/Max 값을 표시하여 정규화 상태도 함께 점검함.
+        """
+        # [DEBUG] Tensor -> Numpy (Batch 0, Channel 0)
+        # Shape 가정: (W, H, D)
+        img_in = mri[0, 0].detach().cpu().numpy()
+        img_gt = ct[0, 0].detach().cpu().numpy()
+        
+        # 각 차원의 중앙 인덱스 계산
+        cx, cy, cz = np.array(img_in.shape) // 2
 
+        # 2행 3열 그래프 생성 (Row 1: MRI, Row 2: CT)
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+        
+        # --- Row 1: MRI ---
+        # Axial (XY plane) -> z축 고정
+        axes[0, 0].imshow(np.rot90(img_in[:, :, cz]), cmap='gray')
+        axes[0, 0].set_title(f"MRI Axial (Z={cz})")
+        
+        # Sagittal (YZ plane) -> x축 고정
+        axes[0, 1].imshow(np.rot90(img_in[cx, :, :]), cmap='gray')
+        axes[0, 1].set_title(f"MRI Sagittal (X={cx})")
+        
+        # Coronal (XZ plane) -> y축 고정
+        axes[0, 2].imshow(np.rot90(img_in[:, cy, :]), cmap='gray')
+        axes[0, 2].set_title(f"MRI Coronal (Y={cy})")
+        
+        # MRI 통계 표시 (정규화 확인용)
+        fig.text(0.5, 0.95, f"MRI Patch Stats | Min: {img_in.min():.2f}, Max: {img_in.max():.2f}", 
+                 ha='center', fontsize=12, color='blue')
+
+        # --- Row 2: CT ---
+        # Axial
+        axes[1, 0].imshow(np.rot90(img_gt[:, :, cz]), cmap='gray')
+        axes[1, 0].set_title(f"CT Axial (Z={cz})")
+        
+        # Sagittal
+        axes[1, 1].imshow(np.rot90(img_gt[cx, :, :]), cmap='gray')
+        axes[1, 1].set_title(f"CT Sagittal (X={cx})")
+        
+        # Coronal
+        axes[1, 2].imshow(np.rot90(img_gt[:, cy, :]), cmap='gray')
+        axes[1, 2].set_title(f"CT Coronal (Y={cy})")
+
+        # CT 통계 표시
+        fig.text(0.5, 0.48, f"CT Patch Stats | Min: {img_gt.min():.2f}, Max: {img_gt.max():.2f}", 
+                 ha='center', fontsize=12, color='red')
+
+        # 레이아웃 정리
+        for ax in axes.flatten():
+            ax.axis('off')
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Main Title 공간 확보
+        
+        # WandB 로깅
+        wandb.log({f"train/patch_viz_epoch_{epoch}_step_{step}": wandb.Image(fig)}, step=epoch)
+        plt.close(fig)
+        
     def _setup_wandb(self):
         if not self.cfg.wandb: return
         
@@ -452,8 +505,7 @@ class Trainer:
 
         # 6. Val Loader (Full Volume)
         val_objs = _make_subj_list(self.val_subjects)
-        val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult)
-        val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess) 
+        val_ds = tio.SubjectsDataset(val_objs, transform=preprocess) # No Augment
         self.val_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
 
     def _setup_models(self):
@@ -699,57 +751,6 @@ class Trainer:
             wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(fig)}, step=epoch)
         plt.close(fig)
 
-    # Added method to visualize training patches
-    @torch.no_grad()
-    def _log_training_patch(self, mri, ct, pred, epoch, step):
-        """
-        Visualizes MRI, Prediction, and CT (GT) for the first patch in the batch.
-        """
-        # 1. Prepare Data (Batch 0, Channel 0)
-        img_in = mri[0, 0].detach().cpu().float().numpy()
-        img_gt = ct[0, 0].detach().cpu().float().numpy()
-        img_pred = pred[0, 0].detach().cpu().float().numpy()
-        
-        # Center indices
-        cx, cy, cz = np.array(img_in.shape) // 2
-
-        # 3 Rows (MRI, Pred, CT), 3 Cols (Axial, Sagittal, Coronal)
-        fig, axes = plt.subplots(3, 3, figsize=(10, 10))
-        
-        # Helper to plot a row
-        def plot_row(row_idx, vol, title_prefix, vmin=None, vmax=None):
-            # Axial
-            axes[row_idx, 0].imshow(np.rot90(vol[:, :, cz]), cmap='gray', vmin=vmin, vmax=vmax)
-            axes[row_idx, 0].set_title(f"{title_prefix} Ax")
-            # Sagittal
-            axes[row_idx, 1].imshow(np.rot90(vol[cx, :, :]), cmap='gray', vmin=vmin, vmax=vmax)
-            axes[row_idx, 1].set_title(f"{title_prefix} Sag")
-            # Coronal
-            axes[row_idx, 2].imshow(np.rot90(vol[:, cy, :]), cmap='gray', vmin=vmin, vmax=vmax)
-            axes[row_idx, 2].set_title(f"{title_prefix} Cor")
-            
-            # Add stats text to the left of the row
-            axes[row_idx, 0].text(-5, 10, f"Min: {vol.min():.2f}\nMax: {vol.max():.2f}", 
-                                  fontsize=8, color='white', backgroundcolor='black')
-
-        # Row 1: MRI (Auto-scaled intensity)
-        plot_row(0, img_in, "MRI")
-
-        # Row 2: Prediction (Fixed 0-1 range to match CT)
-        plot_row(1, img_pred, "Pred", vmin=0, vmax=1)
-
-        # Row 3: CT (Fixed 0-1 range)
-        plot_row(2, img_gt, "GT CT", vmin=0, vmax=1)
-
-        # Cleanup
-        for ax in axes.flatten():
-            ax.axis('off')
-        
-        plt.tight_layout()
-        
-        wandb.log({f"train/patch_viz": wandb.Image(fig)}, step=epoch)
-        plt.close(fig)
-        
     # ==========================================
     # CORE LOGIC
     # ==========================================
@@ -764,7 +765,7 @@ class Trainer:
         
         pbar = tqdm(range(self.cfg.steps_per_epoch), desc=f"Train Ep {epoch}", leave=False, dynamic_ncols=True)
         
-        for step_idx in pbar:
+        for step in pbar:
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
             
@@ -773,6 +774,9 @@ class Trainer:
                 mri = batch['mri'][tio.DATA].to(self.device, non_blocking=True)
                 ct = batch['ct'][tio.DATA].to(self.device, non_blocking=True)
 
+                if self.cfg.wandb:
+                    self._log_training_patch(mri, ct, epoch, step)
+                    print(f"[DEBUG] 🛠️ Training patch logged for inspection.")
 
                 # Use 'dtype=torch.bfloat16' for Ampere+ GPUs (3090, 4090, A100, A6000)
                 # Use 'dtype=torch.float16' for older GPUs (2080, V100, Titan)
@@ -783,10 +787,6 @@ class Trainer:
                         with torch.no_grad(): features = self.feat_extractor(mri)
                     
                     pred = self.model(features)
-                    
-                    if self.cfg.wandb and step_idx == 0:
-                        self._log_training_patch(mri, ct, pred, epoch, step_idx)
-                    
                     fe_ref = self.feat_extractor if self.cfg.perceptual_w > 0 else None
                     loss, comps = self.loss_fn(pred, ct, feat_extractor=fe_ref)
                     
@@ -983,109 +983,24 @@ DEFAULT_CONFIG = {
     "resume_wandb_id": None, 
 }
 
-# EXPERIMENT_CONFIG = [
-#     {
-#         "total_epochs": 5000,
-#         "accum_steps": 2,
-#         "batch_size": 4,
-#         "steps_per_epoch": 25,
-#         # "anatomix_weights": "v1",
-#         # "val_interval": 10,
-#         "val_interval": 5,
-#         "sanity_check": False,
-        
-#         "patches_per_volume": 30,
-#         "data_queue_max_length": 500,
-#         "data_queue_num_workers": 4,
-
-#         "wandb_note": "test_run_long (new augmentation + val sliding window inference)",
-#         # "augment": False,
-        
-#         # "resume_wandb_id": "l2rpr7g5", 
-#     },
-# ]
-
 EXPERIMENT_CONFIG = [
-#     # ==========================================================
-#     # GROUP 1: THE ANCHOR (BASELINE)
-#     # ==========================================================
-#     {
-#         "wandb_note": "01_Ref_BS1_Acc4_W4 | GOAL: Establish baseline samples/sec and VRAM floor. HYPOTHESIS: Safest but slowest due to lack of parallelism.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "model_compile_mode": "default", "data_queue_max_length": 200,
-#     },
+    {
+        "total_epochs": 5000,
+        "accum_steps": 1,
+        "batch_size": 4,
+        "steps_per_epoch": 25,
+        # "anatomix_weights": "v1",
+        "val_interval": 10,
+        "sanity_check": False,
+        
+        "patches_per_volume": 50,
+        "data_queue_max_length": 200,
+        "data_queue_num_workers": 4,
 
-#     # ==========================================================
-#     # GROUP 2: GPU PARALLELISM (VRAM TRADE-OFF)
-#     # ==========================================================
-#     {
-#         "wandb_note": "02_Speed_BS4_Acc1 | GOAL: Measure raw throughput gain from 4x parallelism. HYPOTHESIS: Significant speedup, but risk of CUDA OOM.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 4, "accum_steps": 1, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "model_compile_mode": "default", "data_queue_max_length": 200,
-#     },
-#     {
-#         "wandb_note": "03_Hybrid_BS2_Acc2 | GOAL: Find 'Goldilocks' zone for VRAM efficiency. HYPOTHESIS: Balanced speed increase with lower VRAM risk than BS4.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 2, "accum_steps": 2, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "model_compile_mode": "default", "data_queue_max_length": 200,
-#     },
-
-#     # ==========================================================
-#     # GROUP 3: COMPILATION (CPU VS GPU BOTTLENECK)
-#     # ==========================================================
-#     {
-#         "wandb_note": "04_Compile_None | GOAL: Measure cost of JIT overhead. HYPOTHESIS: If speed is same as Ref, 'default' compilation is useless for this small CNN.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "model_compile_mode": None, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "data_queue_max_length": 200,
-#     },
-#     {
-#         "wandb_note": "05_Compile_ReduceOverhead | GOAL: Test CUDA Graphs for launch-lag. HYPOTHESIS: Fastest iteration time, but creates the highest VRAM spikes.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "model_compile_mode": "reduce-overhead", 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "data_queue_max_length": 200,
-#     },
-
-#     # ==========================================================
-#     # GROUP 4: CPU WORKER SCALING
-#     # ==========================================================
-    # {
-    #     "wandb_note": "06_Workers_0 | GOAL: Identify absolute IO/CPU floor. HYPOTHESIS: GPU will be mostly idle (0-10% util), proving dataloader necessity.",
-    #     "total_epochs": 10, "steps_per_epoch": 50,
-    #     "batch_size": 2, "accum_steps": 2,
-    #     "data_queue_num_workers": 0, 
-    #     "patches_per_volume": 50, "model_compile_mode": "default",
-    #     "data_queue_max_length": 200,
-    # },
-    
-#     {
-#         "wandb_note": "07_Workers_8 | GOAL: Test CPU process overhead. HYPOTHESIS: If GPU util doesn't increase over Ref, W8 is a waste of system RAM.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "data_queue_num_workers": 8, 
-#         "patches_per_volume": 50, "model_compile_mode": "default",
-#         "data_queue_max_length": 200,
-#     },
-    
-#     # ==========================================================
-#     # GROUP 5: DISK IO EFFICIENCY
-#     # ==========================================================
-#     {
-#         "wandb_note": "08_Patches100 | GOAL: Measure NIfTI read/augment overhead. HYPOTHESIS: Faster samples/sec by dividing disk load time across 100 patches.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "data_queue_num_workers": 4, "patches_per_volume": 100, 
-#         "data_queue_max_length": 500, "model_compile_mode": "default",
-#     },
+        "wandb_note": "test_run_data",
+        
+        # "resume_wandb_id": "l2rpr7g5", 
+    },
 ]
 
 if __name__ == "__main__":
