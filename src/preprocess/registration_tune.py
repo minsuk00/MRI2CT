@@ -14,15 +14,18 @@ warnings.filterwarnings("ignore", category=UserWarning, module='monai.utils.modu
 from anatomix.registration import convex_adam
 
 ROOT = "/home/minsukc/MRI2CT"
-DATA_DIR = os.path.join(ROOT, "data")
-CKPT = os.path.join(ROOT, "anatomix/model-weights/anatomix.pth")
+DATA_DIR = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm"
+CKPT = os.path.join(ROOT, "anatomix/model-weights/best_val_net_G.pth")
+RES_MULT = 32
+# CKPT = os.path.join(ROOT, "anatomix/model-weights/anatomix.pth")
 SCRATCH_ROOT =  "/scratch/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/"
 # OUTPUT_DIR = os.path.join(ROOT, "tuning_outputs")
 OUTPUT_DIR = os.path.join(SCRATCH_ROOT, "tuning_outputs")
 
 # --- 1. Define Subjects ---
 # Leave None to scan all folders in DATA_DIR that have required files
-TARGET_SUBJECTS = None 
+# TARGET_SUBJECTS = None 
+TARGET_SUBJECTS = ["1ABA005", "1BA014","1HNA013","1PA021","1THA010"]  
 # TARGET_SUBJECTS = ["1ABA005_3.0x3.0x3.0_resampled", "1HNA001_3.0x3.0x3.0_resampled", "1THA001_3.0x3.0x3.0_resampled"]
 # TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled","1ABA009_3.0x3.0x3.0_resampled","1ABA011_3.0x3.0x3.0_resampled","1ABA012_3.0x3.0x3.0_resampled","1ABA014_3.0x3.0x3.0_resampled","1ABA018_3.0x3.0x3.0_resampled","1ABA019_3.0x3.0x3.0_resampled","1ABA025_3.0x3.0x3.0_resampled","1ABA029_3.0x3.0x3.0_resampled","1ABA030_3.0x3.0x3.0_resampled","1HNA001_3.0x3.0x3.0_resampled","1HNA004_3.0x3.0x3.0_resampled","1HNA006_3.0x3.0x3.0_resampled","1HNA008_3.0x3.0x3.0_resampled","1HNA010_3.0x3.0x3.0_resampled","1HNA012_3.0x3.0x3.0_resampled","1HNA013_3.0x3.0x3.0_resampled","1HNA014_3.0x3.0x3.0_resampled","1HNA015_3.0x3.0x3.0_resampled","1HNA018_3.0x3.0x3.0_resampled","1THA001_3.0x3.0x3.0_resampled","1THA002_3.0x3.0x3.0_resampled","1THA003_3.0x3.0x3.0_resampled","1THA004_3.0x3.0x3.0_resampled","1THA005_3.0x3.0x3.0_resampled","1THA010_3.0x3.0x3.0_resampled","1THA011_3.0x3.0x3.0_resampled","1THA013_3.0x3.0x3.0_resampled","1THA015_3.0x3.0x3.0_resampled","1THA016_3.0x3.0x3.0_resampled"]
 
@@ -35,7 +38,6 @@ grid = {
     # 3. Grid Resolution
     'grid_sp': [2, 3],
     # 4. Iterations
-    # 'selected_niter': [40, 80, 120],
     'selected_niter': [80],
     'smooth': [0, 1],
 }
@@ -50,8 +52,8 @@ REGION_MAPS = {
     "head_neck": {
         "Brain": (90, 50)
     },
-    "brain": {},
-    "pelvis": {}
+    "brain": {"Brain": (90, 50)},
+    "pelvis": {"Bladder": (21, 16), "Sacrum": (25, 18), "Femur_L": (75, 36), "Femur_R": (76, 37)}
 }
 
 # ==========================================
@@ -110,61 +112,49 @@ def get_region_from_id(subject_id):
     )
 
 def discover_tuning_subjects(data_dir, target_list=None):
-    """
-    Scans data_dir for subjects that have ALL required files for tuning.
-    Returns a list of dicts: [{'id': '...', 'region': '...'}, ...]
-    """
     valid_configs = []
+    splits = ["train", "val", "test"]
     
-    # Candidates: Either specific targets or all subdirectories
-    if target_list:
-        candidates = target_list
-    else:
-        candidates = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+    required_files = ["mr.nii.gz", "ct.nii.gz", "ct_seg.nii.gz", "mr_seg.nii.gz"]
 
-    print(f"🔎 Scanning {len(candidates)} candidates in {data_dir}...")
+    print(f"🔎 Scanning subjects in {data_dir}...")
 
-    required_files = [
-        "mr_resampled.nii.gz", "ct_resampled.nii.gz", 
-        "mask_resampled.nii.gz", "ct_seg.nii.gz", "mr_seg.nii.gz"
-    ]
-
-    for subj_id in candidates:
-        subj_path = os.path.join(data_dir, subj_id)
+    for split in splits:
+        split_path = os.path.join(data_dir, split)
+        if not os.path.exists(split_path): continue
         
-        # 1. Check if all files exist
-        missing = [f for f in required_files if not os.path.exists(os.path.join(subj_path, f))]
+        candidates = sorted([d for d in os.listdir(split_path) if os.path.isdir(os.path.join(split_path, d))])
         
-        if missing:
-            if target_list: # Only warn if user explicitly asked for this subject
-                print(f"   ❌ Skipping {subj_id}: Missing {missing}")
-            continue
+        for subj_id in candidates:
+            # Filter targets
+            if target_list and subj_id not in target_list: continue
+            
+            subj_full_path = os.path.join(split_path, subj_id)
+            missing = [f for f in required_files if not os.path.exists(os.path.join(subj_full_path, f))]
+            
+            if missing:
+                if target_list: print(f"   ❌ Skipping {subj_id}: Missing {missing}")
+                continue
 
-        # 2. Infer Region
-        region = get_region_from_id(subj_id)
-        
-        valid_configs.append({
-            "id": subj_id,
-            "region": region
-        })
+            valid_configs.append({
+                "id": subj_id,
+                "path": subj_full_path, # Keep full path
+                "region": get_region_from_id(subj_id)
+            })
 
     print(f"✅ Found {len(valid_configs)} valid subjects for tuning.")
     return valid_configs
 
-def prepare_subject_data(data_dir, subj_id):
-    """
-    Loads raw resampled files, applies minmax & padding, saves temporary files.
-    Returns a dictionary of paths to the temporary padded files.
-    """
-    target_dir = os.path.join(data_dir, subj_id)
+def prepare_subject_data(subj_conf):
+    target_dir = subj_conf['path']
+    subj_id = subj_conf['id']
     
-    # 1. Define Raw Paths (Input)
     raw_paths = {
-        'mr': os.path.join(target_dir, "mr_resampled.nii.gz"),
-        'ct': os.path.join(target_dir, "ct_resampled.nii.gz"),
-        'mask': os.path.join(target_dir, "mask_resampled.nii.gz"),
+        'mr': os.path.join(target_dir, "mr.nii.gz"),
+        'ct': os.path.join(target_dir, "ct.nii.gz"),
         'ct_seg': os.path.join(target_dir, "ct_seg.nii.gz"),
         'mr_seg': os.path.join(target_dir, "mr_seg.nii.gz"),
+        'mask': os.path.join(target_dir, "mask.nii.gz"), 
     }
     
     print(f"   Processing {subj_id}: Normalizing & Padding...")
@@ -187,20 +177,23 @@ def prepare_subject_data(data_dir, subj_id):
     ct_norm = minmax(ct_data, minclip=-450, maxclip=450)
     
     # 4. Pad to multiple of 16
-    mr_pad, _      = pad_to_multiple_np(mri_norm, 16)
-    ct_pad, _      = pad_to_multiple_np(ct_norm, 16)
-    mask_pad, _    = pad_to_multiple_np(mask_data, 16)
-    ct_seg_pad, _ = pad_to_multiple_np(ct_seg_data, 16)
-    mr_seg_pad, _ = pad_to_multiple_np(mr_seg_data, 16)
+    mr_pad, _      = pad_to_multiple_np(mri_norm, RES_MULT)
+    ct_pad, _      = pad_to_multiple_np(ct_norm, RES_MULT)
+    mask_pad, _    = pad_to_multiple_np(mask_data, RES_MULT)
+    ct_seg_pad, _ = pad_to_multiple_np(ct_seg_data, RES_MULT)
+    mr_seg_pad, _ = pad_to_multiple_np(mr_seg_data, RES_MULT)
 
     # 5. Define Output Paths (Temporary)
+    temp_dir = os.path.join(target_dir, "temp_tuning")
+    os.makedirs(temp_dir, exist_ok=True)
+    
     temp_paths = {
-        'fixed':       os.path.join(target_dir, "ct_padded_temp.nii.gz"),
-        'fixed_mask':  os.path.join(target_dir, "mask_padded_temp.nii.gz"), 
-        'fixed_seg':   os.path.join(target_dir, "ct_seg_padded_temp.nii.gz"),
-        'moving':      os.path.join(target_dir, "mr_padded_temp.nii.gz"),
-        'moving_mask': os.path.join(target_dir, "mask_padded_temp.nii.gz"),
-        'moving_seg':  os.path.join(target_dir, "mr_seg_padded_temp.nii.gz"),
+        'fixed':       os.path.join(temp_dir, "ct_padded_temp.nii.gz"),
+        'fixed_mask':  os.path.join(temp_dir, "mask_padded_temp.nii.gz"), 
+        'fixed_seg':   os.path.join(temp_dir, "ct_seg_padded_temp.nii.gz"),
+        'moving':      os.path.join(temp_dir, "mr_padded_temp.nii.gz"),
+        'moving_mask': os.path.join(temp_dir, "mask_padded_temp.nii.gz"),
+        'moving_seg':  os.path.join(temp_dir, "mr_seg_padded_temp.nii.gz"),
     }
 
     # 6. Save Temporary Files
@@ -487,7 +480,7 @@ def run_tuning_session(data_dir, output_root, ckpt_path, subjects_config, param_
 
         # --- A. Preprocess (Create Temp Files) ---
         try:
-            temp_paths = prepare_subject_data(data_dir, subj_id)
+            temp_paths = prepare_subject_data(subj_conf)
         except Exception as e:
             print(f"   ❌ Preprocessing failed: {e}")
             continue

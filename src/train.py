@@ -24,6 +24,7 @@ import nibabel as nib
 import wandb
 import torchio as tio
 from fused_ssim import fused_ssim
+from monai.inferers import sliding_window_inference
 
 from anatomix.model.network import Unet
 
@@ -35,6 +36,7 @@ torch.set_float32_matmul_precision('high')
 
 warnings.filterwarnings("ignore", category=UserWarning, module="monai.utils.module")
 warnings.filterwarnings("ignore", message=".*SubjectsLoader in PyTorch >= 2.3.*")
+warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensional indexing.*")
 os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 
 def set_seed(seed=42):
@@ -144,12 +146,22 @@ def compute_metrics(pred, target, data_range=1.0):
         "bone_dice": dice_val,  # 높을수록 좋음 (Higher is better)
     }
 
-def get_subject_paths(root, subj_id):
-    data_path = os.path.join(root, "data")
-    ct = glob(os.path.join(data_path, subj_id, "ct_resampled.nii*"))
-    mr = glob(os.path.join(data_path, subj_id, "registration_output", "moved_*.nii*"))
-    if not ct or not mr: raise FileNotFoundError(f"Missing files for {subj_id}")
-    return {'ct': ct[0], 'mri': mr[0]}
+def get_subject_paths(root, relative_path):
+    """
+    root: base directory (e.g., .../3.0x3.0x3.0mm)
+    relative_path: 'train/1ABA005' or just '1ABA005' if using flat structure
+    """
+    # Construct full path
+    subj_dir = os.path.join(root, relative_path)
+    
+    ct_path = os.path.join(subj_dir, "ct.nii.gz")
+    mr_path = os.path.join(subj_dir, "registration_output", "moved_mr.nii.gz")
+    
+    # Fallback for checking existence
+    if not os.path.exists(ct_path) or not os.path.exists(mr_path):
+        raise FileNotFoundError(f"Missing files in {subj_dir}")
+        
+    return {'ct': ct_path, 'mri': mr_path}
 
 class Config(SimpleNamespace):
     def __init__(self, dictionary, **kwargs):
@@ -195,7 +207,7 @@ class CompositeLoss(nn.Module):
         self.l1 = nn.L1Loss()
         self.l2 = nn.MSELoss()
 
-    def forward(self, pred, target, feat_extractor=None):
+    def forward(self, pred, target, feat_extractor=None, use_sliding_window=False):
         total_loss = 0.0
         loss_components = {}
         
@@ -220,11 +232,14 @@ class CompositeLoss(nn.Module):
         if self.weights.get("perceptual", 0) > 0:
             if feat_extractor is None: 
                 raise ValueError("Feat extractor missing for perceptual loss")
-            pred_feats = feat_extractor(pred)
-            with torch.no_grad(): target_feats = feat_extractor(target)
-            val = self.l1(pred_feats, target_feats)
-            total_loss += self.weights["perceptual"] * val
-            loss_components["loss_perceptual"] = val.item()
+            if use_sliding_window:
+                print("Skipping perceptual loss calculation during validation. NOTE: val loss will differ from train loss.")
+            else:
+                pred_feats = feat_extractor(pred)
+                with torch.no_grad(): target_feats = feat_extractor(target)
+                val = self.l1(pred_feats, target_feats)
+                total_loss += self.weights["perceptual"] * val
+                loss_components["loss_perceptual"] = val.item()
             
         return total_loss, loss_components
 
@@ -310,8 +325,8 @@ def get_augmentations():
         tio.Clamp(0, 1),
         
         tio.Compose([
-            tio.RandomBiasField(coefficients=0.3, p=0.4),
-            tio.RandomGamma(log_gamma=(-0.2, 0.2), p=0.4),
+            tio.RandomBiasField(coefficients=0.5, p=0.4),
+            tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.4),
         ], include=['mri']) ,
         tio.Clamp(0, 1),
     ])
@@ -356,35 +371,42 @@ class Trainer:
             resume="allow",
         )
         if not self.cfg.resume_wandb_id:
-            wandb.run.log_code(root=self.cfg.root_dir, include_fn=lambda path: path.endswith(".py"))
+            current_code_dir = os.path.dirname(os.path.abspath(__file__))
+            wandb.run.log_code(root=current_code_dir, include_fn=lambda path: path.endswith(".py"))
 
     def _setup_data(self):
-        # 1. Discovery
-        data_dir = os.path.join(self.cfg.root_dir, "data")
-        candidates = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+        print(f"[DEBUG] 📂 Searching for data in: {self.cfg.root_dir}")
         
+        # Helper to scan a folder
+        def scan_split(split_name):
+            split_dir = os.path.join(self.cfg.root_dir, split_name)
+            if not os.path.exists(split_dir): return []
+            return sorted([
+                os.path.join(split_name, d) # Store as relative path 'train/1ABA005'
+                for d in os.listdir(split_dir) 
+                if os.path.isdir(os.path.join(split_dir, d))
+            ])
+
+        train_candidates = scan_split("train")
+        val_candidates = scan_split("val")
+        
+        # Logic for 'subjects' (Single Image Optimization)
         if self.cfg.subjects:
-            candidates = self.cfg.subjects
-        elif self.cfg.region:
-            candidates = [c for c in candidates if self.cfg.region.upper() in c]
-            
-        # Validate existence
-        valid_subjs = []
-        for s in candidates:
-            if os.path.exists(os.path.join(data_dir, s, "ct_resampled.nii.gz")):
-                valid_subjs.append(s)
-        
-        # 2. Split
-        random.shuffle(valid_subjs)
-        num_val = max(1, int(len(valid_subjs) * self.cfg.val_split))
-        self.train_subjects = valid_subjs[:-num_val]
-        self.val_subjects = valid_subjs[-num_val:]
+            print(f"[DEBUG] 🎯 Filtering specific subjects: {self.cfg.subjects}")
+            # Filter candidates that end with the requested ID
+            # e.g., if requested '1ABA005', match 'train/1ABA005'
+            self.train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
+            self.val_subjects = self.train_subjects # Validate on the same subject for overfitting
+        else:
+            # Standard Mode: Use the existing splits
+            self.train_subjects = train_candidates
+            self.val_subjects = val_candidates
         
         print(f"[DEBUG] 📊 Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
 
         if self.cfg.analyze_shapes:
             shapes = []
-            for s in tqdm(self.train_subjects, desc="Analyzing Shapes"):
+            for s in tqdm(self.train_subjects[:30], desc="Analyzing Shapes (Sample)"):
                 try:
                     p = get_subject_paths(self.cfg.root_dir, s)
                     sh = nib.load(p['mri']).header.get_data_shape()
@@ -394,34 +416,14 @@ class Trainer:
             if shapes:
                 avg_shape = np.mean(np.array(shapes), axis=0).astype(int)
                 print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
-                if np.any(avg_shape < self.cfg.patch_size):
-                     print(f"⚠️ Warning: Mean shape {tuple(avg_shape)} is smaller than patch size {self.cfg.patch_size} in some dims. (Auto-padding is active to prevent crashes)")
         
         # 3. Helper to create paths
         def _make_subj_list(subjs):
             return [tio.Subject(
                 mri=tio.ScalarImage(p['mri']), 
                 ct=tio.ScalarImage(p['ct']),
-                subj_id=s
+                subj_id=os.path.basename(s) # Extract just ID for logging
             ) for s in subjs for p in [get_subject_paths(self.cfg.root_dir, s)]]
-
-        # 4. Monitor Data (One subject for viz)
-        self.train_monitor_data = None
-        if self.train_subjects:
-            ref_subj = self.train_subjects[0]
-            paths = get_subject_paths(self.cfg.root_dir, ref_subj)
-            # Create a localized subject for viz
-            subj_viz = tio.Subject(mri=tio.ScalarImage(paths['mri']), ct=tio.ScalarImage(paths['ct']), subj_id=ref_subj)
-            # Preprocess
-            prep = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult)
-            subj_viz = prep(subj_viz)
-            self.train_monitor_data = {
-                'id': ref_subj,
-                'mri': subj_viz['mri'][tio.DATA].unsqueeze(0),
-                'ct': subj_viz['ct'][tio.DATA].unsqueeze(0),
-                'orig_shape': subj_viz['original_shape'].tolist(),
-                'pad_offset': subj_viz['pad_offset']
-            }
 
         # 5. Train Loader (Queue)
         train_objs = _make_subj_list(self.train_subjects)
@@ -462,13 +464,15 @@ class Trainer:
         if self.cfg.anatomix_weights == "v1":
             self.cfg.res_mult = 16 
             self.feat_extractor = Unet(3, 1, 16, 4, 16).to(self.device)
-            ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "anatomix.pth")
+            # ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "anatomix.pth")
+            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/anatomix.pth"
         elif self.cfg.anatomix_weights == "v2":
             self.cfg.res_mult = 32
             self.feat_extractor = Unet(3, 1, 16, 5, 20, norm="instance", interp="trilinear", pooling="Avg").to(self.device)
             # Optimize inference speed
             self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
-            ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
+            # ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
+            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G.pth"
         else:
             raise ValueError("Invalid anatomix_weights")
             
@@ -506,12 +510,24 @@ class Trainer:
             params.append({'params': self.feat_extractor.parameters(), 'lr': self.cfg.lr_feat_extractor})
             
         self.optimizer = torch.optim.Adam(params)
+        
+        # Auto-Pilot Scheduler
+        # patience=10: Waits 10 validation checks (10 * 5 = 50 epochs) before dropping.
+        # factor=0.5: When stuck, cuts LR in half.
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            mode='min', 
+            factor=0.5, 
+            patience=5, 
+            min_lr=1e-6,
+        )
+
         self.loss_fn = CompositeLoss(weights={
             "l1": self.cfg.l1_w, "l2": self.cfg.l2_w, 
             "ssim": self.cfg.ssim_w, "perceptual": self.cfg.perceptual_w
         }).to(self.device)
         self.scaler = torch.cuda.amp.GradScaler()
-
+        
     def _load_resume(self):
         if not self.cfg.resume_wandb_id: return
         
@@ -565,31 +581,31 @@ class Trainer:
     # VISUALIZATION
     # ==========================================
     def _log_aug_viz(self, epoch):
-        """
-        Simulates augmentation on the monitor subject and logs it.
-        """
-        if not self.train_monitor_data: return
         try:
-            # Reconstruct Subject from Tensor
-            tm = self.train_monitor_data
-            subj = tio.Subject(
-                mri=tio.ScalarImage(tensor=tm['mri'][0].cpu()),
-                ct=tio.ScalarImage(tensor=tm['ct'][0].cpu())
-            )
+            # 1. Get Data
+            subj_id = self.val_subjects[0] 
+            paths = get_subject_paths(self.cfg.root_dir, subj_id)
             
-            # Apply Augmentation
-            aug_transform = get_augmentations()
-            aug = aug_transform(subj)
+            subj = tio.Subject(mri=tio.ScalarImage(paths['mri']), ct=tio.ScalarImage(paths['ct']))
+            prep = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult)
+            subj = prep(subj)
+
+            # 2. Augment
+            aug = get_augmentations()(subj)
             hist_str = " | ".join([t.name for t in aug.history])
 
-            # Viz Middle Slice
+            # 3. Slice & Plot
             z = subj['mri'].shape[-1] // 2
+            
+            # NOTE: If aug changes shape, this line will crash.
             orig_sl = subj['mri'].data[0, ..., z].numpy()
             aug_sl = aug['mri'].data[0, ..., z].numpy()
 
             fig, ax = plt.subplots(1, 3, figsize=(10, 4))
-            ax[0].imshow(np.rot90(orig_sl), cmap='gray', vmin=0, vmax=1); ax[0].set_title("Original")
+            ax[0].imshow(np.rot90(orig_sl), cmap='gray', vmin=0, vmax=1); ax[0].set_title(f"Original")
             ax[1].imshow(np.rot90(aug_sl), cmap='gray', vmin=0, vmax=1); ax[1].set_title(f"Augmented\n{hist_str}")
+            
+            # The simple Diff you wanted
             ax[2].imshow(np.rot90(aug_sl - orig_sl), cmap='seismic', vmin=-0.5, vmax=0.5); ax[2].set_title("Diff")
             
             wandb.log({"val/aug_viz": wandb.Image(fig)}, step=epoch)
@@ -597,6 +613,7 @@ class Trainer:
         except Exception as e:
             print(f"[WARNING] Aug Viz failed: {e}")
 
+    
     @torch.no_grad()
     def _visualize_full(self, pred, ct, mri, feats_mri, subj_id, shape, epoch, idx, offset=0):
         """
@@ -699,6 +716,54 @@ class Trainer:
             wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(fig)}, step=epoch)
         plt.close(fig)
 
+    @torch.no_grad()
+    def _visualize_lite(self, pred, ct, mri, subj_id, shape, epoch, idx, offset=0):
+        """
+        Lightweight visualization: MRI, GT, Pred, Residual. 
+        """
+        # 1. Unpad Volumes
+        w, h, d = shape
+        gt_ct = unpad(ct, shape, offset).cpu().numpy().squeeze()
+        gt_mri = unpad(mri, shape, offset).cpu().numpy().squeeze()
+        pred_ct = unpad(pred, shape, offset).cpu().numpy().squeeze()
+        
+        # 2. Define Items (Standard 4-column view)
+        items = [
+            (gt_mri, "GT MRI", "gray", (0,1)),
+            (gt_ct, "GT CT", "gray", (0,1)),
+            (pred_ct, "Pred CT", "gray", (0,1)),
+            (pred_ct - gt_ct, "Residual", "seismic", (-0.5, 0.5)),
+        ]
+
+        # 3. Plotting
+        D_dim = gt_ct.shape[-1]
+        num_cols = len(items)
+        slice_indices = np.linspace(0.1 * D_dim, 0.9 * D_dim, 5, dtype=int)
+        
+        fig, axes = plt.subplots(len(slice_indices), num_cols, figsize=(3 * num_cols, 3.5 * len(slice_indices)))
+        plt.subplots_adjust(wspace=0.05, hspace=0.15)
+        
+        if len(slice_indices) == 1: axes = axes.reshape(1, -1)
+
+        for i, z_slice in enumerate(slice_indices):
+            for j, (data, title, cmap, clim) in enumerate(items):
+                ax = axes[i, j]
+                im = ax.imshow(data[:, :, z_slice], cmap=cmap, vmin=clim[0], vmax=clim[1])
+                
+                if title == "Residual": res_im = im
+                if i == 0: ax.set_title(title)
+                ax.axis("off")
+
+        if 'res_im' in locals():
+            cbar = fig.colorbar(res_im, ax=axes[:, 3], fraction=0.04, pad=0.01)
+            cbar.set_label("Residual Error")
+        
+        fig.suptitle(f"Viz LITE — {subj_id} (Ep {epoch})", fontsize=16, y=0.99)
+        
+        if self.cfg.wandb:
+            wandb.log({f"viz/{('val_'+ str(idx))}": wandb.Image(fig)}, step=epoch)
+        plt.close(fig)
+        
     # Added method to visualize training patches
     @torch.no_grad()
     def _log_training_patch(self, mri, ct, pred, epoch, step):
@@ -826,8 +891,24 @@ class Trainer:
             subj_id = batch['subj_id'][0]
             pad_offset = batch['pad_offset'][0].item() if 'pad_offset' in batch else 0
             
-            feats = self.feat_extractor(mri)
-            pred = self.model(feats)
+            # Sliding Window (Lite) vs Full Volume (Standard)
+            feats = None
+            if self.cfg.val_sliding_window:
+                def combined_forward(x):
+                    return self.model(self.feat_extractor(x))
+
+                pred = sliding_window_inference(
+                    inputs=mri, 
+                    roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size), 
+                    sw_batch_size=self.cfg.val_sw_batch_size, 
+                    predictor=combined_forward,
+                    overlap=self.cfg.val_sw_overlap,
+                    mode="gaussian",
+                    device=self.device
+                )
+            else:
+                feats = self.feat_extractor(mri)
+                pred = self.model(feats)
             
             # Metrics
             pred_unpad = unpad(pred, orig_shape, pad_offset)
@@ -835,32 +916,22 @@ class Trainer:
             met = compute_metrics(pred_unpad, ct_unpad)
             
             # Loss (Composite)
-            l_val, _ = self.loss_fn(pred, ct, feat_extractor=self.feat_extractor)
+            l_val, _ = self.loss_fn(pred, ct, feat_extractor=self.feat_extractor, use_sliding_window = self.cfg.val_sliding_window)
             met['loss'] = l_val.item()
             
             for k, v in met.items():
                 val_metrics[k].append(v)
             
-            # Full Viz
+            # Viz
             if self.cfg.wandb and i < self.cfg.viz_limit:
-                # tqdm.write(f"   🔎 Val Viz [{i+1}/{self.cfg.viz_limit}] ({subj_id})")
-                self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, epoch, idx=i, offset = pad_offset)
-
-        # 2. Train Monitor
-        if self.cfg.wandb and self.train_monitor_data:
-            tm = self.train_monitor_data
-            tm_mri, tm_ct = tm['mri'].to(self.device), tm['ct'].to(self.device)
-            tm_feats = self.feat_extractor(tm_mri)
-            tm_pred = self.model(tm_feats)
-
-            tm_offset = tm['pad_offset'] if 'pad_offset' in tm else 0
-            
-            # Full Viz for Train Sample
-            self._visualize_full(tm_pred, tm_ct, tm_mri, tm_feats, f"{tm['id']}_TRAIN", tm['orig_shape'], epoch, idx=-1, offset = tm_offset)
-            
-            # Aug Viz
-            if self.cfg.augment:
-                self._log_aug_viz(epoch)
+                if self.cfg.val_sliding_window:
+                    self._visualize_lite(pred, ct, mri, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
+                else:
+                    self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
+        
+        # 2. Augmentation Viz
+        if self.cfg.wandb and self.cfg.augment:
+             self._log_aug_viz(epoch)
 
         # 3. Log
         avg_met = {k: np.mean(v) for k, v in val_metrics.items()}
@@ -895,26 +966,32 @@ class Trainer:
             
             loss, comps, gn = self.train_epoch(epoch)
             
+            if epoch % self.cfg.val_interval == 0 or (epoch+1) == self.cfg.total_epochs:
+                avg_met = self.validate(epoch)
+                val_loss = avg_met.get('loss', 0)
+
+                self.scheduler.step(val_loss)
+                
+                tqdm.write(
+                    f"Ep {epoch} | Train: {loss:.4f} | Val: {val_loss:.4f} | "
+                    f"SSIM: {avg_met.get('ssim',0):.4f} | PSNR: {avg_met.get('psnr',0):.2f} | "
+                    f"Bone: {avg_met.get('bone_dice',0):.4f}"
+                )
+
             ep_duration = time.time() - ep_start
             cumulative_time = time.time() - self.global_start_time
-            
+
             if self.cfg.wandb:
+                current_lr = self.optimizer.param_groups[0]['lr']
                 log = {
                     "train_loss/total": loss, 
                     "info/grad_norm": gn, 
                     "info/epoch_duration": ep_duration,
-                    "info/cumulative_time": cumulative_time
+                    "info/cumulative_time": cumulative_time,
+                    "info/lr": current_lr 
                 }
                 for k, v in comps.items(): log[k.replace("loss_", "train_loss/")] = v
                 wandb.log(log, step=epoch)
-            
-            if epoch % self.cfg.val_interval == 0 or (epoch+1) == self.cfg.total_epochs:
-                avg_met = self.validate(epoch)
-                
-                tqdm.write(
-                    f"Ep {epoch} | Train: {loss:.4f} | Val: {avg_met.get('loss',0):.4f} | "
-                    f"SSIM: {avg_met.get('ssim',0):.4f} | PSNR: {avg_met.get('psnr',0):.2f}"
-                )
                 
             if epoch % self.cfg.model_save_interval == 0:
                 self.save_checkpoint(epoch)
@@ -928,7 +1005,8 @@ class Trainer:
 # ==========================================
 DEFAULT_CONFIG = {
     # System
-    "root_dir": "/home/minsukc/MRI2CT",
+    # "root_dir": "/home/minsukc/MRI2CT",
+    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm", 
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -941,9 +1019,9 @@ DEFAULT_CONFIG = {
     "val_split": 0.1,
     "augment": True,
     "patch_size": 96,
-    "patches_per_volume": 50,
-    "data_queue_max_length": 200,
-    "data_queue_num_workers": 2,
+    "patches_per_volume": 40,
+    "data_queue_max_length": 400,
+    "data_queue_num_workers": 4,
     "anatomix_weights": "v2", # "v1", "v2"
     "res_mult": 32 ,
     "analyze_shapes": True, 
@@ -951,141 +1029,62 @@ DEFAULT_CONFIG = {
     # Training
     "lr": 3e-4,
     "val_interval": 1,
-    "sanity_check": False,
-    "accum_steps": 32,
+    "sanity_check": True,
+    "accum_steps": 2,
     "model_save_interval": 50,
-    "viz_limit": 2,
+    "viz_limit": 6,
     "viz_pca": False,
-    "steps_per_epoch": 1000,
+    "steps_per_epoch": 25,
     "finetune_feat_extractor": False,
     "lr_feat_extractor": 1e-5,
     
     # Model Choice
     "model_type": "cnn",
-    "model_compile_mode": "default", # "default", "reduce-overhead", None
-    "total_epochs": 500,
+    "model_compile_mode": None, # "default", "reduce-overhead", None
+    "total_epochs": 5001,
     "dropout": 0,
     
     # CNN Specifics
-    "batch_size": 1,
+    "batch_size": 4,
     "cnn_depth": 9,
     "cnn_hidden": 128,
     "final_activation": "sigmoid",
     "enable_safety_padding": True,
+
+    # Sliding Window & Viz Options
+    "val_sliding_window": True, 
+    "val_sw_batch_size": 4, 
+    "val_sw_overlap": 0.25, 
     
     # Loss Weights
     "l1_w": 1.0,
     "l2_w": 0.0,
     "ssim_w": 1.0,
-    "perceptual_w": 0.0, 
+    "perceptual_w": 0.0,
 
     "wandb_note": "test_run",
     "resume_wandb_id": None, 
 }
 
-# EXPERIMENT_CONFIG = [
-#     {
-#         "total_epochs": 5000,
-#         "accum_steps": 2,
-#         "batch_size": 4,
-#         "steps_per_epoch": 25,
-#         # "anatomix_weights": "v1",
-#         # "val_interval": 10,
-#         "val_interval": 5,
-#         "sanity_check": False,
-        
-#         "patches_per_volume": 30,
-#         "data_queue_max_length": 500,
-#         "data_queue_num_workers": 4,
-
-#         "wandb_note": "test_run_long (new augmentation + val sliding window inference)",
-#         # "augment": False,
-        
-#         # "resume_wandb_id": "l2rpr7g5", 
-#     },
-# ]
-
 EXPERIMENT_CONFIG = [
-#     # ==========================================================
-#     # GROUP 1: THE ANCHOR (BASELINE)
-#     # ==========================================================
-#     {
-#         "wandb_note": "01_Ref_BS1_Acc4_W4 | GOAL: Establish baseline samples/sec and VRAM floor. HYPOTHESIS: Safest but slowest due to lack of parallelism.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "model_compile_mode": "default", "data_queue_max_length": 200,
-#     },
-
-#     # ==========================================================
-#     # GROUP 2: GPU PARALLELISM (VRAM TRADE-OFF)
-#     # ==========================================================
-#     {
-#         "wandb_note": "02_Speed_BS4_Acc1 | GOAL: Measure raw throughput gain from 4x parallelism. HYPOTHESIS: Significant speedup, but risk of CUDA OOM.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 4, "accum_steps": 1, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "model_compile_mode": "default", "data_queue_max_length": 200,
-#     },
-#     {
-#         "wandb_note": "03_Hybrid_BS2_Acc2 | GOAL: Find 'Goldilocks' zone for VRAM efficiency. HYPOTHESIS: Balanced speed increase with lower VRAM risk than BS4.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 2, "accum_steps": 2, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "model_compile_mode": "default", "data_queue_max_length": 200,
-#     },
-
-#     # ==========================================================
-#     # GROUP 3: COMPILATION (CPU VS GPU BOTTLENECK)
-#     # ==========================================================
-#     {
-#         "wandb_note": "04_Compile_None | GOAL: Measure cost of JIT overhead. HYPOTHESIS: If speed is same as Ref, 'default' compilation is useless for this small CNN.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "model_compile_mode": None, 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "data_queue_max_length": 200,
-#     },
-#     {
-#         "wandb_note": "05_Compile_ReduceOverhead | GOAL: Test CUDA Graphs for launch-lag. HYPOTHESIS: Fastest iteration time, but creates the highest VRAM spikes.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "model_compile_mode": "reduce-overhead", 
-#         "data_queue_num_workers": 4, "patches_per_volume": 50,
-#         "data_queue_max_length": 200,
-#     },
-
-#     # ==========================================================
-#     # GROUP 4: CPU WORKER SCALING
-#     # ==========================================================
-    # {
-    #     "wandb_note": "06_Workers_0 | GOAL: Identify absolute IO/CPU floor. HYPOTHESIS: GPU will be mostly idle (0-10% util), proving dataloader necessity.",
-    #     "total_epochs": 10, "steps_per_epoch": 50,
-    #     "batch_size": 2, "accum_steps": 2,
-    #     "data_queue_num_workers": 0, 
-    #     "patches_per_volume": 50, "model_compile_mode": "default",
-    #     "data_queue_max_length": 200,
-    # },
+    {
+        "total_epochs": 5000,
+        "sanity_check": False,
+        
+        "accum_steps": 4,
+        "batch_size": 4,
+        "steps_per_epoch": 100,
+        "val_interval": 1,
+        "viz_limit": 10,
+        
     
-#     {
-#         "wandb_note": "07_Workers_8 | GOAL: Test CPU process overhead. HYPOTHESIS: If GPU util doesn't increase over Ref, W8 is a waste of system RAM.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "data_queue_num_workers": 8, 
-#         "patches_per_volume": 50, "model_compile_mode": "default",
-#         "data_queue_max_length": 200,
-#     },
-    
-#     # ==========================================================
-#     # GROUP 5: DISK IO EFFICIENCY
-#     # ==========================================================
-#     {
-#         "wandb_note": "08_Patches100 | GOAL: Measure NIfTI read/augment overhead. HYPOTHESIS: Faster samples/sec by dividing disk load time across 100 patches.",
-#         "total_epochs": 10, "steps_per_epoch": 50,
-#         "batch_size": 1, "accum_steps": 4,
-#         "data_queue_num_workers": 4, "patches_per_volume": 100, 
-#         "data_queue_max_length": 500, "model_compile_mode": "default",
-#     },
+        # "wandb_note": "long_run_anatomix_v2",
+        
+        "anatomix_weights": "v1",
+        "wandb_note": "long_run_anatomix_v1",
+        
+        # "resume_wandb_id": "l2rpr7g5", 
+    },
 ]
 
 if __name__ == "__main__":

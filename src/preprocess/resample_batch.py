@@ -4,179 +4,201 @@ import numpy as np
 import matplotlib.pyplot as plt
 import SimpleITK as sitk
 from tqdm import tqdm
+import random
 
-INPUT_DIR = "/scratch/jjparkcv_root/jjparkcv98/minsukc/SynthRAD2025/Task1"
-OUTPUT_DIR = "/home/minsukc/MRI2CT/data"
-# OUTPUT_DIR = "/scratch/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/data"
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+# Input Datasets (Add/Remove as needed)
+INPUT_DIRS = [
+    "/scratch/jjparkcv_root/jjparkcv98/minsukc/SynthRAD2025/Task1",
+    "/scratch/jjparkcv_root/jjparkcv98/minsukc/SynthRAD2023/Task1" 
+]
 
-# Number of volumes to process PER REGION. Set to None to process all.
-# NUM_VOLUMES = None  # e.g., 5 or None
-# NUM_VOLUMES = 10
-NUM_VOLUMES = 35
+# Correct Output Path
+OUTPUT_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined"
 
-# Target spacing in x y z (mm)
+# Split Ratios
+SPLIT_RATIOS = {"train": 0.7, "val": 0.1, "test": 0.2}
+
+# Target spacing (mm)
 TARGET_SPACING = [3.0, 3.0, 3.0]
-# TARGET_SPACING = [1.5, 1.5, 1.5]
+
+# Set to None to process ALL volumes
+NUM_VOLUMES = None 
+# NUM_VOLUMES = 5  # Debug mode
 
 def main():
-    # Setup directories
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    viz_dir = os.path.join(OUTPUT_DIR, "_visualizations")
-    
-    # Get regions (e.g., AB, HN, TH)
-    try:
-        regions = sorted([d for d in os.listdir(INPUT_DIR) if os.path.isdir(os.path.join(INPUT_DIR, d))])
-    except FileNotFoundError:
-        print(f"❌ Error: Input directory not found: {INPUT_DIR}")
-        return
-    
-    print(f"🚀 Starting Resampling Job")
-    print(f"   Input: {INPUT_DIR}")
-    print(f"   Output: {OUTPUT_DIR}")
+    print(f"🚀 Starting Multi-Dataset Resampling & Splitting")
     print(f"   Target Spacing: {TARGET_SPACING}")
-    print(f"   Limit per region: {'ALL' if NUM_VOLUMES is None else NUM_VOLUMES}")
-    print("-" * 50)
+    print(f"   Output Root: {OUTPUT_ROOT}")
 
-    total_processed = 0
+    # --- Step 1: Discover All Subjects ---
+    all_subjects = []
+    
+    for input_dir in INPUT_DIRS:
+        if not os.path.exists(input_dir):
+            print(f"❌ WARNING: Directory not found: {input_dir}")
+            continue
+            
+        print(f"🔎 Scanning: {input_dir}...")
+        try:
+            # Assumes structure: InputDir -> Region -> PatientID
+            regions = sorted([d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))])
+        except Exception as e:
+            print(f"❌ Error reading {input_dir}: {e}")
+            continue
 
-    for region in regions:
-        region_path = os.path.join(INPUT_DIR, region)
-        patients = sorted(os.listdir(region_path))
+        for region in regions:
+            region_path = os.path.join(input_dir, region)
+            patients = sorted(os.listdir(region_path))
+            
+            for pid in patients:
+                p_path = os.path.join(region_path, pid)
+                if os.path.isdir(p_path):
+                    all_subjects.append({
+                        "id": pid,
+                        "path": p_path,
+                        "region": region,
+                        "dataset": os.path.basename(input_dir)
+                    })
+
+    # Debug limit
+    if NUM_VOLUMES is not None:
+        print(f"⚠️ DEBUG MODE: Limiting to first {NUM_VOLUMES} subjects.")
+        all_subjects = all_subjects[:NUM_VOLUMES]
+
+    total_subjs = len(all_subjects)
+    print(f"✅ Found {total_subjs} total subjects.")
+    if total_subjs == 0: return
+
+    # --- Step 2: Shuffle & Assign Splits ---
+    # Random seed ensures the same split every time you run this script on the same data
+    random.seed(42) 
+    random.shuffle(all_subjects)
+
+    n_train = int(total_subjs * SPLIT_RATIOS["train"])
+    n_val = int(total_subjs * SPLIT_RATIOS["val"])
+    
+    splits = {
+        "train": all_subjects[:n_train],
+        "val": all_subjects[n_train:n_train+n_val],
+        "test": all_subjects[n_train+n_val:]
+    }
+
+    # --- Step 3: Resample and Save to Split Folders ---
+    # Example Output: .../SynthRAD_combined/3.0x3.0x3.0mm/train/12345/
+    spacing_str = "x".join([str(s) for s in TARGET_SPACING])
+    base_out = os.path.join(OUTPUT_ROOT, f"{spacing_str}mm") 
+
+    for split_name, subjects in splits.items():
+        print(f"\n📂 Processing SPLIT: {split_name.upper()} ({len(subjects)} volumes)")
         
-        # Filter: Take only first N patients if argument is provided
-        if NUM_VOLUMES is not None:
-            patients_to_process = patients[:NUM_VOLUMES]
-        else:
-            patients_to_process = patients
+        # Define split directory
+        split_dir = os.path.join(base_out, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+        
+        # Separate viz directory per split
+        viz_dir = os.path.join(base_out, "_visualizations", split_name) 
 
-        print(f"📂 Processing Region {region}: {len(patients_to_process)} volumes")
+        for idx, subj in enumerate(tqdm(subjects)):
+            # Save visualization for the first patient in each split to check quality
+            process_subject(subj, split_dir, viz_dir, save_viz=(idx == 0))
 
-        for idx, patient_id in enumerate(tqdm(patients_to_process)):
-            patient_dir = os.path.join(region_path, patient_id)
-            
-            mr_path = os.path.join(patient_dir, "mr.nii.gz")
-            ct_path = os.path.join(patient_dir, "ct.nii.gz")
-            mask_path = os.path.join(patient_dir, "mask.nii.gz")
+    print("\n" + "-" * 50)
+    print("🏁 Batch Processing Complete.")
 
-            # Check validity
-            if not (os.path.exists(mr_path) and os.path.exists(ct_path)):
-                continue
+def process_subject(subj, output_dir, viz_dir, save_viz=False):
+    """
+    Reads MR/CT, resamples them, and saves to the output_dir/PatientID/
+    """
+    pid = subj['id']
+    src_path = subj['path']
+    
+    mr_path = os.path.join(src_path, "mr.nii.gz")
+    ct_path = os.path.join(src_path, "ct.nii.gz")
+    mask_path = os.path.join(src_path, "mask.nii.gz")
 
-            # Create Output Directory
-            spacing_str = "x".join([str(s) for s in TARGET_SPACING])
-            out_patient_dir = os.path.join(OUTPUT_DIR, f"{patient_id}_{spacing_str}_resampled")
-            os.makedirs(out_patient_dir, exist_ok=True)
+    # Basic validation
+    if not (os.path.exists(mr_path) and os.path.exists(ct_path)):
+        return
 
-            out_mr_path = os.path.join(out_patient_dir, "mr_resampled.nii.gz")
-            out_ct_path = os.path.join(out_patient_dir, "ct_resampled.nii.gz")
-            # Skip if both main files already exist
-            if os.path.exists(out_mr_path) and os.path.exists(out_ct_path):
-                print(f"Skipping {patient_id} (already done)") # Optional log
-                continue
+    # Create patient folder inside the split directory
+    out_patient_dir = os.path.join(output_dir, pid)
+    os.makedirs(out_patient_dir, exist_ok=True)
 
-            # --- Resample ---
-            # Returns (original_array, resampled_array)
-            mr_orig, mr_res = resample_volume(mr_path, out_mr_path, TARGET_SPACING)
-            ct_orig, ct_res = resample_volume(ct_path, out_ct_path, TARGET_SPACING)
-            
-            mask_orig, mask_res = None, None
-            if os.path.exists(mask_path):
-                mask_orig, mask_res = resample_volume(mask_path, os.path.join(out_patient_dir, "mask_resampled.nii.gz"), TARGET_SPACING, is_mask=True)
+    # Naming convention: keeping it simple or appending suffix
+    out_mr = os.path.join(out_patient_dir, "mr.nii.gz")
+    out_ct = os.path.join(out_patient_dir, "ct.nii.gz")
+    out_mask = os.path.join(out_patient_dir, "mask.nii.gz")
 
-            # --- Visualize (Only first patient of the region) ---
-            if idx == 0:
-                # Prepare dictionaries for plotting function
-                # Normalize for display
-                orig_dict = {
-                    'MRI': minmax(mr_orig),
-                    'CT': minmax(ct_orig, -450, 450),
-                    'Mask': mask_orig
-                }
-                res_dict = {
-                    'MRI': minmax(mr_res),
-                    'CT': minmax(ct_res, -450, 450),
-                    'Mask': mask_res
-                }
-                save_comparison_plot(orig_dict, res_dict, patient_id, viz_dir)
-            
-            total_processed += 1
+    # Skip if done
+    if os.path.exists(out_mr) and os.path.exists(out_ct):
+        return 
 
-    print("-" * 50)
-    print(f"✅ Done! Processed {total_processed} total volumes.")
-    print(f"📊 Visualizations saved to: {viz_dir}")
+    try:
+        # Resample Images
+        mr_orig, mr_res = resample_volume(mr_path, out_mr, TARGET_SPACING)
+        ct_orig, ct_res = resample_volume(ct_path, out_ct, TARGET_SPACING)
+        
+        # Resample Mask (Nearest Neighbor) if exists
+        mask_orig, mask_res = None, None
+        if os.path.exists(mask_path):
+            mask_orig, mask_res = resample_volume(mask_path, out_mask, TARGET_SPACING, is_mask=True)
 
+        # QC Plot
+        if save_viz:
+            orig_dict = {'MRI': minmax(mr_orig), 'CT': minmax(ct_orig, -450, 450), 'Mask': mask_orig}
+            res_dict = {'MRI': minmax(mr_res), 'CT': minmax(ct_res, -450, 450), 'Mask': mask_res}
+            save_comparison_plot(orig_dict, res_dict, pid, viz_dir)
+
+    except Exception as e:
+        print(f"❌ Failed on {pid}: {e}")
+
+# ==========================================
+# UTILITIES
+# ==========================================
 def minmax(arr, minclip=None, maxclip=None):
-    """Normalize array to 0-1 range with optional clipping."""
     if minclip is not None and maxclip is not None:
         arr = np.clip(arr, minclip, maxclip)
-    
-    range_val = arr.max() - arr.min()
-    if range_val == 0:
-        return np.zeros_like(arr)
-    return (arr - arr.min()) / range_val
+    denom = arr.max() - arr.min()
+    if denom == 0: return np.zeros_like(arr)
+    return (arr - arr.min()) / denom
 
 def get_middle_slice(arr):
-    """Extract the middle axial slice."""
-    # SimpleITK arrays are usually (z, y, x)
+    if arr is None: return np.zeros((100,100))
     z_mid = arr.shape[0] // 2
     return arr[z_mid, :, :]
 
 def save_comparison_plot(orig_dict, res_dict, patient_id, save_dir):
-    """
-    Saves a comparison plot of middle slices.
-    orig_dict/res_dict: {'MRI': arr, 'CT': arr, 'Mask': arr}
-    """
     os.makedirs(save_dir, exist_ok=True)
-    
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
-    # Row 1: Originals
-    axes[0, 0].imshow(get_middle_slice(orig_dict['MRI']), cmap='gray')
-    axes[0, 0].set_title(f"Original MRI")
-    axes[0, 1].imshow(get_middle_slice(orig_dict['CT']), cmap='gray')
-    axes[0, 1].set_title(f"Original CT")
-    if orig_dict['Mask'] is not None:
-        axes[0, 2].imshow(get_middle_slice(orig_dict['Mask']), cmap='gray')
-        axes[0, 2].set_title(f"Original Mask")
-    else:
-        axes[0, 2].axis('off')
+    def plot_ax(ax, data, title):
+        ax.imshow(get_middle_slice(data), cmap='gray')
+        ax.set_title(title)
+        ax.axis('off')
 
-    # Row 2: Resampled
-    axes[1, 0].imshow(get_middle_slice(res_dict['MRI']), cmap='gray')
-    axes[1, 0].set_title(f"Resampled MRI")
-    axes[1, 1].imshow(get_middle_slice(res_dict['CT']), cmap='gray')
-    axes[1, 1].set_title(f"Resampled CT")
-    if res_dict['Mask'] is not None:
-        axes[1, 2].imshow(get_middle_slice(res_dict['Mask']), cmap='gray')
-        axes[1, 2].set_title(f"Resampled Mask")
-    else:
-        axes[1, 2].axis('off')
+    plot_ax(axes[0,0], orig_dict['MRI'], "Original MRI")
+    plot_ax(axes[0,1], orig_dict['CT'], "Original CT")
+    plot_ax(axes[0,2], orig_dict['Mask'], "Original Mask")
 
-    for ax_row in axes:
-        for ax in ax_row:
-            ax.axis('off')
+    plot_ax(axes[1,0], res_dict['MRI'], "Resampled MRI")
+    plot_ax(axes[1,1], res_dict['CT'], "Resampled CT")
+    plot_ax(axes[1,2], res_dict['Mask'], "Resampled Mask")
 
     plt.suptitle(f"Patient: {patient_id}", fontsize=16)
-    save_path = os.path.join(save_dir, f"{patient_id}_comparison.png")
-    plt.savefig(save_path)
+    plt.savefig(os.path.join(save_dir, f"{patient_id}_comparison.png"))
     plt.close()
-    # print(f"🖼️ Saved visualization to {save_path}")
 
 def resample_volume(in_path, out_path, target_spacing, is_mask=False):
-    """
-    Resamples a NIfTI file to target spacing.
-    Returns: The numpy array of the resampled image.
-    """
     img = sitk.ReadImage(in_path)
-    
-    # If visualization is needed, we need the original array too
-    # SimpleITK GetArrayFromImage returns (z, y, x)
     original_array = sitk.GetArrayFromImage(img) 
 
     original_spacing = img.GetSpacing()
     original_size = img.GetSize()
 
-    # Calculate new size
+    # Compute new dimensions
     new_size = [
         int(round(osz * ospc / tspc))
         for osz, ospc, tspc in zip(original_size, original_spacing, target_spacing)
@@ -189,7 +211,7 @@ def resample_volume(in_path, out_path, target_spacing, is_mask=False):
     resample.SetOutputOrigin(img.GetOrigin())
     resample.SetOutputPixelType(img.GetPixelIDValue())
 
-    # Use Nearest Neighbor for masks to preserve integer labels, Linear for images
+    # Important: Nearest Neighbor for masks to keep integer labels
     if is_mask:
         resample.SetInterpolator(sitk.sitkNearestNeighbor)
     else:

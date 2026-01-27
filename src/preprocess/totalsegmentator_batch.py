@@ -4,106 +4,67 @@ import torch
 import nibabel as nib
 import numpy as np
 import matplotlib.pyplot as plt
-from glob import glob
 from totalsegmentator.python_api import totalsegmentator
 from tqdm import tqdm
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-ROOT = "/home/minsukc/MRI2CT"
-DATA_DIR = os.path.join(ROOT, "data")
+# UPDATE: Point to the output of the previous step
+ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined"
+DATA_DIR = os.path.join(ROOT, "3.0x3.0x3.0mm") # The specific resolution folder
 
-# OPTION A: Define specific folders to process (leave None to process ALL)
+# Target specific subjects or None for ALL
 TARGET_LIST = None 
-# TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled"] 
-# TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled","1ABA009_3.0x3.0x3.0_resampled","1ABA011_3.0x3.0x3.0_resampled","1ABA012_3.0x3.0x3.0_resampled","1ABA014_3.0x3.0x3.0_resampled","1ABA018_3.0x3.0x3.0_resampled","1ABA019_3.0x3.0x3.0_resampled","1ABA025_3.0x3.0x3.0_resampled","1ABA029_3.0x3.0x3.0_resampled","1ABA030_3.0x3.0x3.0_resampled","1HNA001_3.0x3.0x3.0_resampled","1HNA004_3.0x3.0x3.0_resampled","1HNA006_3.0x3.0x3.0_resampled","1HNA008_3.0x3.0x3.0_resampled","1HNA010_3.0x3.0x3.0_resampled","1HNA012_3.0x3.0x3.0_resampled","1HNA013_3.0x3.0x3.0_resampled","1HNA014_3.0x3.0x3.0_resampled","1HNA015_3.0x3.0x3.0_resampled","1HNA018_3.0x3.0x3.0_resampled","1THA001_3.0x3.0x3.0_resampled","1THA002_3.0x3.0x3.0_resampled","1THA003_3.0x3.0x3.0_resampled","1THA004_3.0x3.0x3.0_resampled","1THA005_3.0x3.0x3.0_resampled","1THA010_3.0x3.0x3.0_resampled","1THA011_3.0x3.0x3.0_resampled","1THA013_3.0x3.0x3.0_resampled","1THA015_3.0x3.0x3.0_resampled","1THA016_3.0x3.0x3.0_resampled"]
-
 
 # --- PERFORMANCE SETTINGS ---
 DEVICE = "gpu" 
 # False = High Res (Slow, ~5 mins/scan). True = Low Res (Fast, ~30s/scan)
-FAST_MODE = False 
-# FAST_MODE = True
+# FAST_MODE = False 
+FAST_MODE = True
 
 # ==========================================
 # 2. UTILITIES
 # ==========================================
-def get_region_from_id(subject_id):
+def discover_subjects(data_root, target_list=None):
     """
-    Parses the subject ID to determine the anatomy region.
-    Logic: Looks at the 2 characters following the leading '1'.
-    e.g., 1ABA... -> AB -> abdomen
-    """
-    # 1. Basic Format Check
-    if len(subject_id) < 2 or not subject_id.startswith("1"):
-        raise ValueError(
-            f"⚠️ Invalid subject ID '{subject_id}'. Expected format '1XX...'"
-        )
-
-    # 2. Extract Code
-    region_code = subject_id[1:3].upper()
-
-    # 3. Map to regions
-    mapping = {
-        # SynthRAD 2025 (2-char codes)
-        "AB": "abdomen",
-        "TH": "thorax",
-        "HN": "head_neck",
-        # SynthRAD 2023 (1-char codes)
-        "B": "brain",
-        "P": "pelvis" 
-    }
-
-    # Extract candidates
-    code_2 = subject_id[1:3].upper()
-    code_1 = subject_id[1:2].upper()
-    
-    # Match
-    if code_2 in mapping:
-        return mapping[code_2]
-    elif code_1 in mapping:
-        return mapping[code_1]
-
-    raise ValueError(
-        f"⚠️ Region code '{region_code}' in '{subject_id}' is not recognized..."
-    )
-
-def discover_subjects(data_dir, target_list=None):
-    """
-    Scans the data directory for valid subjects containing necessary NIfTI files.
+    Scans data_root/train, data_root/val, and data_root/test for subjects.
     """
     valid_subjects = []
-    
-    # Determine candidates
-    if target_list:
-        candidates = target_list
-    else:
-        # Get all subdirectories
-        candidates = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+    splits = ["train", "val", "test"]
 
-    print(f"🔎 Scanning {len(candidates)} candidates in {data_dir}...")
+    print(f"🔎 Scanning subjects in {data_root}...")
 
-    for subj_id in candidates:
-        subj_path = os.path.join(data_dir, subj_id)
+    for split in splits:
+        split_path = os.path.join(data_root, split)
+        if not os.path.exists(split_path):
+            continue
+            
+        # Get patient IDs in this split
+        candidates = sorted([d for d in os.listdir(split_path) if os.path.isdir(os.path.join(split_path, d))])
         
-        # Define required files
-        mr_path = os.path.join(subj_path, "mr_resampled.nii.gz")
-        ct_path = os.path.join(subj_path, "ct_resampled.nii.gz")
+        for subj_id in candidates:
+            # Filter if TARGET_LIST is set
+            if target_list and subj_id not in target_list:
+                continue
 
-        # Check existence
-        if os.path.exists(mr_path) and os.path.exists(ct_path):
-            region = get_region_from_id(subj_id)
-            valid_subjects.append({
-                "id": subj_id,
-                "path": subj_path,
-                "region": region,
-                "mr": mr_path,
-                "ct": ct_path
-            })
-        else:
-            if target_list: # Only warn if user specifically asked for this one
-                print(f"   ❌ Missing files for {subj_id}. Skipping.")
+            subj_path = os.path.join(split_path, subj_id)
+            
+            # UPDATE: Filenames match the output of resample_and_split.py
+            mr_path = os.path.join(subj_path, "mr.nii.gz")
+            ct_path = os.path.join(subj_path, "ct.nii.gz")
+
+            if os.path.exists(mr_path) and os.path.exists(ct_path):
+                valid_subjects.append({
+                    "id": subj_id,
+                    "path": subj_path,
+                    "split": split,
+                    "mr": mr_path,
+                    "ct": ct_path
+                })
+            else:
+                if target_list: 
+                    print(f"   ❌ Missing files for {subj_id} in {split}. Skipping.")
 
     return valid_subjects
 
@@ -148,7 +109,6 @@ def save_qa_plot(ct_path, ct_seg_path, mr_path, mr_seg_path, save_path):
         plt.tight_layout()
         plt.savefig(save_path)
         plt.close(fig)
-        # print(f"   📸 QA Plot saved")
         
     except Exception as e:
         print(f"   ⚠️ QA Plot Error: {e}")
@@ -161,7 +121,7 @@ def run_batch_segmentation():
     subjects = discover_subjects(DATA_DIR, target_list=TARGET_LIST)
     
     if not subjects:
-        print("❌ No valid subjects found. Check your paths.")
+        print(f"❌ No valid subjects found in {DATA_DIR}. Check your paths.")
         return
 
     print(f"\n🚀 Starting TotalSegmentator Batch for {len(subjects)} subjects")
@@ -175,43 +135,49 @@ def run_batch_segmentation():
     for subj in tqdm(subjects, desc="Processing Subjects", unit="subj"):
         start_time = time.time()
         
+        # Outputs saved in the patient's folder
         ct_out = os.path.join(subj['path'], "ct_seg.nii.gz")
         mr_out = os.path.join(subj['path'], "mr_seg.nii.gz")
         qa_path = os.path.join(subj['path'], "segmentation_qa.png")
 
         # --- CT Segmentation ---
         if os.path.exists(ct_out):
-            tqdm.write("✅ CT Segmentation exists.")
+            # tqdm.write(f"[{subj['id']}] CT Seg exists.") 
+            pass
         else:
-            tqdm.write("🧠 Running CT Seg (Task: total)...")
+            tqdm.write(f"[{subj['id']}] Running CT Seg...")
             try:
                 totalsegmentator(
                     input=subj['ct'], output=ct_out, ml=True, 
-                    task="total", fastest=FAST_MODE, device=DEVICE, quiet = True
+                    # task="total", fast=FAST_MODE, device=DEVICE, quiet=True
+                    task="total", fast=FAST_MODE, device=DEVICE
                 )
-                # quiet = True, preview = True, skip_saving = True
             except Exception as e:
-                tqdm.write(f"💥 CT Seg Failed: {e}")
+                tqdm.write(f"💥 CT Seg Failed for {subj['id']}: {e}")
 
         # --- MR Segmentation ---
         if os.path.exists(mr_out):
-            tqdm.write("✅ MR Segmentation exists.")
+            pass
         else:
-            tqdm.write("🧠 Running MR Seg (Task: total_mr)...")
+            tqdm.write(f"[{subj['id']}] Running MR Seg...")
             try:
                 totalsegmentator(
                     input=subj['mr'], output=mr_out, ml=True, 
-                    task="total_mr", fastest=FAST_MODE, device=DEVICE, quiet = True
+                    # task="total_mr", fast=FAST_MODE, device=DEVICE, quiet=True
+                    task="total_mr", fast=FAST_MODE, device=DEVICE
                 )
             except Exception as e:
-                tqdm.write(f"💥 MR Seg Failed: {e}")
+                tqdm.write(f"💥 MR Seg Failed for {subj['id']}: {e}")
 
         # --- QA Visualization ---
+        # Only creating QA plot if both segments exist and plot doesn't exist
         if os.path.exists(ct_out) and os.path.exists(mr_out):
-            if not os.path.exists(qa_path):
-                save_qa_plot(subj['ct'], ct_out, subj['mr'], mr_out, qa_path)
+            save_qa_plot(subj['ct'], ct_out, subj['mr'], mr_out, qa_path)
+            # if not os.path.exists(qa_path):
+            #     save_qa_plot(subj['ct'], ct_out, subj['mr'], mr_out, qa_path)
         
-        tqdm.write(f"✨ Subject done in {time.time() - start_time:.1f}s")
+        # Optional: Print time per subject
+        tqdm.write(f"✨ {subj['id']} done in {time.time() - start_time:.1f}s")
 
 if __name__ == "__main__":
     run_batch_segmentation()

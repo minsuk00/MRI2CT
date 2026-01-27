@@ -146,12 +146,22 @@ def compute_metrics(pred, target, data_range=1.0):
         "bone_dice": dice_val,  # 높을수록 좋음 (Higher is better)
     }
 
-def get_subject_paths(root, subj_id):
-    data_path = os.path.join(root, "data")
-    ct = glob(os.path.join(data_path, subj_id, "ct_resampled.nii*"))
-    mr = glob(os.path.join(data_path, subj_id, "registration_output", "moved_*.nii*"))
-    if not ct or not mr: raise FileNotFoundError(f"Missing files for {subj_id}")
-    return {'ct': ct[0], 'mri': mr[0]}
+def get_subject_paths(root, relative_path):
+    """
+    root: base directory (e.g., .../3.0x3.0x3.0mm)
+    relative_path: 'train/1ABA005' or just '1ABA005' if using flat structure
+    """
+    # Construct full path
+    subj_dir = os.path.join(root, relative_path)
+    
+    ct_path = os.path.join(subj_dir, "ct.nii.gz")
+    mr_path = os.path.join(subj_dir, "registration_output", "moved_mr.nii.gz")
+    
+    # Fallback for checking existence
+    if not os.path.exists(ct_path) or not os.path.exists(mr_path):
+        raise FileNotFoundError(f"Missing files in {subj_dir}")
+        
+    return {'ct': ct_path, 'mri': mr_path}
 
 class Config(SimpleNamespace):
     def __init__(self, dictionary, **kwargs):
@@ -315,8 +325,8 @@ def get_augmentations():
         tio.Clamp(0, 1),
         
         tio.Compose([
-            tio.RandomBiasField(coefficients=0.3, p=0.4),
-            tio.RandomGamma(log_gamma=(-0.2, 0.2), p=0.4),
+            tio.RandomBiasField(coefficients=0.5, p=0.4),
+            tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.4),
         ], include=['mri']) ,
         tio.Clamp(0, 1),
     ])
@@ -361,35 +371,42 @@ class Trainer:
             resume="allow",
         )
         if not self.cfg.resume_wandb_id:
-            wandb.run.log_code(root=self.cfg.root_dir, include_fn=lambda path: path.endswith(".py"))
+            current_code_dir = os.path.dirname(os.path.abspath(__file__))
+            wandb.run.log_code(root=current_code_dir, include_fn=lambda path: path.endswith(".py"))
 
     def _setup_data(self):
-        # 1. Discovery
-        data_dir = os.path.join(self.cfg.root_dir, "data")
-        candidates = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+        print(f"[DEBUG] 📂 Searching for data in: {self.cfg.root_dir}")
         
+        # Helper to scan a folder
+        def scan_split(split_name):
+            split_dir = os.path.join(self.cfg.root_dir, split_name)
+            if not os.path.exists(split_dir): return []
+            return sorted([
+                os.path.join(split_name, d) # Store as relative path 'train/1ABA005'
+                for d in os.listdir(split_dir) 
+                if os.path.isdir(os.path.join(split_dir, d))
+            ])
+
+        train_candidates = scan_split("train")
+        val_candidates = scan_split("val")
+        
+        # Logic for 'subjects' (Single Image Optimization)
         if self.cfg.subjects:
-            candidates = self.cfg.subjects
-        elif self.cfg.region:
-            candidates = [c for c in candidates if self.cfg.region.upper() in c]
-            
-        # Validate existence
-        valid_subjs = []
-        for s in candidates:
-            if os.path.exists(os.path.join(data_dir, s, "ct_resampled.nii.gz")):
-                valid_subjs.append(s)
-        
-        # 2. Split
-        random.shuffle(valid_subjs)
-        num_val = max(1, int(len(valid_subjs) * self.cfg.val_split))
-        self.train_subjects = valid_subjs[:-num_val]
-        self.val_subjects = valid_subjs[-num_val:]
+            print(f"[DEBUG] 🎯 Filtering specific subjects: {self.cfg.subjects}")
+            # Filter candidates that end with the requested ID
+            # e.g., if requested '1ABA005', match 'train/1ABA005'
+            self.train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
+            self.val_subjects = self.train_subjects # Validate on the same subject for overfitting
+        else:
+            # Standard Mode: Use the existing splits
+            self.train_subjects = train_candidates
+            self.val_subjects = val_candidates
         
         print(f"[DEBUG] 📊 Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
 
         if self.cfg.analyze_shapes:
             shapes = []
-            for s in tqdm(self.train_subjects, desc="Analyzing Shapes"):
+            for s in tqdm(self.train_subjects[:30], desc="Analyzing Shapes (Sample)"):
                 try:
                     p = get_subject_paths(self.cfg.root_dir, s)
                     sh = nib.load(p['mri']).header.get_data_shape()
@@ -399,15 +416,13 @@ class Trainer:
             if shapes:
                 avg_shape = np.mean(np.array(shapes), axis=0).astype(int)
                 print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
-                if np.any(avg_shape < self.cfg.patch_size):
-                     print(f"⚠️ Warning: Mean shape {tuple(avg_shape)} is smaller than patch size {self.cfg.patch_size} in some dims. (Auto-padding is active to prevent crashes)")
         
         # 3. Helper to create paths
         def _make_subj_list(subjs):
             return [tio.Subject(
                 mri=tio.ScalarImage(p['mri']), 
                 ct=tio.ScalarImage(p['ct']),
-                subj_id=s
+                subj_id=os.path.basename(s) # Extract just ID for logging
             ) for s in subjs for p in [get_subject_paths(self.cfg.root_dir, s)]]
 
         # 5. Train Loader (Queue)
@@ -449,13 +464,15 @@ class Trainer:
         if self.cfg.anatomix_weights == "v1":
             self.cfg.res_mult = 16 
             self.feat_extractor = Unet(3, 1, 16, 4, 16).to(self.device)
-            ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "anatomix.pth")
+            # ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "anatomix.pth")
+            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/anatomix.pth"
         elif self.cfg.anatomix_weights == "v2":
             self.cfg.res_mult = 32
             self.feat_extractor = Unet(3, 1, 16, 5, 20, norm="instance", interp="trilinear", pooling="Avg").to(self.device)
             # Optimize inference speed
             self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
-            ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
+            # ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
+            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G.pth"
         else:
             raise ValueError("Invalid anatomix_weights")
             
@@ -912,7 +929,7 @@ class Trainer:
                 else:
                     self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
         
-        # 2. Augmentation Viz (Updated)
+        # 2. Augmentation Viz
         if self.cfg.wandb and self.cfg.augment:
              self._log_aug_viz(epoch)
 
@@ -957,7 +974,8 @@ class Trainer:
                 
                 tqdm.write(
                     f"Ep {epoch} | Train: {loss:.4f} | Val: {val_loss:.4f} | "
-                    f"SSIM: {avg_met.get('ssim',0):.4f} | PSNR: {avg_met.get('psnr',0):.2f}"
+                    f"SSIM: {avg_met.get('ssim',0):.4f} | PSNR: {avg_met.get('psnr',0):.2f} | "
+                    f"Bone: {avg_met.get('bone_dice',0):.4f}"
                 )
 
             ep_duration = time.time() - ep_start
@@ -987,7 +1005,8 @@ class Trainer:
 # ==========================================
 DEFAULT_CONFIG = {
     # System
-    "root_dir": "/home/minsukc/MRI2CT",
+    # "root_dir": "/home/minsukc/MRI2CT",
+    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm", 
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -1000,8 +1019,8 @@ DEFAULT_CONFIG = {
     "val_split": 0.1,
     "augment": True,
     "patch_size": 96,
-    "patches_per_volume": 30,
-    "data_queue_max_length": 500,
+    "patches_per_volume": 40,
+    "data_queue_max_length": 400,
     "data_queue_num_workers": 4,
     "anatomix_weights": "v2", # "v1", "v2"
     "res_mult": 32 ,
@@ -1051,11 +1070,12 @@ EXPERIMENT_CONFIG = [
     {
         "total_epochs": 5000,
         # "anatomix_weights": "v1",
-        "sanity_check": False,
+        # "sanity_check": False,
+        
         "accum_steps": 4,
-        "batch_size": 8,
-        "val_interval": 2,
-
+        "batch_size": 4,
+        "val_interval": 1,
+    
         "wandb_note": "test_run_long (new augmentation + val sliding window inference + lr scheduling)",
         
         # "resume_wandb_id": "l2rpr7g5", 
