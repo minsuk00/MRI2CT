@@ -458,6 +458,13 @@ class Trainer:
         val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess) 
         self.val_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
 
+        total_val = len(self.val_subjects)
+        num_viz = min(self.cfg.viz_limit, total_val)
+        rng = random.Random(self.cfg.seed) 
+        self.val_viz_indices = set(rng.sample(range(total_val), num_viz))
+        
+        print(f"[DEBUG] 🖼️  Fixed Validation Viz Indices: {self.val_viz_indices}")
+
     def _setup_models(self):
         # 1. Anatomix (Feature Extractor)
         print(f"[DEBUG] 🏗️ Building Anatomix ({self.cfg.anatomix_weights})...")
@@ -514,19 +521,26 @@ class Trainer:
         # Auto-Pilot Scheduler
         # patience=10: Waits 10 validation checks (10 * 5 = 50 epochs) before dropping.
         # factor=0.5: When stuck, cuts LR in half.
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 
-            mode='min', 
-            factor=0.5, 
-            patience=5, 
-            min_lr=1e-6,
-        )
+        if self.cfg.use_scheduler:
+            print("[DEBUG] 📉 Initializing Scheduler (ReduceLROnPlateau)")
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, 
+                mode='min', 
+                factor=0.5, 
+                patience=10, 
+                # patience=5, 
+                min_lr=1e-6,
+            )
+        else:
+            print("[DEBUG] 🛑 Scheduler DISABLED. Using fixed LR.")
+            self.scheduler = None
 
         self.loss_fn = CompositeLoss(weights={
             "l1": self.cfg.l1_w, "l2": self.cfg.l2_w, 
             "ssim": self.cfg.ssim_w, "perceptual": self.cfg.perceptual_w
         }).to(self.device)
-        self.scaler = torch.cuda.amp.GradScaler()
+        # self.scaler = torch.cuda.amp.GradScaler()
+        self.scaler = torch.amp.GradScaler('cuda')
         
     def _load_resume(self):
         if not self.cfg.resume_wandb_id: return
@@ -553,6 +567,17 @@ class Trainer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            if self.cfg.override_lr:
+                print(f"[RESUME] 🔧 Forcing new Learning Rate: {self.cfg.lr}")
+                for param_group in self.optimizer.param_groups:
+                    if len(param_group['params']) == len(list(self.feat_extractor.parameters())):
+                         param_group['lr'] = self.cfg.lr_feat_extractor
+                    else:
+                         param_group['lr'] = self.cfg.lr
+        
+        # if 'optimizer_state_dict' in checkpoint:
+        #     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'epoch' in checkpoint:
             self.start_epoch = checkpoint['epoch'] + 1
     
@@ -923,7 +948,7 @@ class Trainer:
                 val_metrics[k].append(v)
             
             # Viz
-            if self.cfg.wandb and i < self.cfg.viz_limit:
+            if self.cfg.wandb and i in self.val_viz_indices:
                 if self.cfg.val_sliding_window:
                     self._visualize_lite(pred, ct, mri, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
                 else:
@@ -970,7 +995,8 @@ class Trainer:
                 avg_met = self.validate(epoch)
                 val_loss = avg_met.get('loss', 0)
 
-                self.scheduler.step(val_loss)
+                if self.scheduler is not None:
+                    self.scheduler.step(val_loss)
                 
                 tqdm.write(
                     f"Ep {epoch} | Train: {loss:.4f} | Val: {val_loss:.4f} | "
@@ -1031,12 +1057,14 @@ DEFAULT_CONFIG = {
     "val_interval": 1,
     "sanity_check": True,
     "accum_steps": 2,
-    "model_save_interval": 50,
+    "model_save_interval": 10,
     "viz_limit": 6,
     "viz_pca": False,
     "steps_per_epoch": 25,
     "finetune_feat_extractor": False,
     "lr_feat_extractor": 1e-5,
+    "use_scheduler": False,
+    "override_lr": False,
     
     # Model Choice
     "model_type": "cnn",
@@ -1071,19 +1099,24 @@ EXPERIMENT_CONFIG = [
         "total_epochs": 5000,
         "sanity_check": False,
         
-        "accum_steps": 4,
-        "batch_size": 4,
+        "accum_steps": 2,
+        "batch_size": 8,
         "steps_per_epoch": 100,
         "val_interval": 1,
         "viz_limit": 10,
+        "model_save_interval": 5,
         
+
+        # "override_lr": True,
     
-        # "wandb_note": "long_run_anatomix_v2",
+        "wandb_note": "long_run_anatomix_v2",
+        # "resume_wandb_id": "gozzhvfn", 
         
-        "anatomix_weights": "v1",
-        "wandb_note": "long_run_anatomix_v1",
+        # "anatomix_weights": "v1",
+        # "wandb_note": "long_run_anatomix_v1",
+    #     "resume_wandb_id": "msj4nmzy", 
+
         
-        # "resume_wandb_id": "l2rpr7g5", 
     },
 ]
 
