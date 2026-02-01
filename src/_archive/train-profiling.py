@@ -172,6 +172,34 @@ class Config(SimpleNamespace):
 # ==========================================
 # 1. MODELS & LOSS
 # ==========================================
+class CNNTranslator(nn.Module):
+    def __init__(self, in_channels=16, hidden_channels=32, depth=3, final_activation="relu_clamp", dropout=0.0):
+        super().__init__()
+        self.final_activation = final_activation
+        layers = []
+        
+        # Input
+        layers.append(nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1))
+        layers.append(nn.ReLU(inplace=True))
+        if dropout > 0: layers.append(nn.Dropout3d(p=dropout))
+        
+        # Hidden
+        for _ in range(depth - 2):
+            layers.append(nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=1))
+            layers.append(nn.ReLU(inplace=True))
+            if dropout > 0: layers.append(nn.Dropout3d(p=dropout))
+        
+        # Output
+        layers.append(nn.Conv3d(hidden_channels, 1, kernel_size=3, padding=1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.net(x)
+        if self.final_activation == "sigmoid": return torch.sigmoid(x)
+        elif self.final_activation == "relu_clamp": return torch.clamp(torch.relu(x), 0, 1)
+        elif self.final_activation == "none": return x
+        else: raise ValueError(f"Unknown activation: {self.final_activation}")
+
 class CompositeLoss(nn.Module):
     def __init__(self, weights):
         super().__init__()
@@ -465,17 +493,17 @@ class Trainer:
             for p in self.feat_extractor.parameters(): p.requires_grad = False
             self.feat_extractor.eval()
         
-        # 2. Unet Translator
-        print(f"[DEBUG] 🏗️ Building Unet Translator (Anatomix v1)...")
-        model = Unet(
-            dimension=3,
-            input_nc=16, 
-            output_nc=1,
-            num_downs=4,           
-            ngf=16, 
-            final_act="sigmoid",   
+        # 2. CNN Translator
+        print(f"[DEBUG] 🏗️ Building CNN (D={self.cfg.cnn_depth}, H={self.cfg.cnn_hidden})...")
+        model = CNNTranslator(
+            in_channels=16,
+            hidden_channels=self.cfg.cnn_hidden,
+            depth=self.cfg.cnn_depth,
+            final_activation=self.cfg.final_activation,
+            dropout=self.cfg.dropout
         ).to(self.device)
-
+        # self.model = torch.compile(model, mode="reduce-overhead")
+        # self.model = torch.compile(model, mode="default")
         if self.cfg.model_compile_mode:
             print(f"[DEBUG] 🚀 Compiling model with mode: {self.cfg.model_compile_mode}")
             self.model = torch.compile(model, mode=self.cfg.model_compile_mode)
@@ -827,39 +855,54 @@ class Trainer:
         pbar = tqdm(range(self.cfg.steps_per_epoch), desc=f"Train Ep {epoch}", leave=False, dynamic_ncols=True)
         
         for step_idx in pbar:
+            t_step_start = time.time() 
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
-
-            step_t_data = 0.0
-            step_t_fwd = 0.0
-            step_t_bwd = 0.0
-            t_step_start = 0.0
             
+            # [TIMER] Setup breakdown
+            t_data_load = 0.0
+            t_fwd_feat = 0.0
+            t_fwd_model = 0.0
+            t_calc_loss = 0.0
+            t_backward = 0.0
+
             for _ in range(self.cfg.accum_steps):
+                # 1. Data Load
                 t0 = time.time() 
                 batch = next(self.train_iter)
                 t1 = time.time()
-                step_t_data += (t1 - t0)
-                
-                mri = batch['mri'][tio.DATA].to(self.device, non_blocking=True)
-                ct = batch['ct'][tio.DATA].to(self.device, non_blocking=True)
+                t_data_load += (t1 - t0)
 
+                # NEW: Optimize memory format for Ampere GPUs (channels_last_3d)
+                # This can speed up 3D Convs by 20-30% on A40/A100
+                mri = batch['mri'][tio.DATA].to(self.device, non_blocking=True).to(memory_format=torch.channels_last_3d)
+                ct = batch['ct'][tio.DATA].to(self.device, non_blocking=True).to(memory_format=torch.channels_last_3d)
+
+                # 2. Forward Feature Extractor
                 torch.cuda.synchronize()
                 t2 = time.time()
-
-                # Use 'dtype=torch.bfloat16' for Ampere+ GPUs (3090, 4090, A100, A6000)
-                # Use 'dtype=torch.float16' for older GPUs (2080, V100, Titan)
+                
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     if self.cfg.finetune_feat_extractor:
                         features = self.feat_extractor(mri)
                     else:
                         with torch.no_grad(): features = self.feat_extractor(mri)
                     
+                    torch.cuda.synchronize()
+                    t3 = time.time()
+                    t_fwd_feat += (t3 - t2)
+                    
+                    # 3. Forward CNN Model
                     pred = self.model(features)
+                    
+                    torch.cuda.synchronize()
+                    t4 = time.time()
+                    t_fwd_model += (t4 - t3)
                     
                     if self.cfg.wandb and step_idx == 0:
                         self._log_training_patch(mri, ct, pred, epoch, step_idx)
                     
+                    # 4. Calculate Loss
                     fe_ref = self.feat_extractor if self.cfg.perceptual_w > 0 else None
                     loss, comps = self.loss_fn(pred, ct, feat_extractor=fe_ref)
                     
@@ -867,17 +910,18 @@ class Trainer:
                         comp_accum[k] = comp_accum.get(k, 0.0) + (v / self.cfg.accum_steps)
                     
                     loss = loss / self.cfg.accum_steps
-
-                    torch.cuda.synchronize()
-                    t3 = time.time()
-                    step_t_fwd += (t3 - t2)
                     
+                    torch.cuda.synchronize()
+                    t5 = time.time()
+                    t_calc_loss += (t5 - t4)
+
+                    # 5. Backward Pass
                     self.scaler.scale(loss).backward()
                     step_loss += loss.item()
 
                     torch.cuda.synchronize()
-                    t4 = time.time()
-                    step_t_bwd += (t4 - t3)
+                    t6 = time.time()
+                    t_backward += (t6 - t5)
 
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -889,30 +933,17 @@ class Trainer:
             
             total_loss += step_loss
             total_grad += grad_norm.item()
-
+            pbar.set_postfix({"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"})
+            
             t_step_end = time.time()
-            step_t_total = t_step_end - t_step_start
-            avg_batch_data = step_t_data / self.cfg.accum_steps
-            avg_batch_fwd = step_t_fwd / self.cfg.accum_steps
-            avg_batch_bwd = step_t_bwd / self.cfg.accum_steps
             
-            # pbar.set_postfix({"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"})
-
-            pbar.set_postfix({
-                "loss": f"{step_loss:.4f}", 
-                "gn": f"{grad_norm.item():.2f}",
-                "dt": f"{avg_batch_data:.3f}", 
-                "fwd": f"{avg_batch_fwd:.3f}",
-                "bwd": f"{avg_batch_bwd:.3f}"
-            })
-            
-            if self.cfg.wandb:
-                wandb.log({
-                    "info/time_data": avg_batch_data,
-                    "info/time_forward": avg_batch_fwd,
-                    "info/time_backward": avg_batch_bwd,
-                    "info/time_step_total": step_t_total,
-                }, commit=False)
+            # [TIMER] Detailed breakdown print
+            print(f"\n[TIMER breakdown] Total: {t_step_end - t_step_start:.2f}s | "
+                  f"Data: {t_data_load:.2f}s | "
+                  f"Feat: {t_fwd_feat:.2f}s | "
+                  f"Model: {t_fwd_model:.2f}s | "
+                  f"Loss: {t_calc_loss:.2f}s | "
+                  f"Back: {t_backward:.2f}s")
             
         return total_loss / self.cfg.steps_per_epoch, \
                {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, \
@@ -920,9 +951,6 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch):
-        gc.collect()
-        torch.cuda.empty_cache()
-
         self.model.eval()
         val_metrics = defaultdict(list)
         
@@ -971,11 +999,7 @@ class Trainer:
                     self._visualize_lite(pred, ct, mri, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
                 else:
                     self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
-
-            del mri, ct, pred, pred_unpad, ct_unpad
-            if 'feats' in locals(): del feats
-            torch.cuda.empty_cache()
-            
+        
         # 2. Augmentation Viz
         if self.cfg.wandb and self.cfg.augment:
              self._log_aug_viz(epoch)
@@ -985,9 +1009,6 @@ class Trainer:
         if self.cfg.wandb:
             wandb.log({f"val/{k}": v for k, v in avg_met.items()}, step=epoch)
 
-        gc.collect()
-        torch.cuda.empty_cache()
-        
         return avg_met
 
     def train(self):
@@ -1124,20 +1145,20 @@ EXPERIMENT_CONFIG = [
         "total_epochs": 5000,
         "sanity_check": False,
         
-        "accum_steps": 2,
+        "accum_steps": 1,
         "batch_size": 8,
         "steps_per_epoch": 100,
         "val_interval": 1,
         "viz_limit": 10,
         "model_save_interval": 1,
-
-        # "model_compile_mode": "reduce-overhead",
-        "accum_steps": 1,
-        "wandb_note": "unet",
+        
+        "cnn_hidden": 32,
+        "model_compile_mode": "reduce-overhead",
+        
 
         # "override_lr": True,
     
-        # "wandb_note": "long_run_anatomix_v2",
+        "wandb_note": "profiling",
         # "resume_wandb_id": "gozzhvfn", 
         
         # "anatomix_weights": "v1",
