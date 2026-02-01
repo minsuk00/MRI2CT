@@ -23,7 +23,8 @@ from tqdm import tqdm
 import nibabel as nib
 import wandb
 import torchio as tio
-from fused_ssim import fused_ssim
+# from fused_ssim import fused_ssim
+from fused_ssim import fused_ssim3d
 from monai.inferers import sliding_window_inference
 
 from anatomix.model.network import Unet
@@ -104,10 +105,12 @@ def compute_metrics(pred, target, data_range=1.0):
         
     b, c, d, h, w = pred.shape
     # NOTE: Reshaping for 2D SSIM calculation
-    pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
-    targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
+    # pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
+    # targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
     
-    ssim_val = fused_ssim(pred_2d, targ_2d, train=False).item()
+    # ssim_val = fused_ssim(pred_2d, targ_2d, train=False).item()
+
+    ssim_val = fused_ssim3d(pred.float(), target.float(), train=False).item()
     
     # PSNR
     mse = torch.mean((pred - target) ** 2, dim=[1, 2, 3, 4])
@@ -194,10 +197,12 @@ class CompositeLoss(nn.Module):
             loss_components["loss_l2"] = val.item()
 
         if self.weights.get("ssim", 0) > 0:
-            b, c, d, h, w = pred.shape
-            pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w).float()
-            targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w).float()
-            val = 1.0 - fused_ssim(pred_2d, targ_2d, train=True)
+            # b, c, d, h, w = pred.shape
+            # pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w).float()
+            # targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w).float()
+            # val = 1.0 - fused_ssim(pred_2d, targ_2d, train=True)
+            
+            val = 1.0 - fused_ssim3d(pred.float(), target.float(), train=True)
             total_loss += self.weights["ssim"] * val
             loss_components["loss_ssim"] = val.item()
 
@@ -1112,7 +1117,7 @@ DEFAULT_CONFIG = {
     # Loss Weights
     "l1_w": 1.0,
     "l2_w": 0.0,
-    "ssim_w": 1.0,
+    "ssim_w": 0.1,
     "perceptual_w": 0.0,
 
     "wandb_note": "test_run",
@@ -1131,7 +1136,7 @@ EXPERIMENT_CONFIG = [
         "viz_limit": 10,
         "model_save_interval": 1,
 
-        # "model_compile_mode": "reduce-overhead",
+        "model_compile_mode": "reduce-overhead",
         "accum_steps": 1,
         "wandb_note": "unet",
 
