@@ -6,7 +6,12 @@ This project, `MRI2CT`, aims to synthesize CT images from MRI scans using deep l
 ## Directory Structure
 
 *   **`src/`**: Contains the source code for training and preprocessing.
-    *   `train.py`: The main entry point for training the synthesis model. Contains the `Trainer` class, configuration (`DEFAULT_CONFIG`), and the training loop.
+    *   `train.py`: The main entry point for training. Configures and launches experiments.
+    *   `trainer.py`: Contains the `Trainer` class and training logic.
+    *   `config.py`: Defines defaults (`DEFAULT_CONFIG`) and configuration handling.
+    *   `data.py`: Data loading, augmentation, and preprocessing.
+    *   `loss.py`: Loss function definitions (`CompositeLoss`).
+    *   `utils.py`: General utility functions.
     *   `preprocess/`: Scripts for data preparation.
         *   `registration_batch.py`: Likely for registering MRI to CT (or vice versa).
         *   `resample_batch.py`: For resampling volumes to a common resolution (e.g., 3.0mm isotropic).
