@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensi
 os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 
 def set_seed(seed=42):
-    print(f"[DEBUG] 🌱 Setting global seed to {seed}")
+    print(f"[DEBUG] Setting global seed to {seed}")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -224,14 +224,16 @@ class CompositeLoss(nn.Module):
 # 2. DATA PIPELINE
 # ==========================================
 class DataPreprocessing(tio.Transform):
-    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, **kwargs):        
+    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, use_weighted_sampler=False, **kwargs):        
         super().__init__(**kwargs)
         self.patch_size = patch_size
         self.enable_safety_padding = enable_safety_padding
         self.res_mult = res_mult
+        self.use_weighted_sampler = use_weighted_sampler
 
     def apply_transform(self, subject):
-        subject['ct'].set_data(anatomix_normalize(subject['ct'].data, clip_range=(-450, 450)).float())
+        # subject['ct'].set_data(anatomix_normalize(subject['ct'].data, clip_range=(-450, 450)).float())
+        subject['ct'].set_data(anatomix_normalize(subject['ct'].data, clip_range=(-1024, 1024)).float())
         subject['mri'].set_data(anatomix_normalize(subject['mri'].data, percentile_range=(0,99.99)).float())
         # subject['mri'].set_data(anatomix_normalize(subject['mri'].data).float())
         
@@ -257,7 +259,7 @@ class DataPreprocessing(tio.Transform):
             subject = tio.Pad(padding_params, padding_mode=0)(subject)
             
         # Probability Map for Sampler
-        if 'prob_map' not in subject:
+        if self.use_weighted_sampler and 'prob_map' not in subject:
             prob = (subject['ct'].data > 0.01).to(torch.float32)
             subject.add_image(tio.LabelMap(tensor=prob, affine=subject['mri'].affine), 'prob_map')
 
@@ -319,6 +321,9 @@ class Trainer:
         self.device = torch.device(self.cfg.device)
         print(f"[DEBUG] 🚀 Initializing Trainer on {self.device}")
 
+        # Default run name
+        self.run_name = f"{self.cfg.model_type.upper()}_Train_{datetime.datetime.now():%Y%m%d_%H%M}"
+
         # 2. Setup Components
         self._setup_models()
         self._setup_data()
@@ -327,19 +332,22 @@ class Trainer:
         
         # 3. State Tracking
         self.start_epoch = 0
+        self.global_step = 0
         self.global_start_time = None 
         self._load_resume()
 
     def _setup_wandb(self):
         if not self.cfg.wandb: return
         
-        run_name = f"{self.cfg.model_type.upper()}_Train{len(self.train_subjects)}"
+        # Consistent run name
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")                          
+        self.run_name = f"{self.cfg.model_type.upper()}_Train{len(self.train_subjects)}_{timestamp}"
         os.makedirs(self.cfg.log_dir, exist_ok=True)
         
-        print(f"[DEBUG] 📡 Initializing WandB: {run_name}")
+        print(f"[DEBUG] 📡 Initializing WandB: {self.run_name}")
         wandb.init(
             project=self.cfg.project_name, 
-            name=run_name, 
+            name=self.run_name, 
             config=vars(self.cfg),
             notes=self.cfg.wandb_note,
             reinit=True,
@@ -347,9 +355,6 @@ class Trainer:
             id=self.cfg.resume_wandb_id, 
             resume="allow",
         )
-        if not self.cfg.resume_wandb_id:
-            current_code_dir = os.path.dirname(os.path.abspath(__file__))
-            wandb.run.log_code(root=current_code_dir, include_fn=lambda path: path.endswith(".py"))
 
     def _setup_data(self):
         print(f"[DEBUG] 📂 Searching for data in: {self.cfg.root_dir}")
@@ -404,13 +409,23 @@ class Trainer:
 
         # 5. Train Loader (Queue)
         train_objs = _make_subj_list(self.train_subjects)
-        use_safety = (self.cfg.model_type.lower() == "cnn" and self.cfg.enable_safety_padding)
+        # use_safety = (self.cfg.model_type.lower() == "cnn" and self.cfg.enable_safety_padding)
+        use_safety = self.cfg.enable_safety_padding
         
-        preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=use_safety, res_mult=self.cfg.res_mult)
+        preprocess = DataPreprocessing(
+            patch_size=self.cfg.patch_size, 
+            enable_safety_padding=use_safety, 
+            res_mult=self.cfg.res_mult,
+            use_weighted_sampler=self.cfg.use_weighted_sampler
+        )
         transforms = tio.Compose([preprocess, get_augmentations()]) if self.cfg.augment else preprocess
         
         train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
-        sampler = tio.WeightedSampler(patch_size=self.cfg.patch_size, probability_map='prob_map')
+        
+        if self.cfg.use_weighted_sampler:
+            sampler = tio.WeightedSampler(patch_size=self.cfg.patch_size, probability_map='prob_map')
+        else:
+            sampler = tio.UniformSampler(patch_size=self.cfg.patch_size)
         
         queue = tio.Queue(
             subjects_dataset=train_ds,
@@ -557,6 +572,13 @@ class Trainer:
         #     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'epoch' in checkpoint:
             self.start_epoch = checkpoint['epoch'] + 1
+        
+        if 'global_step' in checkpoint:
+            self.global_step = checkpoint['global_step']
+        else:
+            self.global_step = self.start_epoch * self.cfg.steps_per_epoch
+            if self.start_epoch > 0:
+                print(f"[RESUME] ⚠️ Global step not found. Estimating: {self.global_step}")
     
     def save_checkpoint(self, epoch, is_final=False):
         filename = f"{self.cfg.model_type}_{'FINAL' if is_final else f'epoch{epoch:05d}_{datetime.datetime.now():%Y%m%d_%H%M}'}.pt"
@@ -565,6 +587,7 @@ class Trainer:
         
         save_dict = {
             'epoch': epoch,
+            'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': vars(self.cfg)
@@ -577,12 +600,12 @@ class Trainer:
         torch.save(save_dict, path)
         print(f"[SAVE] 💾 Checkpoint saved: {path}")
         if self.cfg.wandb:
-            wandb.log({"info/checkpoint_path": path}, commit=False)
+            wandb.log({"info/checkpoint_path": path}, step=self.global_step)
             
     # ==========================================
     # VISUALIZATION
     # ==========================================
-    def _log_aug_viz(self, epoch):
+    def _log_aug_viz(self, step):
         try:
             # 1. Get Data
             subj_id = self.val_subjects[0] 
@@ -610,14 +633,14 @@ class Trainer:
             # The simple Diff you wanted
             ax[2].imshow(np.rot90(aug_sl - orig_sl), cmap='seismic', vmin=-0.5, vmax=0.5); ax[2].set_title("Diff")
             
-            wandb.log({"val/aug_viz": wandb.Image(fig)}, step=epoch)
+            wandb.log({"val/aug_viz": wandb.Image(fig)}, step=step)
             plt.close(fig)
         except Exception as e:
             print(f"[WARNING] Aug Viz failed: {e}")
 
     
     @torch.no_grad()
-    def _visualize_full(self, pred, ct, mri, feats_mri, subj_id, shape, epoch, idx, offset=0):
+    def _visualize_full(self, pred, ct, mri, feats_mri, subj_id, shape, step, idx, offset=0, save_path=None):
         """
         Full 8-column visualization with PCA, Cosine Sim, and Residuals.
         """
@@ -712,14 +735,16 @@ class Trainer:
         cbar2 = fig.colorbar(cos_im, ax=axes[:, num_cols-1], fraction=0.04, pad=0.01)
         cbar2.set_label("Cosine Similarity")
 
-        fig.suptitle(f"Viz — {subj_id} (Ep {epoch})", fontsize=16, y=0.99)
+        caption = f"Viz — {subj_id} (Step {step})"
+        if save_path: caption += f"\nSaved to: {save_path}"
+        fig.suptitle(caption, fontsize=16, y=0.99)
         
         if self.cfg.wandb:
-            wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(fig)}, step=epoch)
+            wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(fig, caption=caption)}, step=step)
         plt.close(fig)
 
     @torch.no_grad()
-    def _visualize_lite(self, pred, ct, mri, subj_id, shape, epoch, idx, offset=0):
+    def _visualize_lite(self, pred, ct, mri, subj_id, shape, step, idx, offset=0, save_path=None):
         """
         Lightweight visualization: MRI, GT, Pred, Residual. 
         """
@@ -760,15 +785,17 @@ class Trainer:
             cbar = fig.colorbar(res_im, ax=axes[:, 3], fraction=0.04, pad=0.01)
             cbar.set_label("Residual Error")
         
-        fig.suptitle(f"Viz LITE — {subj_id} (Ep {epoch})", fontsize=16, y=0.99)
+        caption = f"Viz LITE — {subj_id} (Step {step})"
+        if save_path: caption += f"\nSaved to: {save_path}"
+        fig.suptitle(caption, fontsize=16, y=0.99)
         
         if self.cfg.wandb:
-            wandb.log({f"viz/{('val_'+ str(idx))}": wandb.Image(fig)}, step=epoch)
+            wandb.log({f"viz/{('val_'+ str(idx))}": wandb.Image(fig, caption=caption)}, step=step)
         plt.close(fig)
         
     # Added method to visualize training patches
     @torch.no_grad()
-    def _log_training_patch(self, mri, ct, pred, epoch, step):
+    def _log_training_patch(self, mri, ct, pred, step, batch_idx):
         """
         Visualizes MRI, Prediction, and CT (GT) for the first patch in the batch.
         """
@@ -814,7 +841,7 @@ class Trainer:
         
         plt.tight_layout()
         
-        wandb.log({f"train/patch_viz": wandb.Image(fig)}, step=epoch)
+        wandb.log({f"train/patch_viz": wandb.Image(fig)}, step=step)
         plt.close(fig)
         
     # ==========================================
@@ -863,7 +890,7 @@ class Trainer:
                     pred = self.model(features)
                     
                     if self.cfg.wandb and step_idx == 0:
-                        self._log_training_patch(mri, ct, pred, epoch, step_idx)
+                        self._log_training_patch(mri, ct, pred, self.global_step, step_idx)
                     
                     fe_ref = self.feat_extractor if self.cfg.perceptual_w > 0 else None
                     loss, comps = self.loss_fn(pred, ct, feat_extractor=fe_ref)
@@ -894,6 +921,8 @@ class Trainer:
             
             total_loss += step_loss
             total_grad += grad_norm.item()
+            
+            self.global_step += 1
 
             t_step_end = time.time()
             step_t_total = t_step_end - t_step_start
@@ -913,11 +942,15 @@ class Trainer:
             
             if self.cfg.wandb:
                 wandb.log({
+                    "train/loss_step": step_loss,
+                    "train/grad_norm": grad_norm.item(),
                     "info/time_data": avg_batch_data,
                     "info/time_forward": avg_batch_fwd,
                     "info/time_backward": avg_batch_bwd,
                     "info/time_step_total": step_t_total,
-                }, commit=False)
+                    "info/global_step": self.global_step,
+                    "info/epoch": epoch,
+                }, step=self.global_step)
             
         return total_loss / self.cfg.steps_per_epoch, \
                {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, \
@@ -970,12 +1003,27 @@ class Trainer:
             for k, v in met.items():
                 val_metrics[k].append(v)
             
-            # Viz
-            if self.cfg.wandb and i in self.val_viz_indices:
-                if self.cfg.val_sliding_window:
-                    self._visualize_lite(pred, ct, mri, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
-                else:
-                    self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, epoch, idx=i, offset=pad_offset)
+            # Viz & Save
+            if i in self.val_viz_indices:
+                save_path = None
+                if self.cfg.save_val_volumes:
+                    save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
+                    os.makedirs(save_dir, exist_ok=True)
+                    
+                    # Denormalize [0, 1] -> [-1024, 1024]
+                    pred_np = pred_unpad.float().cpu().numpy().squeeze()
+                    pred_hu = (pred_np * 2048.0) - 1024.0
+                    affine = batch['ct']['affine'][0].cpu().numpy()
+                    
+                    nii = nib.Nifti1Image(pred_hu, affine)
+                    save_path = os.path.join(save_dir, f"pred_{subj_id}.nii.gz")
+                    nib.save(nii, save_path)
+
+                if self.cfg.wandb:
+                    if self.cfg.val_sliding_window:
+                        self._visualize_lite(pred, ct, mri, subj_id, orig_shape, self.global_step, idx=i, offset=pad_offset, save_path=save_path)
+                    else:
+                        self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, self.global_step, idx=i, offset=pad_offset, save_path=save_path)
 
             del mri, ct, pred, pred_unpad, ct_unpad
             if 'feats' in locals(): del feats
@@ -983,12 +1031,12 @@ class Trainer:
             
         # 2. Augmentation Viz
         if self.cfg.wandb and self.cfg.augment:
-             self._log_aug_viz(epoch)
+             self._log_aug_viz(self.global_step)
 
         # 3. Log
         avg_met = {k: np.mean(v) for k, v in val_metrics.items()}
         if self.cfg.wandb:
-            wandb.log({f"val/{k}": v for k, v in avg_met.items()}, step=epoch)
+            wandb.log({f"val/{k}": v for k, v in avg_met.items()}, step=self.global_step)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1047,7 +1095,7 @@ class Trainer:
                     "info/lr": current_lr 
                 }
                 for k, v in comps.items(): log[k.replace("loss_", "train_loss/")] = v
-                wandb.log(log, step=epoch)
+                wandb.log(log, step=self.global_step)
                 
             if epoch % self.cfg.model_save_interval == 0:
                 self.save_checkpoint(epoch)
@@ -1108,6 +1156,7 @@ DEFAULT_CONFIG = {
     "cnn_hidden": 128,
     "final_activation": "sigmoid",
     "enable_safety_padding": True,
+    "use_weighted_sampler": True,
 
     # Sliding Window & Viz Options
     "val_sliding_window": True, 
@@ -1122,6 +1171,10 @@ DEFAULT_CONFIG = {
 
     "wandb_note": "test_run",
     "resume_wandb_id": None, 
+    
+    # Validation Saving
+    "save_val_volumes": True, 
+    "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/predictions", 
 }
 
 EXPERIMENT_CONFIG = [
@@ -1129,7 +1182,6 @@ EXPERIMENT_CONFIG = [
         "total_epochs": 5000,
         "sanity_check": False,
         
-        "accum_steps": 2,
         "batch_size": 8,
         "steps_per_epoch": 100,
         "val_interval": 1,
@@ -1139,6 +1191,8 @@ EXPERIMENT_CONFIG = [
         "model_compile_mode": "reduce-overhead",
         "accum_steps": 1,
         "wandb_note": "unet",
+        "enable_safety_padding": False,
+        "use_weighted_sampler": False,
 
         # "override_lr": True,
     
