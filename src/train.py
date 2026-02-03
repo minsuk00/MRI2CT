@@ -25,21 +25,27 @@ os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 
 EXPERIMENT_CONFIG = [
     {
+        "steps_per_epoch": 3000,
+        "val_interval": 1,
         "total_epochs": 5000,
         "sanity_check": False,
         
         "batch_size": 8,
-        "steps_per_epoch": 100,
-        "val_interval": 1,
         "viz_limit": 10,
         "model_save_interval": 1,
 
         "model_compile_mode": "reduce-overhead",
         "accum_steps": 1,
-        "wandb_note": "unet",
         "enable_safety_padding": False,
         "use_weighted_sampler": False,
 
+        "patches_per_volume": 200,
+        "data_queue_max_length": 800,
+        "data_queue_num_workers": 8,
+
+        "lr": 3e-5,
+
+        "wandb_note": "test_run",
         # "override_lr": True,
     
         # "wandb_note": "long_run_anatomix_v2",

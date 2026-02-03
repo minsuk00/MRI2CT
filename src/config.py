@@ -20,12 +20,12 @@ DEFAULT_CONFIG = {
     # Data
     "subjects": None,
     "region": None, # "AB", "TH", "HN"
-    "val_split": 0.1,
+    "val_split": 0.1, # deprecated
     "augment": True,
     "patch_size": 96,
-    "patches_per_volume": 100,
-    "data_queue_max_length": 1000,
-    "data_queue_num_workers": 6,
+    "patches_per_volume": 40,
+    "data_queue_max_length": 400,
+    "data_queue_num_workers": 4,
     "anatomix_weights": "v2", # "v1", "v2"
     "res_mult": 32 ,
     "analyze_shapes": True, 
@@ -45,15 +45,15 @@ DEFAULT_CONFIG = {
     "override_lr": False,
     
     # Model Choice
-    "model_type": "cnn",
+    "model_type": "cnn", # deprecated
     "model_compile_mode": None, # "default", "reduce-overhead", None
     "total_epochs": 5001,
     "dropout": 0,
     
     # CNN Specifics
     "batch_size": 4,
-    "cnn_depth": 9,
-    "cnn_hidden": 128,
+    "cnn_depth": 9, # deprecated
+    "cnn_hidden": 128, # deprecated
     "final_activation": "sigmoid",
     "enable_safety_padding": True,
     "use_weighted_sampler": True,

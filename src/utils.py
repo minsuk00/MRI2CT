@@ -69,12 +69,7 @@ def compute_metrics(pred, target, data_range=1.0):
         raise ValueError(f"Expected (B, C, D, H, W), got {pred.shape}")
         
     b, c, d, h, w = pred.shape
-    # NOTE: Reshaping for 2D SSIM calculation
-    # pred_2d = pred.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
-    # targ_2d = target.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
     
-    # ssim_val = fused_ssim(pred_2d, targ_2d, train=False).item()
-
     ssim_val = fused_ssim3d(pred.float(), target.float(), train=False).item()
     
     # PSNR

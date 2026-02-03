@@ -349,7 +349,7 @@ class Trainer:
 
     
     @torch.no_grad()
-    def _visualize_full(self, pred, ct, mri, feats_mri, subj_id, shape, step, idx, offset=0, save_path=None):
+    def _visualize_full(self, pred, ct, mri, feats_mri, subj_id, shape, step, epoch, idx, offset=0, save_path=None):
         """
         Full 8-column visualization with PCA, Cosine Sim, and Residuals.
         """
@@ -444,16 +444,17 @@ class Trainer:
         cbar2 = fig.colorbar(cos_im, ax=axes[:, num_cols-1], fraction=0.04, pad=0.01)
         cbar2.set_label("Cosine Similarity")
 
-        caption = f"Viz — {subj_id} (Step {step})"
+        title_str = f"Subject: {subj_id} | Epoch {epoch} | Step {step}"
+        caption = f"Subject: {subj_id}"
         if save_path: caption += f"\nSaved to: {save_path}"
-        fig.suptitle(caption, fontsize=16, y=0.99)
+        fig.suptitle(title_str, fontsize=16, y=0.99)
         
         if self.cfg.wandb:
             wandb.log({f"viz/{'train' if idx==-1 else ('val_'+ str(idx))}": wandb.Image(fig, caption=caption)}, step=step)
         plt.close(fig)
 
     @torch.no_grad()
-    def _visualize_lite(self, pred, ct, mri, subj_id, shape, step, idx, offset=0, save_path=None):
+    def _visualize_lite(self, pred, ct, mri, subj_id, shape, step, epoch, idx, offset=0, save_path=None):
         """
         Lightweight visualization: MRI, GT, Pred, Residual. 
         """
@@ -494,9 +495,10 @@ class Trainer:
             cbar = fig.colorbar(res_im, ax=axes[:, 3], fraction=0.04, pad=0.01)
             cbar.set_label("Residual Error")
         
-        caption = f"Viz LITE — {subj_id} (Step {step})"
+        title_str = f"Subject: {subj_id} | Epoch {epoch} | Step {step}"
+        caption = f"Subject: {subj_id}"
         if save_path: caption += f"\nSaved to: {save_path}"
-        fig.suptitle(caption, fontsize=16, y=0.99)
+        fig.suptitle(title_str, fontsize=16, y=0.99)
         
         if self.cfg.wandb:
             wandb.log({f"viz/{('val_'+ str(idx))}": wandb.Image(fig, caption=caption)}, step=step)
@@ -650,7 +652,7 @@ class Trainer:
             })
             
             if self.cfg.wandb:
-                wandb.log({
+                log_dict = {
                     "train/loss_step": step_loss,
                     "train/grad_norm": grad_norm.item(),
                     "info/time_data": avg_batch_data,
@@ -659,7 +661,12 @@ class Trainer:
                     "info/time_step_total": step_t_total,
                     "info/global_step": self.global_step,
                     "info/epoch": epoch,
-                }, step=self.global_step)
+                }
+                # Log components step-wise
+                for k, v in comps.items():
+                    log_dict[k.replace("loss_", "train_loss_step/")] = v
+                
+                wandb.log(log_dict, step=self.global_step)
             
         return total_loss / self.cfg.steps_per_epoch, \
                {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, \
@@ -730,9 +737,9 @@ class Trainer:
 
                 if self.cfg.wandb:
                     if self.cfg.val_sliding_window:
-                        self._visualize_lite(pred, ct, mri, subj_id, orig_shape, self.global_step, idx=i, offset=pad_offset, save_path=save_path)
+                        self._visualize_lite(pred, ct, mri, subj_id, orig_shape, self.global_step, epoch, idx=i, offset=pad_offset, save_path=save_path)
                     else:
-                        self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, self.global_step, idx=i, offset=pad_offset, save_path=save_path)
+                        self._visualize_full(pred, ct, mri, feats, subj_id, orig_shape, self.global_step, epoch, idx=i, offset=pad_offset, save_path=save_path)
 
             del mri, ct, pred, pred_unpad, ct_unpad
             if 'feats' in locals(): del feats
