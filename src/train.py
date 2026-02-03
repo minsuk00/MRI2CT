@@ -39,13 +39,28 @@ EXPERIMENT_CONFIG = [
         "enable_safety_padding": False,
         "use_weighted_sampler": False,
 
-        "patches_per_volume": 200,
-        "data_queue_max_length": 800,
-        "data_queue_num_workers": 8,
+        "patches_per_volume": 400,
+        "data_queue_max_length": 2000,
+        "data_queue_num_workers": 6,
 
-        "lr": 3e-5,
+        "enable_profiling": True,
 
-        "wandb_note": "test_run",
+        "lr": 3e-4,
+
+        # ------------------------
+        "wandb_note": "single_subject_overfitting",
+        "subjects": ["1ABA005"],
+        "augment": False,
+        "steps_per_epoch": 3000,
+        "val_interval": 1,
+        "total_epochs": 1000,
+        "model_save_interval": 1,
+        "patches_per_volume": 2000,
+        "data_queue_max_length": 2000,
+        "data_queue_num_workers": 6,
+        # ------------------------
+        
+        # "wandb_note": "test_run",
         # "override_lr": True,
     
         # "wandb_note": "long_run_anatomix_v2",

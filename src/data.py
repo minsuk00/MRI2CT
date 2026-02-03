@@ -14,8 +14,8 @@ class DataPreprocessing(tio.Transform):
     def apply_transform(self, subject):
         # subject['ct'].set_data(anatomix_normalize(subject['ct'].data, clip_range=(-450, 450)).float())
         subject['ct'].set_data(anatomix_normalize(subject['ct'].data, clip_range=(-1024, 1024)).float())
-        subject['mri'].set_data(anatomix_normalize(subject['mri'].data, percentile_range=(0,99.99)).float())
-        # subject['mri'].set_data(anatomix_normalize(subject['mri'].data).float())
+        # subject['mri'].set_data(anatomix_normalize(subject['mri'].data, percentile_range=(0,99.99)).float())
+        subject['mri'].set_data(anatomix_normalize(subject['mri'].data).float())
         
         # Save original shape
         subject['original_shape'] = torch.tensor(subject['ct'].spatial_shape)
@@ -57,7 +57,7 @@ def get_augmentations():
                 num_control_points=7, 
                 max_displacement=4, 
                 locked_borders=2, 
-                image_interpolation='bspline' 
+                image_interpolation='linear' 
             ): 0.3, 
             tio.RandomAffine(
                 scales=(0.95, 1.1), 
@@ -70,7 +70,7 @@ def get_augmentations():
         tio.Clamp(0, 1),
         
         tio.Compose([
-            tio.RandomBiasField(coefficients=0.5, p=0.4),
+            tio.RandomBiasField(coefficients=0.5, p=0.4, order=2),
             tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.4),
         ], include=['mri']) ,
         tio.Clamp(0, 1),

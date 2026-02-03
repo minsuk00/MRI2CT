@@ -2,6 +2,7 @@ import os
 import gc
 import random
 import numpy as np
+import psutil
 import torch
 from fused_ssim import fused_ssim3d
 
@@ -19,6 +20,25 @@ def set_seed(seed=42):
 def cleanup_gpu():
     gc.collect()
     torch.cuda.empty_cache()
+
+def get_ram_info():
+    # 1. 시스템 전체 RAM 사용률 (%)
+    sys_mem = psutil.virtual_memory()
+    sys_percent = sys_mem.percent
+    
+    # 2. 현재 프로세스 + 자식 프로세스(Workers) 메모리 합계 (GB)
+    main_p = psutil.Process()
+    total_rss = main_p.memory_info().rss  # Main process
+    
+    # 자식 프로세스(DataLoader Workers)들 순회
+    for child in main_p.children(recursive=True):
+        try:
+            total_rss += child.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+            
+    total_gb = total_rss / (1024 ** 3)  # Byte -> GB 변환
+    return sys_percent, total_gb
 
 def anatomix_normalize(tensor, percentile_range = None, clip_range=None):
     if not torch.is_tensor(tensor):

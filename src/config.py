@@ -29,9 +29,13 @@ DEFAULT_CONFIG = {
     "anatomix_weights": "v2", # "v1", "v2"
     "res_mult": 32 ,
     "analyze_shapes": True, 
+    "enable_profiling": False,
     
     # Training
     "lr": 3e-4,
+    "scheduler_type": "cosine", # "plateau", "cosine", None
+    "scheduler_t_max": 500000,
+    "scheduler_min_lr": 1e-6,
     "val_interval": 1,
     "sanity_check": True,
     "accum_steps": 2,

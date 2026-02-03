@@ -18,7 +18,7 @@ from monai.inferers import sliding_window_inference
 from anatomix.model.network import Unet
 
 from src.config import Config
-from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics
+from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info
 from src.data import DataPreprocessing, get_augmentations, get_subject_paths
 from src.loss import CompositeLoss
 
@@ -219,18 +219,22 @@ class Trainer:
             
         self.optimizer = torch.optim.Adam(params)
         
-        # Auto-Pilot Scheduler
-        # patience=10: Waits 10 validation checks (10 * 5 = 50 epochs) before dropping.
-        # factor=0.5: When stuck, cuts LR in half.
-        if self.cfg.use_scheduler:
+        # 3. Scheduler Setup
+        if self.cfg.scheduler_type == "plateau":
             print("[DEBUG] 📉 Initializing Scheduler (ReduceLROnPlateau)")
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, 
                 mode='min', 
                 factor=0.5, 
                 patience=10, 
-                # patience=5,
                 min_lr=1e-6,
+            )
+        elif self.cfg.scheduler_type == "cosine":
+            print(f"[DEBUG] 📉 Initializing Scheduler (CosineAnnealingLR) T_max={self.cfg.scheduler_t_max}, min_lr={self.cfg.scheduler_min_lr}")
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.cfg.scheduler_t_max,
+                eta_min=self.cfg.scheduler_min_lr
             )
         else:
             print("[DEBUG] 🛑 Scheduler DISABLED. Using fixed LR.")
@@ -573,22 +577,25 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
 
-            step_t_data = 0.0
-            step_t_fwd = 0.0
-            step_t_bwd = 0.0
-            t_step_start = 0.0
+            if self.cfg.enable_profiling:
+                step_t_data = 0.0
+                step_t_fwd = 0.0
+                step_t_bwd = 0.0
+                t_step_start = time.time()
             
             for _ in range(self.cfg.accum_steps):
-                t0 = time.time() 
+                if self.cfg.enable_profiling: t0 = time.time()
                 batch = next(self.train_iter)
-                t1 = time.time()
-                step_t_data += (t1 - t0)
+                if self.cfg.enable_profiling:
+                    t1 = time.time()
+                    step_t_data += (t1 - t0)
                 
                 mri = batch['mri'][tio.DATA].to(self.device, non_blocking=True)
                 ct = batch['ct'][tio.DATA].to(self.device, non_blocking=True)
 
-                torch.cuda.synchronize()
-                t2 = time.time()
+                if self.cfg.enable_profiling:
+                    torch.cuda.synchronize()
+                    t2 = time.time()
 
                 # Use 'dtype=torch.bfloat16' for Ampere+ GPUs (3090, 4090, A100, A6000)
                 # Use 'dtype=torch.float16' for older GPUs (2080, V100, Titan)
@@ -611,16 +618,18 @@ class Trainer:
                     
                     loss = loss / self.cfg.accum_steps
 
-                    torch.cuda.synchronize()
-                    t3 = time.time()
-                    step_t_fwd += (t3 - t2)
+                    if self.cfg.enable_profiling:
+                        torch.cuda.synchronize()
+                        t3 = time.time()
+                        step_t_fwd += (t3 - t2)
                     
                     self.scaler.scale(loss).backward()
                     step_loss += loss.item()
 
-                    torch.cuda.synchronize()
-                    t4 = time.time()
-                    step_t_bwd += (t4 - t3)
+                    if self.cfg.enable_profiling:
+                        torch.cuda.synchronize()
+                        t4 = time.time()
+                        step_t_bwd += (t4 - t3)
 
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -630,47 +639,79 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
+            # Step scheduler per iteration for cosine
+            if self.scheduler is not None and self.cfg.scheduler_type == "cosine":
+                self.scheduler.step()
+
             total_loss += step_loss
             total_grad += grad_norm.item()
             
             self.global_step += 1
 
-            t_step_end = time.time()
-            step_t_total = t_step_end - t_step_start
-            avg_batch_data = step_t_data / self.cfg.accum_steps
-            avg_batch_fwd = step_t_fwd / self.cfg.accum_steps
-            avg_batch_bwd = step_t_bwd / self.cfg.accum_steps
+            pbar_dict = {"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"}
             
-            # pbar.set_postfix({"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"})
-
-            pbar.set_postfix({
-                "loss": f"{step_loss:.4f}", 
-                "gn": f"{grad_norm.item():.2f}",
-                "dt": f"{avg_batch_data:.3f}", 
-                "fwd": f"{avg_batch_fwd:.3f}",
-                "bwd": f"{avg_batch_bwd:.3f}"
-            })
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if self.cfg.enable_profiling:
+                t_step_end = time.time()
+                step_t_total = t_step_end - t_step_start
+                avg_batch_data = step_t_data / self.cfg.accum_steps * 1000
+                avg_batch_fwd = step_t_fwd / self.cfg.accum_steps * 1000
+                avg_batch_bwd = step_t_bwd / self.cfg.accum_steps * 1000
+                pbar_dict.update({
+                    "dt(ms)": f"{avg_batch_data:.3f}", 
+                    "fwd(ms)": f"{avg_batch_fwd:.3f}",
+                    "bwd(ms)": f"{avg_batch_bwd:.3f}",
+                    "lr": f"{current_lr:.2e}"
+                })
+            
+            pbar.set_postfix(pbar_dict)
             
             if self.cfg.wandb:
-                log_dict = {
-                    "train/loss_step": step_loss,
-                    "train/grad_norm": grad_norm.item(),
-                    "info/time_data": avg_batch_data,
-                    "info/time_forward": avg_batch_fwd,
-                    "info/time_backward": avg_batch_bwd,
-                    "info/time_step_total": step_t_total,
-                    "info/global_step": self.global_step,
-                    "info/epoch": epoch,
-                }
-                # Log components step-wise
-                for k, v in comps.items():
-                    log_dict[k.replace("loss_", "train_loss_step/")] = v
+                log_dict = {}
+                if step_idx % 100 == 0:
+                    log_dict.update({
+                        "train/loss_step": step_loss,
+                        "train/grad_norm": grad_norm.item(),
+                        "train/lr": current_lr,
+                        "info/global_step": self.global_step,
+                        "info/epoch": epoch,
+                    })
+                    for k, v in comps.items():
+                        log_dict[k.replace("loss_", "train/loss_")] = v
+                    
+                
+                if self.cfg.enable_profiling:
+                    log_dict.update({
+                        "info/time_data(ms)": avg_batch_data,
+                        "info/time_forward(ms)": avg_batch_fwd,
+                        "info/time_backward(ms)": avg_batch_bwd,
+                        "info/time_step_total(s)": step_t_total,
+                    })
                 
                 wandb.log(log_dict, step=self.global_step)
+
+            # ---------------------------------------------------------
+            # 📊 RAM 모니터링 (Optional)
+            # ---------------------------------------------------------
+            if self.cfg.wandb and self.cfg.enable_profiling and step_idx % 100 == 0:
+                sys_percent, app_gb = get_ram_info()
+                
+                queue = self.train_loader.dataset
+                curr_patches = len(queue.patches_list)
+                
+                wandb.log({
+                    "perf/ram_system_percent": sys_percent,
+                    "perf/ram_app_total_gb": app_gb,
+                    "perf/queue_curr_patches": curr_patches
+                }, step=self.global_step)
+                
+                if sys_percent > 90:
+                    tqdm.write(f"[WARNING] ⚠️ RAM usage critical: {sys_percent}% (App: {app_gb:.2f} GB)")
+            # ---------------------------------------------------------
             
         return total_loss / self.cfg.steps_per_epoch, \
-               {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, \
-               total_grad / self.cfg.steps_per_epoch
+                {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, \
+                total_grad / self.cfg.steps_per_epoch
 
     @torch.no_grad()
     def validate(self, epoch):
@@ -789,7 +830,7 @@ class Trainer:
                 avg_met = self.validate(epoch)
                 val_loss = avg_met.get('loss', 0)
 
-                if self.scheduler is not None:
+                if self.scheduler is not None and self.cfg.scheduler_type == "plateau":
                     self.scheduler.step(val_loss)
                 
                 tqdm.write(
