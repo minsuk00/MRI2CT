@@ -12,7 +12,8 @@ from tqdm import tqdm
 # ==========================================
 # UPDATE: Point to the output of the previous step
 ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined"
-DATA_DIR = os.path.join(ROOT, "3.0x3.0x3.0mm") # The specific resolution folder
+# DATA_DIR = os.path.join(ROOT, "3.0x3.0x3.0mm") # The specific resolution folder
+DATA_DIR = os.path.join(ROOT, "1.0x1.0x1.0mm")
 
 # Target specific subjects or None for ALL
 TARGET_LIST = None 
@@ -20,8 +21,8 @@ TARGET_LIST = None
 # --- PERFORMANCE SETTINGS ---
 DEVICE = "gpu" 
 # False = High Res (Slow, ~5 mins/scan). True = Low Res (Fast, ~30s/scan)
-# FAST_MODE = False 
-FAST_MODE = True
+FAST_MODE = False 
+# FAST_MODE = True
 
 # ==========================================
 # 2. UTILITIES
@@ -138,7 +139,25 @@ def run_batch_segmentation():
         # Outputs saved in the patient's folder
         ct_out = os.path.join(subj['path'], "ct_seg.nii.gz")
         mr_out = os.path.join(subj['path'], "mr_seg.nii.gz")
+        body_out = os.path.join(subj['path'], "body_mask.nii.gz")
         qa_path = os.path.join(subj['path'], "segmentation_qa.png")
+
+        # --- Body Mask (Binary) ---
+        if os.path.exists(body_out) and not os.path.isdir(body_out):
+            pass
+        else:
+            if os.path.isdir(body_out):
+                import shutil
+                shutil.rmtree(body_out)
+
+            tqdm.write(f"[{subj['id']}] Running Body Mask...")
+            try:
+                totalsegmentator(
+                    input=subj['ct'], output=body_out, 
+                    task="body", device=DEVICE, ml=True
+                )
+            except Exception as e:
+                tqdm.write(f"💥 Body Mask Failed for {subj['id']}: {e}")
 
         # --- CT Segmentation ---
         if os.path.exists(ct_out):

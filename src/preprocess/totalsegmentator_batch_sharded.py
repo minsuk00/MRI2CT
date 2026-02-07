@@ -13,12 +13,14 @@ import math
 # 1. CONFIGURATION
 # ==========================================
 ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined"
-DATA_DIR = os.path.join(ROOT, "3.0x3.0x3.0mm")
+# DATA_DIR = os.path.join(ROOT, "3.0x3.0x3.0mm")
+DATA_DIR = os.path.join(ROOT, "1.0x1.0x1.0mm")
 
 # --- PERFORMANCE SETTINGS ---
 DEVICE = "gpu" 
 # FAST_MODE = True: Uses 3mm model (Fastest)
-FAST_MODE = True 
+# FAST_MODE = True 
+FAST_MODE = False
 
 # ==========================================
 # 2. UTILITIES
@@ -79,7 +81,24 @@ def run_batch_segmentation(part_idx=0, total_parts=1, make_plots=False):
     for subj in tqdm(my_subjects, desc=f"Part {part_idx+1}", unit="subj"):
         ct_out = os.path.join(subj['path'], "ct_seg.nii.gz")
         mr_out = os.path.join(subj['path'], "mr_seg.nii.gz")
+        body_out = os.path.join(subj['path'], "body_mask.nii.gz")
         
+        # --- Body Mask ---
+        if os.path.exists(body_out) and not os.path.isdir(body_out):
+            pass
+        else:
+            if os.path.isdir(body_out):
+                import shutil
+                shutil.rmtree(body_out)
+                
+            try:
+                totalsegmentator(
+                    input=subj['ct'], output=body_out, 
+                    task="body", device=DEVICE, quiet=True, ml=True
+                )
+            except Exception as e:
+                tqdm.write(f"💥 Body Mask Failed {subj['id']}: {e}")
+
         # --- CT Segmentation ---
         if not os.path.exists(ct_out):
             try:

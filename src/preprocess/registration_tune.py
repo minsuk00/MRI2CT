@@ -10,35 +10,39 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import warnings
+import datetime
+import contextlib
+import io
+import gc
 warnings.filterwarnings("ignore", category=UserWarning, module='monai.utils.module')
-from anatomix.registration import convex_adam
+from anatomix.registration import convex_adam, load_model
+import torch
+
+# 100% Safe Speed Optimization (No effect on precision)
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 
 ROOT = "/home/minsukc/MRI2CT"
-DATA_DIR = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm"
+DATA_DIR = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.0x1.0x1.0mm"
 CKPT = os.path.join(ROOT, "anatomix/model-weights/best_val_net_G.pth")
 RES_MULT = 32
 # CKPT = os.path.join(ROOT, "anatomix/model-weights/anatomix.pth")
 SCRATCH_ROOT =  "/scratch/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/"
-# OUTPUT_DIR = os.path.join(ROOT, "tuning_outputs")
-OUTPUT_DIR = os.path.join(SCRATCH_ROOT, "tuning_outputs")
+OUTPUT_DIR = os.path.join(DATA_DIR, "temp_tuning_results")
+
 
 # --- 1. Define Subjects ---
-# Leave None to scan all folders in DATA_DIR that have required files
 # TARGET_SUBJECTS = None 
-TARGET_SUBJECTS = ["1ABA005", "1BA014","1HNA013","1PA021","1THA010"]  
-# TARGET_SUBJECTS = ["1ABA005_3.0x3.0x3.0_resampled", "1HNA001_3.0x3.0x3.0_resampled", "1THA001_3.0x3.0x3.0_resampled"]
-# TARGET_LIST = ["1ABA005_3.0x3.0x3.0_resampled","1ABA009_3.0x3.0x3.0_resampled","1ABA011_3.0x3.0x3.0_resampled","1ABA012_3.0x3.0x3.0_resampled","1ABA014_3.0x3.0x3.0_resampled","1ABA018_3.0x3.0x3.0_resampled","1ABA019_3.0x3.0x3.0_resampled","1ABA025_3.0x3.0x3.0_resampled","1ABA029_3.0x3.0x3.0_resampled","1ABA030_3.0x3.0x3.0_resampled","1HNA001_3.0x3.0x3.0_resampled","1HNA004_3.0x3.0x3.0_resampled","1HNA006_3.0x3.0x3.0_resampled","1HNA008_3.0x3.0x3.0_resampled","1HNA010_3.0x3.0x3.0_resampled","1HNA012_3.0x3.0x3.0_resampled","1HNA013_3.0x3.0x3.0_resampled","1HNA014_3.0x3.0x3.0_resampled","1HNA015_3.0x3.0x3.0_resampled","1HNA018_3.0x3.0x3.0_resampled","1THA001_3.0x3.0x3.0_resampled","1THA002_3.0x3.0x3.0_resampled","1THA003_3.0x3.0x3.0_resampled","1THA004_3.0x3.0x3.0_resampled","1THA005_3.0x3.0x3.0_resampled","1THA010_3.0x3.0x3.0_resampled","1THA011_3.0x3.0x3.0_resampled","1THA013_3.0x3.0x3.0_resampled","1THA015_3.0x3.0x3.0_resampled","1THA016_3.0x3.0x3.0_resampled"]
+TARGET_SUBJECTS = ["1ABA005", "1ABA033", "1BA014", "1BA085", "1HNA013", "1HNA001", "1PA021", "1PA145", "1THA010", "1THA022"]  
 
+# export PYTORCH_ALLOC_CONF=expandable_segments:True
 # --- 2. Define Parameter Search Grid ---
 grid = {
-    # 1. Regularization (soft tissue vs preserve bones)
-    'lambda_weight': [0.5, 0.75, 1.0, 1.5, 2.0, 2.5], 
-    # 2. Capture Range
+    'lambda_weight': [0.5, 0.75, 1.5], 
     'disp_hw': [1, 2, 4], 
-    # 3. Grid Resolution
-    'grid_sp': [2, 3],
-    # 4. Iterations
-    'selected_niter': [80],
+    'grid_sp': [2, 4, 6],       
+    'grid_sp_adam': [2],     
+    'selected_niter': [50],  # Will Use 80 for actual run
     'smooth': [0, 1],
 }
 
@@ -149,12 +153,17 @@ def prepare_subject_data(subj_conf):
     target_dir = subj_conf['path']
     subj_id = subj_conf['id']
     
+    # Try body_mask.nii.gz first, fallback to mask.nii.gz
+    body_mask_path = os.path.join(target_dir, "body_mask.nii.gz")
+    fallback_mask_path = os.path.join(target_dir, "mask.nii.gz")
+    selected_mask_path = body_mask_path if os.path.isfile(body_mask_path) else fallback_mask_path
+
     raw_paths = {
         'mr': os.path.join(target_dir, "mr.nii.gz"),
         'ct': os.path.join(target_dir, "ct.nii.gz"),
         'ct_seg': os.path.join(target_dir, "ct_seg.nii.gz"),
         'mr_seg': os.path.join(target_dir, "mr_seg.nii.gz"),
-        'mask': os.path.join(target_dir, "mask.nii.gz"), 
+        'mask': selected_mask_path, 
     }
     
     print(f"   Processing {subj_id}: Normalizing & Padding...")
@@ -441,12 +450,13 @@ def save_and_print_results(results, output_root):
         **{c: 'first' for c in param_cols} # Keep param values
     }).sort_values(by='dice', ascending=False)
 
-    # Save Raw
-    df.to_csv(os.path.join(output_root, "raw_results.csv"), index=False)
-    summary.to_csv(os.path.join(output_root, "summary_results.csv"), index=False)
+    # Save Raw with timestamp
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    df.to_csv(os.path.join(output_root, f"raw_results_{ts}.csv"), index=False)
+    summary.to_csv(os.path.join(output_root, f"summary_results_{ts}.csv"), index=False)
 
     print("\n" + "="*60)
-    print("🏆 FINAL TUNING RESULTS (Ranked by Avg Dice)")
+    print(f"🏆 FINAL TUNING RESULTS (Ranked by Avg Dice) | {ts}")
     print("="*60)
     print(summary.head(10).to_string(columns=['dice'] + param_cols))
     
@@ -460,6 +470,10 @@ def save_and_print_results(results, output_root):
 def run_tuning_session(data_dir, output_root, ckpt_path, subjects_config, param_grid):
     os.makedirs(output_root, exist_ok=True)
     results = []
+
+    # Preload Model
+    print(f"📦 Preloading model from {ckpt_path}...")
+    model = load_model(ckpt_path)
 
     # 1. Expand Parameter Grid
     keys, values = zip(*param_grid.items())
@@ -498,30 +512,34 @@ def run_tuning_session(data_dir, output_root, ckpt_path, subjects_config, param_
             tqdm.write(f"   🔹 Config {i}: {params}")
 
             lam = params.get('lambda_weight', 0.75)
-            grid_sp = params.get('grid_sp', 2)
-            smooth = params.get('smooth', 0)       # Default to 0 if missing
-            disp_hw = params.get('disp_hw', 1)     # Default to 1 if missing
-            niter = params.get('selected_niter', 80) # Default to 80
+            grid_sp = params.get('grid_sp', 4)
+            grid_sp_adam = params.get('grid_sp_adam', 2)
+            smooth = params.get('smooth', 0)       
+            disp_hw = params.get('disp_hw', 1)     
+            niter = params.get('selected_niter', 80) 
 
             try:
                 # Run Registration on TEMP PADDED files
-                convex_adam(
-                    ckpt_path=ckpt_path,
-                    expname="tune",
-                    result_path=result_dir,
-                    lambda_weight=lam,
-                    grid_sp=grid_sp,
-                    selected_smooth=smooth,
-                    disp_hw=disp_hw, selected_niter=niter, grid_sp_adam=grid_sp,
-                    ic=True, use_mask=True, warp_seg=True,
-                    fixed_image=temp_paths['fixed'], 
-                    fixed_mask=temp_paths['fixed_mask'], 
-                    fixed_seg=temp_paths['fixed_seg'],
-                    fixed_minclip=-450, fixed_maxclip=450,
-                    moving_image=temp_paths['moving'], 
-                    moving_mask=temp_paths['moving_mask'], 
-                    moving_seg=temp_paths['moving_seg']
-                )
+                # Suppress "Using pre-loaded model" etc by capturing stdout
+                with contextlib.redirect_stdout(io.StringIO()):
+                    convex_adam(
+                        ckpt_path=ckpt_path,
+                        expname="tune",
+                        result_path=result_dir,
+                        lambda_weight=lam,
+                        grid_sp=grid_sp,
+                        selected_smooth=smooth,
+                        disp_hw=disp_hw, selected_niter=niter, grid_sp_adam=grid_sp_adam,
+                        ic=False, use_mask=True, warp_seg=True,
+                        fixed_image=temp_paths['fixed'], 
+                        fixed_mask=temp_paths['fixed_mask'], 
+                        fixed_seg=temp_paths['fixed_seg'],
+                        fixed_minclip=-450, fixed_maxclip=450,
+                        moving_image=temp_paths['moving'], 
+                        moving_mask=temp_paths['moving_mask'], 
+                        moving_seg=temp_paths['moving_seg'],
+                        model=model
+                    )
 
                 # Locate Output Files, Compute Dice Score, Visualize output
                 warped_img_candidates = glob.glob(os.path.join(result_dir, "moved_mr_padded_temp*.nii.gz"))
@@ -562,7 +580,24 @@ def run_tuning_session(data_dir, output_root, ckpt_path, subjects_config, param_
 
 
             except Exception as e:
-                tqdm.write(f"      💥 Registration Crash: {e}")
+                error_msg = str(e)
+                tqdm.write(f"      💥 Registration Crash: {error_msg}")
+                
+                # Record the failure in the CSV
+                rec = params.copy()
+                rec['subject'] = subj_id
+                rec['region'] = region
+                rec['config_id'] = i
+                
+                if "out of memory" in error_msg.lower():
+                    rec['dice'] = -1.0 # OOM indicator
+                else:
+                    rec['dice'] = -2.0 # Other error indicator
+                results.append(rec)
+                
+            finally:
+                gc.collect()
+                torch.cuda.empty_cache()
 
         # --- C. Cleanup (Delete Temp Files) ---
         cleanup_subject_data(temp_paths)

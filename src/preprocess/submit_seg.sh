@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16g
+#SBATCH --mem=32g
 #SBATCH --time=07:00:00
 #SBATCH --array=0-9
 #SBATCH --mail-user=minsukc@umich.edu
@@ -17,3 +17,7 @@
 # Ensure the directory /home/minsukc/logs/ exists or change the path.
 
 python src/preprocess/totalsegmentator_batch_sharded.py --part $SLURM_ARRAY_TASK_ID --total_parts 10
+
+# ls -lt /home/minsukc/logs/ | head -n 10
+# tail -f /home/minsukc/logs/totalseg-123456_0.log
+# grep -i "error\|fail" /home/minsukc/logs/totalseg-123456_*.log

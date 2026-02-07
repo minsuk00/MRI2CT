@@ -10,9 +10,15 @@ from matplotlib.colors import ListedColormap
 from sklearn.metrics import f1_score
 from tqdm import tqdm
 import warnings
+import gc
 warnings.filterwarnings("ignore", category=UserWarning, module="monai")
 
-from anatomix.registration import convex_adam
+from anatomix.registration import convex_adam, load_model
+import torch
+
+# 100% Safe Speed Optimization (No effect on precision)
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 
 # ==========================================
 # 1. CONFIGURATION
@@ -21,24 +27,23 @@ PROJECT_ROOT = "/home/minsukc/MRI2CT"
 # UPDATE: Pointing to V2 Checkpoint based on your request
 CKPT_PATH = os.path.join(PROJECT_ROOT, "anatomix/model-weights/best_val_net_G.pth")
 RES_MULT = 32 # use 16 for anatomix v1
-# CKPT_PATH = os.path.join(PROJECT_ROOT, "anatomix/model-weights/anatomix.pth")
-# RES_MULT = 16
 
 # Path to your DATA (On GPFS)
-DATA_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm"
+DATA_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.0x1.0x1.0mm"
 
 # Target specific subjects or set to None for ALL
 TARGET_LIST = None 
-# TARGET_LIST = ["1PA021"]
-# TARGET_LIST = ["1PA112"]
 
-# *** BEST PARAMETERS ***
+# *** BEST PARAMETERS (Updated for 1.0mm Stability) ***
+# NOTE: For 1.0mm, if grid_sp=2 + disp_hw=4 OOMs, 
+# set grid_sp to 4 or 6, and keep grid_sp_adam at 2.
 BEST_PARAMS = {
     'lambda_weight': 0.5,  
-    'grid_sp': 2,           
+    'grid_sp': 2,
+    'grid_sp_adam': 2,    
     'selected_smooth': 1,   
     'selected_niter': 80,   
-    'disp_hw': 4            
+    'disp_hw': 4          
 }
 
 # ==========================================
@@ -343,6 +348,11 @@ def run_batch_pipeline():
         return
 
     print(f"\n🚀 Starting Batch Registration with Params: {BEST_PARAMS}")
+    
+    # Preload Model
+    print(f"📦 Preloading model from {CKPT_PATH}...")
+    model = load_model(CKPT_PATH)
+    
     summary_results = []
     
     params = BEST_PARAMS.copy()
@@ -367,10 +377,15 @@ def run_batch_pipeline():
             tqdm.write(f"Skipping {subj_id} (Already done)")
             continue
 
+        # Try body_mask.nii.gz first, fallback to mask.nii.gz
+        body_mask_path = os.path.join(subj_dir, "body_mask.nii.gz")
+        fallback_mask_path = os.path.join(subj_dir, "mask.nii.gz")
+        selected_mask_path = body_mask_path if os.path.isfile(body_mask_path) else fallback_mask_path
+
         raw_files = {
             'fixed': os.path.join(subj_dir, "ct.nii.gz"),
             'moving': os.path.join(subj_dir, "mr.nii.gz"),
-            'mask': os.path.join(subj_dir, "mask.nii.gz"),
+            'mask': selected_mask_path,
             'fixed_seg': os.path.join(subj_dir, "ct_seg.nii.gz"),
             'moving_seg': os.path.join(subj_dir, "mr_seg.nii.gz"),
         }
@@ -418,17 +433,21 @@ def run_batch_pipeline():
                 selected_smooth=params['selected_smooth'],
                 disp_hw=params['disp_hw'],
                 selected_niter=params['selected_niter'], 
-                grid_sp_adam=params['grid_sp'],
+                grid_sp_adam=params.get('grid_sp_adam', 2),
                 ic=True, use_mask=True, warp_seg=True,
                 fixed_image=temp_paths['fixed'], fixed_mask=temp_paths['mask'], fixed_seg=temp_paths['fixed_seg'],
                 fixed_minclip=-450, fixed_maxclip=450,
-                moving_image=temp_paths['moving'], moving_mask=temp_paths['mask'], moving_seg=temp_paths['moving_seg']
+                moving_image=temp_paths['moving'], moving_mask=temp_paths['mask'], moving_seg=temp_paths['moving_seg'],
+                model=model
             )
         except Exception as e:
             tqdm.write(f"   💥 Registration failed: {e}")
             for p in temp_paths.values(): 
                 if os.path.exists(p): os.remove(p)
             continue
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
 
         try:
             warped_pattern = os.path.join(result_dir, "moved*.nii.gz")

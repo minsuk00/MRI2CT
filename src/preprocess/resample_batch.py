@@ -22,7 +22,8 @@ OUTPUT_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_c
 SPLIT_RATIOS = {"train": 0.7, "val": 0.1, "test": 0.2}
 
 # Target spacing (mm)
-TARGET_SPACING = [3.0, 3.0, 3.0]
+# TARGET_SPACING = [3.0, 3.0, 3.0]
+TARGET_SPACING = [1.0, 1.0, 1.0]
 
 # Set to None to process ALL volumes
 NUM_VOLUMES = None 
@@ -72,19 +73,42 @@ def main():
     print(f"✅ Found {total_subjs} total subjects.")
     if total_subjs == 0: return
 
-    # --- Step 2: Shuffle & Assign Splits ---
-    # Random seed ensures the same split every time you run this script on the same data
-    random.seed(42) 
-    random.shuffle(all_subjects)
+    # --- Step 2: Stratified Shuffle & Assign Splits ---
+    random.seed(42)
 
-    n_train = int(total_subjs * SPLIT_RATIOS["train"])
-    n_val = int(total_subjs * SPLIT_RATIOS["val"])
-    
-    splits = {
-        "train": all_subjects[:n_train],
-        "val": all_subjects[n_train:n_train+n_val],
-        "test": all_subjects[n_train+n_val:]
-    }
+    # Group by region
+    region_groups = {}
+    for subj in all_subjects:
+        r = subj["region"]
+        if r not in region_groups:
+            region_groups[r] = []
+        region_groups[r].append(subj)
+
+    splits = {"train": [], "val": [], "test": []}
+
+    print("\n📊 Stratified Split Summary:")
+    header = f"{'Region':<15} | {'Total':<6} | {'Train':<6} | {'Val':<6} | {'Test':<6}"
+    print(header)
+    print("-" * len(header))
+
+    for region, subjects in sorted(region_groups.items()):
+        random.shuffle(subjects)
+        n = len(subjects)
+        n_train = int(n * SPLIT_RATIOS["train"])
+        n_val = int(n * SPLIT_RATIOS["val"])
+
+        r_train = subjects[:n_train]
+        r_val = subjects[n_train:n_train + n_val]
+        r_test = subjects[n_train + n_val:]
+
+        splits["train"].extend(r_train)
+        splits["val"].extend(r_val)
+        splits["test"].extend(r_test)
+
+        print(f"{region:<15} | {n:<6} | {len(r_train):<6} | {len(r_val):<6} | {len(r_test):<6}")
+
+    print("-" * len(header))
+    print(f"{'TOTAL':<15} | {total_subjs:<6} | {len(splits['train']):<6} | {len(splits['val']):<6} | {len(splits['test']):<6}")
 
     # --- Step 3: Resample and Save to Split Folders ---
     # Example Output: .../SynthRAD_combined/3.0x3.0x3.0mm/train/12345/
@@ -101,9 +125,15 @@ def main():
         # Separate viz directory per split
         viz_dir = os.path.join(base_out, "_visualizations", split_name) 
 
-        for idx, subj in enumerate(tqdm(subjects)):
-            # Save visualization for the first patient in each split to check quality
-            process_subject(subj, split_dir, viz_dir, save_viz=(idx == 0))
+        visualized_regions = set()
+        for subj in tqdm(subjects):
+            region = subj['region']
+            # Save visualization for the first successful patient of EACH region in this split
+            should_viz = region not in visualized_regions
+            success = process_subject(subj, split_dir, viz_dir, save_viz=should_viz)
+            
+            if success and should_viz:
+                visualized_regions.add(region)
 
     print("\n" + "-" * 50)
     print("🏁 Batch Processing Complete.")
@@ -111,6 +141,7 @@ def main():
 def process_subject(subj, output_dir, viz_dir, save_viz=False):
     """
     Reads MR/CT, resamples them, and saves to the output_dir/PatientID/
+    Returns True if resampling was successful (or already done), False otherwise.
     """
     pid = subj['id']
     src_path = subj['path']
@@ -121,20 +152,38 @@ def process_subject(subj, output_dir, viz_dir, save_viz=False):
 
     # Basic validation
     if not (os.path.exists(mr_path) and os.path.exists(ct_path)):
-        return
+        return False
 
     # Create patient folder inside the split directory
     out_patient_dir = os.path.join(output_dir, pid)
     os.makedirs(out_patient_dir, exist_ok=True)
 
-    # Naming convention: keeping it simple or appending suffix
+    # Naming convention
     out_mr = os.path.join(out_patient_dir, "mr.nii.gz")
     out_ct = os.path.join(out_patient_dir, "ct.nii.gz")
     out_mask = os.path.join(out_patient_dir, "mask.nii.gz")
 
     # Skip if done
     if os.path.exists(out_mr) and os.path.exists(out_ct):
-        return 
+        # Even if already done, we check if we need to generate a plot
+        if save_viz:
+            viz_file = os.path.join(viz_dir, f"{pid}_{subj['region']}_comparison.png")
+            if not os.path.exists(viz_file):
+                try:
+                    # Quick resample for viz only
+                    _, mr_res = resample_volume(mr_path, None, TARGET_SPACING)
+                    _, ct_res = resample_volume(ct_path, None, TARGET_SPACING)
+                    mask_res = None
+                    if os.path.exists(mask_path):
+                        _, mask_res = resample_volume(mask_path, None, TARGET_SPACING, is_mask=True)
+                    
+                    orig_dict = {'MRI': minmax(sitk.GetArrayFromImage(sitk.ReadImage(mr_path))), 
+                                 'CT': minmax(sitk.GetArrayFromImage(sitk.ReadImage(ct_path)), -450, 450), 
+                                 'Mask': None}
+                    res_dict = {'MRI': minmax(mr_res), 'CT': minmax(ct_res, -450, 450), 'Mask': mask_res}
+                    save_comparison_plot(orig_dict, res_dict, pid, viz_dir, subj['region'])
+                except: pass
+        return True 
 
     try:
         # Resample Images
@@ -150,10 +199,13 @@ def process_subject(subj, output_dir, viz_dir, save_viz=False):
         if save_viz:
             orig_dict = {'MRI': minmax(mr_orig), 'CT': minmax(ct_orig, -450, 450), 'Mask': mask_orig}
             res_dict = {'MRI': minmax(mr_res), 'CT': minmax(ct_res, -450, 450), 'Mask': mask_res}
-            save_comparison_plot(orig_dict, res_dict, pid, viz_dir)
+            save_comparison_plot(orig_dict, res_dict, pid, viz_dir, subj['region'])
+        
+        return True
 
     except Exception as e:
         print(f"❌ Failed on {pid}: {e}")
+        return False
 
 # ==========================================
 # UTILITIES
@@ -170,7 +222,7 @@ def get_middle_slice(arr):
     z_mid = arr.shape[0] // 2
     return arr[z_mid, :, :]
 
-def save_comparison_plot(orig_dict, res_dict, patient_id, save_dir):
+def save_comparison_plot(orig_dict, res_dict, patient_id, save_dir, region):
     os.makedirs(save_dir, exist_ok=True)
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
@@ -187,8 +239,8 @@ def save_comparison_plot(orig_dict, res_dict, patient_id, save_dir):
     plot_ax(axes[1,1], res_dict['CT'], "Resampled CT")
     plot_ax(axes[1,2], res_dict['Mask'], "Resampled Mask")
 
-    plt.suptitle(f"Patient: {patient_id}", fontsize=16)
-    plt.savefig(os.path.join(save_dir, f"{patient_id}_comparison.png"))
+    plt.suptitle(f"Patient: {patient_id} ({region})", fontsize=16)
+    plt.savefig(os.path.join(save_dir, f"{patient_id}_{region}_comparison.png"))
     plt.close()
 
 def resample_volume(in_path, out_path, target_spacing, is_mask=False):
@@ -218,7 +270,8 @@ def resample_volume(in_path, out_path, target_spacing, is_mask=False):
         resample.SetInterpolator(sitk.sitkLinear)
 
     new_img = resample.Execute(img)
-    sitk.WriteImage(new_img, out_path)
+    if out_path is not None:
+        sitk.WriteImage(new_img, out_path)
     
     return original_array, sitk.GetArrayFromImage(new_img)
 
