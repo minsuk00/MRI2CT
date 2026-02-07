@@ -12,3 +12,4 @@ results/
 data/
 *.pyc
 /anatomix/
+dataset
