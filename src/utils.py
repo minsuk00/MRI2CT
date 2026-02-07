@@ -14,31 +14,50 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     
     # FOR TESTING & PRODUCTION TRAINING (SPEED):
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.deterministic = False
+    # torch.backends.cudnn.benchmark = True
 
 def cleanup_gpu():
     gc.collect()
     torch.cuda.empty_cache()
 
 def get_ram_info():
-    # 1. 시스템 전체 RAM 사용률 (%)
+    # 1. Get System Memory
     sys_mem = psutil.virtual_memory()
-    sys_percent = sys_mem.percent
-    
-    # 2. 현재 프로세스 + 자식 프로세스(Workers) 메모리 합계 (GB)
+    total_available_mem = sys_mem.total
+
+    # 2. Check for User Limits (ulimit -m / RLIMIT_RSS)
+    try:
+        import resource
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_RSS)
+        # If soft_limit is set (not -1/infinity), use it as the ceiling
+        if soft_limit != resource.RLIM_INFINITY:
+            total_available_mem = min(total_available_mem, soft_limit)
+    except Exception:
+        pass # Fallback to system total if anything fails
+
+    # 3. Calculate Total Usage (Main + Children)
     main_p = psutil.Process()
-    total_rss = main_p.memory_info().rss  # Main process
+    # Use PSS if available (Linux), else RSS
+    try:
+        main_mem = main_p.memory_full_info()
+        total_used = getattr(main_mem, 'pss', main_mem.rss)
+    except:
+        total_used = main_p.memory_info().rss
     
-    # 자식 프로세스(DataLoader Workers)들 순회
     for child in main_p.children(recursive=True):
         try:
-            total_rss += child.memory_info().rss
+            mem = child.memory_full_info()
+            total_used += getattr(mem, 'pss', mem.rss)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
             
-    total_gb = total_rss / (1024 ** 3)  # Byte -> GB 변환
-    return sys_percent, total_gb
+    total_gb = total_used / (1024 ** 3)
+    
+    # Recalculate percentage based on the effective limit
+    usage_percent = (total_used / total_available_mem) * 100
+    
+    return usage_percent, total_gb
 
 def anatomix_normalize(tensor, percentile_range = None, clip_range=None):
     if not torch.is_tensor(tensor):
