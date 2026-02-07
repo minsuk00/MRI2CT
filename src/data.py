@@ -53,24 +53,25 @@ def get_augmentations():
     return tio.Compose([
         # Applied to BOTH MRI and CT identically
         tio.OneOf({
-            tio.RandomElasticDeformation(
-                num_control_points=7, 
-                max_displacement=4, 
-                locked_borders=2, 
-                image_interpolation='linear' 
-            ): 0.3, 
+            # tio.RandomElasticDeformation(
+            #     num_control_points=7, 
+            #     max_displacement=4, 
+            #     locked_borders=2, 
+            #     image_interpolation='linear' 
+            # ): 0.3, 
             tio.RandomAffine(
                 scales=(0.95, 1.1), 
                 degrees=7, 
                 translation=4,
                 default_pad_value='minimum'
-            ): 0.7,
+            ): 1.0,
         }, p=0.8), 
         tio.RandomFlip(axes=(0, 1, 2), p=0.5),
         tio.Clamp(0, 1),
         
         tio.Compose([
-            tio.RandomBiasField(coefficients=0.5, p=0.4, order=2),
+            # tio.RandomBiasField(coefficients=0.5, p=0.4, order=2),
+            tio.RandomBiasField(coefficients=0.5, p=0.4),
             tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.4),
         ], include=['mri']) ,
         tio.Clamp(0, 1),
@@ -92,3 +93,86 @@ def get_subject_paths(root, relative_path):
         raise FileNotFoundError(f"Missing files in {subj_dir}")
         
     return {'ct': ct_path, 'mri': mr_path}
+
+def get_region_key(subj_id):
+    """Determines region key from subject ID (e.g., 1ABA005 -> abdomen, 1BB034 -> brain)."""
+    mapping = {"AB": "abdomen", "TH": "thorax", "HN": "head_neck", "B": "brain", "P": "pelvis"}
+    
+    # Basic validation
+    if not subj_id or len(subj_id) < 2:
+        return "abdomen"
+
+    code_2 = subj_id[1:3].upper()
+    code_1 = subj_id[1:2].upper()
+    
+    if code_2 in mapping: return mapping[code_2]
+    if code_1 in mapping: return mapping[code_1]
+    
+    return "abdomen"
+
+REGION_MAPS = {
+    "abdomen": {
+        "Spleen": 1,
+        "Kidneys": [2, 3],
+        "Gallbladder": 4,
+        "Liver": 5,
+        "Stomach": 6,
+        "Pancreas": 7,
+        "Adrenal_Glands": [8, 9],
+        "Small_Bowel": 18,
+        "Duodenum": 19,
+        "Colon": 20,
+        "Urinary_Bladder": 21,
+        "Kidney_Cysts": [23, 24],
+        "Vertebrae_Lumbar": [27, 28, 29, 30, 31],
+        "Vertebrae_Thoracic_Lower": [32, 33, 34, 35],
+        "Aorta": 52,
+        "Inferior_Vena_Cava": 63,
+        "Portal_Vein_And_Splenic_Vein": 64
+    },
+    "thorax": {
+        "Lungs": [10, 11, 12, 13, 14],
+        "Esophagus": 15,
+        "Trachea": 16,
+        "Heart": 51,
+        "Aorta": 52,
+        "Pulmonary_Vein": 53,
+        "Brachiocephalic_Trunk": 54,
+        "Subclavian_Arteries": [55, 56],
+        "Common_Carotid_Arteries": [57, 58],
+        "Brachiocephalic_Veins": [59, 60],
+        "Atrial_Appendage_Left": 61,
+        "Superior_Vena_Cava": 62,
+        "Vertebrae_Thoracic": list(range(32, 44)),
+        "Scapula": [71, 72],
+        "Clavicula": [73, 74],
+        "Spinal_Cord": 79,
+        "Ribs": list(range(92, 116)),
+        "Sternum": 116,
+        "Costal_Cartilages": 117
+    },
+    "head_neck": {
+        "Brain": 90,
+        "Skull": 91,
+        "Thyroid_Gland": 17,
+        "Vertebrae_Cervical": list(range(44, 51)),
+        "Common_Carotid_Arteries": [57, 58]
+    },
+    "brain": {
+        "Brain": 90,
+        "Skull": 91
+    },
+    "pelvis": {
+        "Urinary_Bladder": 21,
+        "Prostate": 22,
+        "Sacrum": 25,
+        "Vertebrae_S1": 26,
+        "Vertebrae_L5": 27,
+        "Iliac_Arteries": [65, 66],
+        "Iliac_Veins": [67, 68],
+        "Femurs": [75, 76],
+        "Hips": [77, 78],
+        "Gluteus_Muscles": list(range(80, 86)),
+        "Iliopsoas_Muscles": [88, 89]
+    }
+}
