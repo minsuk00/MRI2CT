@@ -25,12 +25,12 @@ os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 
 EXPERIMENT_CONFIG = [
     {
-        "steps_per_epoch": 3000,
+        "steps_per_epoch": 2000,
         "val_interval": 1,
         "total_epochs": 5000,
         "sanity_check": False,
         
-        "batch_size": 8,
+        "batch_size": 4,
         "viz_limit": 10,
         "model_save_interval": 1,
 
@@ -39,36 +39,43 @@ EXPERIMENT_CONFIG = [
         "enable_safety_padding": False,
         "use_weighted_sampler": False,
 
-        "patches_per_volume": 400,
-        "data_queue_max_length": 2000,
+        "patches_per_volume": 50,
+        "data_queue_max_length": 500,
         "data_queue_num_workers": 6,
-
-        "enable_profiling": True,
 
         "lr": 3e-4,
+        # "lr": 5e-5,
+        # "scheduler_t_max": 1000000,
+        # "scheduler_t_max": 500000,
+        "scheduler_t_max": 50000,
+        "scheduler_min_lr": 1e-6,
+
+        "enable_profiling": True,
+        
+        "wandb_note": "long_run_anatomix_v2",
+        "resume_wandb_id": "bzum5b0m", 
+
+        "patch_size": 128,
+        
+        # "anatomix_weights": "v1",
+        # "wandb_note": "long_run_anatomix_v1",
+        # "resume_wandb_id": "vrqk0o7f", 
 
         # ------------------------
-        "wandb_note": "single_subject_overfitting",
-        "subjects": ["1ABA005"],
-        "augment": False,
-        "steps_per_epoch": 3000,
-        "val_interval": 1,
-        "total_epochs": 1000,
-        "model_save_interval": 1,
-        "patches_per_volume": 2000,
-        "data_queue_max_length": 2000,
-        "data_queue_num_workers": 6,
+        # "wandb_note": "single_subject_overfitting",
+        # "subjects": ["1ABA005"],
+        # "augment": False,
+        # "steps_per_epoch": 3000,
+        # "val_interval": 1,
+        # "total_epochs": 1000,
+        # "model_save_interval": 1,
+        # "patches_per_volume": 2000,
+        # "data_queue_max_length": 2000,
+        # "data_queue_num_workers": 6,
         # ------------------------
         
         # "wandb_note": "test_run",
         # "override_lr": True,
-    
-        # "wandb_note": "long_run_anatomix_v2",
-        # "resume_wandb_id": "gozzhvfn", 
-        
-        # "anatomix_weights": "v1",
-        # "wandb_note": "long_run_anatomix_v1",
-        # "resume_wandb_id": "msj4nmzy", 
     },
 ]
 

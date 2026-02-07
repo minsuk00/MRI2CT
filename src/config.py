@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
     # Training
     "lr": 3e-4,
     "scheduler_type": "cosine", # "plateau", "cosine", None
-    "scheduler_t_max": 500000,
+    "scheduler_t_max": 1000000,
     "scheduler_min_lr": 1e-6,
     "val_interval": 1,
     "sanity_check": True,

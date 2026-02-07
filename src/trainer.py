@@ -19,7 +19,7 @@ from anatomix.model.network import Unet
 
 from src.config import Config
 from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info
-from src.data import DataPreprocessing, get_augmentations, get_subject_paths
+from src.data import DataPreprocessing, get_augmentations, get_subject_paths, get_region_key
 from src.loss import CompositeLoss
 
 class Trainer:
@@ -31,7 +31,7 @@ class Trainer:
         print(f"[DEBUG] 🚀 Initializing Trainer on {self.device}")
 
         # Default run name
-        self.run_name = f"{self.cfg.model_type.upper()}_Train_{datetime.datetime.now():%Y%m%d_%H%M}"
+        self.run_name = f"{datetime.datetime.now():%Y%m%d_%H%M}_{self.cfg.anatomix_weights.upper()}_Train"
 
         # 2. Setup Components
         self._setup_models()
@@ -50,7 +50,7 @@ class Trainer:
         
         # Consistent run name
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")                          
-        self.run_name = f"{self.cfg.model_type.upper()}_Train{len(self.train_subjects)}_{timestamp}"
+        self.run_name = f"{timestamp}_{self.cfg.anatomix_weights.upper()}_Train{len(self.train_subjects)}"
         os.makedirs(self.cfg.log_dir, exist_ok=True)
         
         print(f"[DEBUG] 📡 Initializing WandB: {self.run_name}")
@@ -72,18 +72,27 @@ class Trainer:
         def scan_split(split_name):
             split_dir = os.path.join(self.cfg.root_dir, split_name)
             if not os.path.exists(split_dir): return []
-            return sorted([
-                os.path.join(split_name, d) # Store as relative path 'train/1ABA005'
-                for d in os.listdir(split_dir) 
-                if os.path.isdir(os.path.join(split_dir, d))
-            ])
+            
+            valid_subjs = []
+            for d in sorted(os.listdir(split_dir)):
+                subj_path = os.path.join(split_dir, d)
+                if not os.path.isdir(subj_path): continue
+                
+                # Check for required files (must have both CT and Registered MRI)
+                has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz"))
+                has_mr = os.path.exists(os.path.join(subj_path, "registration_output", "moved_mr.nii.gz"))
+                
+                if has_ct and has_mr:
+                    valid_subjs.append(os.path.join(split_name, d))
+            
+            return valid_subjs
 
         train_candidates = scan_split("train")
         val_candidates = scan_split("val")
         
         # Logic for 'subjects' (Single Image Optimization)
         if self.cfg.subjects:
-            print(f"[DEBUG] 🎯 Filtering specific subjects: {self.cfg.subjects}")
+            print(f"[DEBUG] Filtering specific subjects: {self.cfg.subjects}")
             # Filter candidates that end with the requested ID
             # e.g., if requested '1ABA005', match 'train/1ABA005'
             self.train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
@@ -93,7 +102,7 @@ class Trainer:
             self.train_subjects = train_candidates
             self.val_subjects = val_candidates
         
-        print(f"[DEBUG] 📊 Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
+        print(f"[DEBUG] Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
 
         if self.cfg.analyze_shapes:
             shapes = []
@@ -159,12 +168,28 @@ class Trainer:
         val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess) 
         self.val_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
 
+        # Stratified Validation Sampling (2 per region)
         total_val = len(self.val_subjects)
-        num_viz = min(self.cfg.viz_limit, total_val)
-        rng = random.Random(self.cfg.seed) 
-        self.val_viz_indices = set(rng.sample(range(total_val), num_viz))
+        rng = random.Random(self.cfg.seed)
         
-        print(f"[DEBUG] 🖼️  Fixed Validation Viz Indices: {self.val_viz_indices}")
+        region_to_indices = defaultdict(list)
+        for idx, subj_path in enumerate(self.val_subjects):
+            subj_id = os.path.basename(subj_path)
+            region = get_region_key(subj_id)
+            region_to_indices[region].append(idx)
+        
+        viz_indices = []
+        for region, indices in region_to_indices.items():
+            # Pick up to 2 subjects per region
+            num_to_pick = min(len(indices), 2)
+            viz_indices.extend(rng.sample(indices, num_to_pick))
+        
+        self.val_viz_indices = set(viz_indices)
+        
+        # print(f"[DEBUG] 🖼️  Stratified Val Viz Indices: {self.val_viz_indices}")
+        for region, indices in region_to_indices.items():
+            picked = [i for i in viz_indices if i in indices]
+            # print(f"   - {region:10}: picked {len(picked)}/{len(indices)} (indices: {picked})")
 
     def _setup_models(self):
         # 1. Anatomix (Feature Extractor)
@@ -269,20 +294,45 @@ class Trainer:
         print(f"[RESUME] 📥 Loading: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=self.device)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Helper to load into potentially compiled model
+        def load_state(m, state):
+            getattr(m, "_orig_mod", m).load_state_dict(state)
+            # m.load_state_dict(state)
+
+        load_state(self.model, checkpoint['model_state_dict'])
+        
+        if 'feat_extractor_state_dict' in checkpoint:
+            print("[RESUME] 📥 Loading Feature Extractor state...")
+            load_state(self.feat_extractor, checkpoint['feat_extractor_state_dict'])
+
+        if checkpoint.get('scheduler_state_dict') is not None and self.scheduler is not None:
+            print("[RESUME] 📥 Loading Scheduler state...")
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
             if self.cfg.override_lr:
                 print(f"[RESUME] 🔧 Forcing new Learning Rate: {self.cfg.lr}")
+                feat_params = list(self.feat_extractor.parameters())
                 for param_group in self.optimizer.param_groups:
-                    if len(param_group['params']) == len(list(self.feat_extractor.parameters())):
+                    # Identify by parameter matching instead of just length if possible, 
+                    # but length is a good fallback for different models.
+                    is_feat = any(any(p is fp for fp in feat_params) for p in param_group['params'])
+                    
+                    if is_feat:
                          param_group['lr'] = self.cfg.lr_feat_extractor
                     else:
                          param_group['lr'] = self.cfg.lr
+                
+                # Update scheduler base_lrs to match new optimizer LRs
+                if self.scheduler is not None:
+                    self.scheduler.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
         
-        # if 'optimizer_state_dict' in checkpoint:
-        #     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            print("[RESUME] 📥 Loading GradScaler state...")
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
         if 'epoch' in checkpoint:
             self.start_epoch = checkpoint['epoch'] + 1
         
@@ -298,16 +348,22 @@ class Trainer:
         save_dir = wandb.run.dir if self.cfg.wandb else os.path.join(self.cfg.root_dir, "results", "models")
         os.makedirs(save_dir, exist_ok=True)
         
+        # Helper to get clean state dict (handles torch.compile)
+        def get_state_dict(m):
+            return getattr(m, "_orig_mod", m).state_dict()
+
         save_dict = {
             'epoch': epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': get_state_dict(self.model),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler_state_dict': self.scaler.state_dict(),
             'config': vars(self.cfg)
         }
         
         if self.cfg.finetune_feat_extractor:
-             save_dict['feat_extractor_state_dict'] = self.feat_extractor.state_dict()
+             save_dict['feat_extractor_state_dict'] = get_state_dict(self.feat_extractor)
              
         path = os.path.join(save_dir, filename)
         torch.save(save_dict, path)
@@ -641,7 +697,8 @@ class Trainer:
             
             # Step scheduler per iteration for cosine
             if self.scheduler is not None and self.cfg.scheduler_type == "cosine":
-                self.scheduler.step()
+                if self.scheduler.last_epoch < self.scheduler.T_max:
+                    self.scheduler.step()
 
             total_loss += step_loss
             total_grad += grad_norm.item()
@@ -666,32 +723,17 @@ class Trainer:
             
             pbar.set_postfix(pbar_dict)
             
-            if self.cfg.wandb:
-                log_dict = {}
-                if step_idx % 100 == 0:
-                    log_dict.update({
-                        "train/loss_step": step_loss,
-                        "train/grad_norm": grad_norm.item(),
-                        "train/lr": current_lr,
-                        "info/global_step": self.global_step,
-                        "info/epoch": epoch,
-                    })
-                    for k, v in comps.items():
-                        log_dict[k.replace("loss_", "train/loss_")] = v
-                    
-                
-                if self.cfg.enable_profiling:
-                    log_dict.update({
-                        "info/time_data(ms)": avg_batch_data,
-                        "info/time_forward(ms)": avg_batch_fwd,
-                        "info/time_backward(ms)": avg_batch_bwd,
-                        "info/time_step_total(s)": step_t_total,
-                    })
-                
+            if self.cfg.wandb and self.cfg.enable_profiling:
+                log_dict = {
+                    "info/time_data(ms)": avg_batch_data,
+                    "info/time_forward(ms)": avg_batch_fwd,
+                    "info/time_backward(ms)": avg_batch_bwd,
+                    "info/time_step_total(s)": step_t_total,
+                }
                 wandb.log(log_dict, step=self.global_step)
 
             # ---------------------------------------------------------
-            # 📊 RAM 모니터링 (Optional)
+            # RAM 모니터링 (Optional)
             # ---------------------------------------------------------
             if self.cfg.wandb and self.cfg.enable_profiling and step_idx % 100 == 0:
                 sys_percent, app_gb = get_ram_info()
@@ -845,13 +887,15 @@ class Trainer:
             if self.cfg.wandb:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 log = {
-                    "train_loss/total": loss, 
+                    "train/total": loss, 
                     "info/grad_norm": gn, 
                     "info/epoch_duration": ep_duration,
                     "info/cumulative_time": cumulative_time,
-                    "info/lr": current_lr 
+                    "info/lr": current_lr,
+                    "info/global_step": self.global_step,
+                    "info/epoch": epoch,
                 }
-                for k, v in comps.items(): log[k.replace("loss_", "train_loss/")] = v
+                for k, v in comps.items(): log[k.replace("loss_", "train/")] = v
                 wandb.log(log, step=self.global_step)
                 
             if epoch % self.cfg.model_save_interval == 0:
