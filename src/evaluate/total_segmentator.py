@@ -9,7 +9,7 @@ from totalsegmentator.python_api import totalsegmentator
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from src.data import get_region_key, REGION_MAPS
+from src.data import get_region_key
 
 # ==========================================
 # 2. EVALUATION LOGIC
@@ -29,13 +29,13 @@ def compute_dice(seg_a, seg_b, labels):
         union = np.sum(mask_a) + np.sum(mask_b)
         
         if union == 0:
-            dice_scores[name] = 1.0
+            dice_scores[name] = np.nan
         else:
             dice_scores[name] = (2.0 * inter) / (union)
             
     return dice_scores
 
-def run_functional_eval(pred_dir, data_root, gt_res_arg, device="gpu"):
+def run_functional_eval(pred_dir, data_root, gt_res_arg, device="gpu", fast=False):
     # Map simplified arg to directory name
     res_map = {"1x1x1": "1.0x1.0x1.0mm", "3x3x3": "3.0x3.0x3.0mm"}
     gt_res_dir = res_map[gt_res_arg]
@@ -78,30 +78,34 @@ def run_functional_eval(pred_dir, data_root, gt_res_arg, device="gpu"):
         pred_seg_path = pf.replace(".nii.gz", "_seg.nii.gz")
         if not os.path.exists(pred_seg_path):
             try:
-                totalsegmentator(pf, pred_seg_path, task="total", ml=True, fast=False, device=device, quiet=True)
+                totalsegmentator(pf, pred_seg_path, task="total", ml=True, fast=fast, device=device, quiet=True)
             except Exception as e:
                 tqdm.write(f"   💥 Failed to segment {subj_id}: {e}")
                 continue
         
         # 3. Load and Compute Dice
         try:
-            gt_seg = nib.load(gt_seg_path).get_fdata()
-            pred_seg = nib.load(pred_seg_path).get_fdata()
+            gt_seg = nib.load(gt_seg_path).get_fdata().astype(int)
+            pred_seg = nib.load(pred_seg_path).get_fdata().astype(int)
             
-            region_key = get_region_key(subj_id)
-            organs = REGION_MAPS.get(region_key, {})
+            # Use TotalSegmentator's internal map for consistent naming and exhaustive coverage
+            from totalsegmentator.map_to_binary import class_map
+            ts_map = class_map['total']
+            all_ts_organs = {name: lid for lid, name in ts_map.items()}
             
-            scores = compute_dice(gt_seg, pred_seg, organs)
+            scores = compute_dice(gt_seg, pred_seg, all_ts_organs)
             if scores is None: continue
 
             scores['subj_id'] = subj_id
-            scores['region'] = region_key
+            scores['region'] = get_region_key(subj_id)
             
+            # Average only over labels that existed in GT or were hallucinated in Pred (non-NaN)
             organ_vals = [v for k, v in scores.items() if k not in ['subj_id', 'region']]
-            scores['avg_dice'] = np.mean(organ_vals) if organ_vals else 0.0
+            valid_vals = [v for v in organ_vals if not np.isnan(v)]
+            scores['avg_dice'] = np.mean(valid_vals) if valid_vals else 0.0
             
             all_results.append(scores)
-            tqdm.write(f"   ✅ {subj_id} | Avg Dice: {scores['avg_dice']:.4f}")
+            tqdm.write(f"   ✅ {subj_id} | Avg Dice: {scores['avg_dice']:.4f} ({len(valid_vals)} organs)")
 
         except Exception as e:
             tqdm.write(f"   ⚠️ Error processing {subj_id}: {e}")
@@ -122,6 +126,8 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="./dataset", help="Dataset root")
     parser.add_argument("--gt_res", type=str, default="1x1x1", choices=["1x1x1", "3x3x3"], help="GT resolution")
     parser.add_argument("--device", type=str, default="gpu", choices=["gpu", "cpu"])
+    parser.add_argument("--fast", action="store_true", help="Run TotalSegmentator in fast mode (3mm)")
     
     args = parser.parse_args()
-    run_functional_eval(args.path, args.data, args.gt_res, device=args.device)
+    run_functional_eval(args.path, args.data, args.gt_res, device=args.device, fast=args.fast)
+    
