@@ -46,14 +46,16 @@ EXPERIMENT_CONFIG = [
         "lr": 3e-4,
         # "lr": 5e-5,
         # "scheduler_t_max": 1000000,
-        # "scheduler_t_max": 500000,
-        "scheduler_t_max": 50000,
+        "scheduler_t_max": 500000,
+        # "scheduler_t_max": 50000,
         "scheduler_min_lr": 1e-6,
 
         "enable_profiling": True,
         
         "wandb_note": "long_run_anatomix_v2",
         "resume_wandb_id": "bzum5b0m", 
+        "resume_epoch": 237, # None for last epoch
+        "diverge_wandb_branch": False,
 
         "patch_size": 128,
         

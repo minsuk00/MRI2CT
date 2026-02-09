@@ -54,6 +54,8 @@ class Trainer:
         os.makedirs(self.cfg.log_dir, exist_ok=True)
         
         print(f"[DEBUG] 📡 Initializing WandB: {self.run_name}")
+        wandb_id = None if self.cfg.diverge_wandb_branch else self.cfg.resume_wandb_id
+        
         wandb.init(
             project=self.cfg.project_name, 
             name=self.run_name, 
@@ -61,8 +63,8 @@ class Trainer:
             notes=self.cfg.wandb_note,
             reinit=True,
             dir=self.cfg.log_dir,
-            id=self.cfg.resume_wandb_id, 
-            resume="allow",
+            id=wandb_id, 
+            resume="allow" if not self.cfg.diverge_wandb_branch else None,
         )
 
     def _setup_data(self):
@@ -278,7 +280,7 @@ class Trainer:
         print(f"[RESUME] 🕵️ Searching for Run ID: {self.cfg.resume_wandb_id}")
         run_folders = glob(os.path.join(self.cfg.log_dir, "wandb", f"run-*-{self.cfg.resume_wandb_id}"))
         if not run_folders:
-            print("[RESUME] ❌ Run folder not found.")
+            print(f"[RESUME] ❌ Run folder not found for ID: {self.cfg.resume_wandb_id}")
             return
 
         all_ckpts = []
@@ -290,7 +292,16 @@ class Trainer:
             print("[RESUME] ⚠️ No checkpoints found inside run folder.")
             return
 
-        resume_path = max(all_ckpts, key=os.path.getmtime)
+        if self.cfg.resume_epoch is not None:
+            epoch_str = f"epoch{self.cfg.resume_epoch:05d}"
+            target_ckpts = sorted([c for c in all_ckpts if epoch_str in os.path.basename(c)])
+            if not target_ckpts:
+                print(f"[RESUME] ❌ Could not find checkpoint for epoch {self.cfg.resume_epoch}")
+                return
+            resume_path = target_ckpts[-1] # Take the latest one for that epoch
+        else:
+            resume_path = max(all_ckpts, key=os.path.getmtime)
+            
         print(f"[RESUME] 📥 Loading: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=self.device)
         

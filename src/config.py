@@ -75,6 +75,8 @@ DEFAULT_CONFIG = {
 
     "wandb_note": "test_run",
     "resume_wandb_id": None, 
+    "resume_epoch": None,
+    "diverge_wandb_branch": False,
     
     # Validation Saving
     "save_val_volumes": True, 
