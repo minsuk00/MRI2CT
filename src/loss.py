@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from fused_ssim import fused_ssim3d
 
 class CompositeLoss(nn.Module):
@@ -9,7 +10,47 @@ class CompositeLoss(nn.Module):
         self.l1 = nn.L1Loss()
         self.l2 = nn.MSELoss()
 
-    def forward(self, pred, target, feat_extractor=None, use_sliding_window=False):
+    def soft_dice_loss(self, probs, target_mask):
+        """
+        probs: [B, C, X, Y, Z] (Softmax output from Teacher)
+        target_mask: [B, 1, X, Y, Z] (Integer Hard Labels from GT)
+        """
+        smooth = 1e-5
+        num_classes = probs.shape[1]
+        
+        # Squeeze channel dim from mask if present: [B, 1, X, Y, Z] -> [B, X, Y, Z]
+        if target_mask.ndim == 5:
+            target_mask = target_mask.squeeze(1)
+            
+        # Convert target_mask to one-hot: [B, X, Y, Z] -> [B, C, X, Y, Z]
+        target_one_hot = F.one_hot(target_mask.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+        
+        # Flatten: [B, C, N]
+        p = probs.view(probs.shape[0], probs.shape[1], -1)
+        t = target_one_hot.view(target_one_hot.shape[0], target_one_hot.shape[1], -1)
+        
+        # Select Classes based on config
+        if self.weights.get("dice_bone_only", False):
+            if p.shape[1] <= 5:
+                raise RuntimeError(f"Dice Bone Only requested (idx 5), but input has only {p.shape[1]} channels.")
+            # Select just channel 5
+            p = p[:, 5:6, :]
+            t = t[:, 5:6, :]
+        elif self.weights.get("dice_exclude_background", True):
+            # Exclude index 0
+            p = p[:, 1:, :]
+            t = t[:, 1:, :]
+        
+        intersection = (p * t).sum(dim=2)
+        union = p.sum(dim=2) + t.sum(dim=2)
+        
+        # Dice per class per batch
+        dice = (2. * intersection + smooth) / (union + smooth)
+        
+        # Average over classes and batch
+        return 1.0 - dice.mean()
+
+    def forward(self, pred, target, feat_extractor=None, use_sliding_window=False, pred_probs=None, target_mask=None):
         total_loss = 0.0
         loss_components = {}
         
@@ -44,5 +85,10 @@ class CompositeLoss(nn.Module):
                 val = self.l1(pred_feats, target_feats)
                 total_loss += self.weights["perceptual"] * val
                 loss_components["loss_perceptual"] = val.item()
+        
+        if self.weights.get("dice_w", 0) > 0 and pred_probs is not None and target_mask is not None:
+            val = self.soft_dice_loss(pred_probs, target_mask)
+            total_loss += self.weights["dice_w"] * val
+            loss_components["loss_dice"] = val.item()
             
         return total_loss, loss_components

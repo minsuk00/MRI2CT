@@ -46,7 +46,7 @@ EXPERIMENT_CONFIG = [
         "lr": 3e-4,
         # "lr": 5e-5,
         # "scheduler_t_max": 1000000,
-        "scheduler_t_max": 500000,
+        "scheduler_t_max": 300000,
         # "scheduler_t_max": 50000,
         "scheduler_min_lr": 1e-6,
 
@@ -58,6 +58,12 @@ EXPERIMENT_CONFIG = [
         "diverge_wandb_branch": False,
 
         "patch_size": 128,
+        # "dice_w": 0.0, 
+        "dice_w": 1.0, 
+        "l1_w": 0.0,
+        "ssim_w": 0.0,
+
+        "dice_bone_only": True,
         
         # "anatomix_weights": "v1",
         # "wandb_note": "long_run_anatomix_v1",

@@ -1,4 +1,5 @@
 import os
+import sys
 import gc
 import time
 import random
@@ -16,6 +17,14 @@ import wandb
 import torchio as tio
 from monai.inferers import sliding_window_inference
 from anatomix.model.network import Unet
+
+# Add CADS to path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "CADS")))
+try:
+    from cads.utils.libs import get_model_weights_dir, setup_nnunet_env
+    from cads.utils.inference import nnUNetv2Predictor
+except ImportError:
+    print("[WARNING] CADS not found. Dice loss will be unavailable.")
 
 from src.config import Config
 from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info
@@ -120,15 +129,30 @@ class Trainer:
                 print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
         
         # 3. Helper to create paths
-        def _make_subj_list(subjs):
-            return [tio.Subject(
-                mri=tio.ScalarImage(p['mri']), 
-                ct=tio.ScalarImage(p['ct']),
-                subj_id=os.path.basename(s) # Extract just ID for logging
-            ) for s in subjs for p in [get_subject_paths(self.cfg.root_dir, s)]]
+        def _make_subj_list(subjs, load_seg=False):
+            subj_list = []
+            for s in subjs:
+                paths = get_subject_paths(self.cfg.root_dir, s)
+                kwargs = {
+                    'mri': tio.ScalarImage(paths['mri']), 
+                    'ct': tio.ScalarImage(paths['ct']),
+                    'subj_id': os.path.basename(s)
+                }
+                # Conditionally load segmentation
+                if load_seg:
+                    seg_path = os.path.join(self.cfg.root_dir, s, "cads_ct_seg.nii.gz")
+                    if os.path.exists(seg_path):
+                        kwargs['seg'] = tio.LabelMap(seg_path)
+                    else:
+                        raise FileNotFoundError(f"Segmentation missing for {s} but dice_w > 0.")
+                        
+                subj_list.append(tio.Subject(**kwargs))
+            return subj_list
 
         # 5. Train Loader (Queue)
-        train_objs = _make_subj_list(self.train_subjects)
+        # Only load seg if Dice weight > 0
+        load_seg = getattr(self.cfg, 'dice_w', 0) > 0
+        train_objs = _make_subj_list(self.train_subjects, load_seg=load_seg)
         # use_safety = (self.cfg.model_type.lower() == "cnn" and self.cfg.enable_safety_padding)
         use_safety = self.cfg.enable_safety_padding
         
@@ -165,7 +189,7 @@ class Trainer:
         self.train_iter = _inf_gen(self.train_loader)
 
         # 6. Val Loader (Full Volume)
-        val_objs = _make_subj_list(self.val_subjects)
+        val_objs = _make_subj_list(self.val_subjects, load_seg=False) # No dice loss in Val for now
         val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult)
         val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess) 
         self.val_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
@@ -238,6 +262,29 @@ class Trainer:
         else:
             print(f"[DEBUG] 🐢 specific compile mode not set or None. Skipping compilation.")
             self.model = model
+            
+        # 3. CADS Model (For Dice Loss)
+        self.cads_model = None
+        if getattr(self.cfg, 'dice_w', 0) > 0:
+            print("[DEBUG] 👨‍🏫 Initializing CADS Model for Dice Loss...")
+            if "CADS_WEIGHTS_PATH" not in os.environ:
+                os.environ["CADS_WEIGHTS_PATH"] = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/cads_weights"
+            
+            try:
+                setup_nnunet_env()
+                self.cads_model = nnUNetv2Predictor(
+                    model_folder=get_model_weights_dir(), 
+                    task_id=559, # Saros
+                    device=self.device
+                )
+                # Freeze CADS model
+                self.cads_model.predictor.network.eval()
+                for p in self.cads_model.predictor.network.parameters():
+                    p.requires_grad = False
+                print("[DEBUG] ✅ CADS Model initialized.")
+            except Exception as e:
+                print(f"[ERROR] ❌ Failed to init CADS Model: {e}")
+                raise e # Fail loudly if dice loss is requested but model fails
 
     def _setup_opt(self):
         params = [{'params': self.model.parameters(), 'lr': self.cfg.lr}]
@@ -269,7 +316,8 @@ class Trainer:
 
         self.loss_fn = CompositeLoss(weights={
             "l1": self.cfg.l1_w, "l2": self.cfg.l2_w, 
-            "ssim": self.cfg.ssim_w, "perceptual": self.cfg.perceptual_w
+            "ssim": self.cfg.ssim_w, "perceptual": self.cfg.perceptual_w,
+            "dice_w": getattr(self.cfg, "dice_w", 0.0)
         }).to(self.device)
         # self.scaler = torch.cuda.amp.GradScaler()
         self.scaler = torch.amp.GradScaler('cuda')
@@ -577,31 +625,45 @@ class Trainer:
         
     # Added method to visualize training patches
     @torch.no_grad()
-    def _log_training_patch(self, mri, ct, pred, step, batch_idx):
+    def _log_training_patch(self, mri, ct, pred, step, batch_idx, seg=None, pred_probs=None):
         """
         Visualizes MRI, Prediction, and CT (GT) for the first patch in the batch.
+        Optionally overlays Segmentation (GT) and Predicted Probs (Argmax).
         """
         # 1. Prepare Data (Batch 0, Channel 0)
         img_in = mri[0, 0].detach().cpu().float().numpy()
         img_gt = ct[0, 0].detach().cpu().float().numpy()
         img_pred = pred[0, 0].detach().cpu().float().numpy()
         
+        img_seg = None
+        img_pred_seg = None
+        
+        if seg is not None:
+            img_seg = seg[0, 0].detach().cpu().float().numpy()
+        
+        if pred_probs is not None:
+            # pred_probs: [B, C, X, Y, Z] -> Argmax -> [X, Y, Z]
+            img_pred_seg = torch.argmax(pred_probs[0], dim=0).detach().cpu().float().numpy()
+        
         # Center indices
         cx, cy, cz = np.array(img_in.shape) // 2
 
         # 3 Rows (MRI, Pred, CT), 3 Cols (Axial, Sagittal, Coronal)
-        fig, axes = plt.subplots(3, 3, figsize=(10, 10))
+        # If seg exists, add 4th row (Seg GT, Seg Pred, Overlay?)
+        
+        nrows = 4 if img_seg is not None else 3
+        fig, axes = plt.subplots(nrows, 3, figsize=(10, 3.5*nrows))
         
         # Helper to plot a row
-        def plot_row(row_idx, vol, title_prefix, vmin=None, vmax=None):
+        def plot_row(row_idx, vol, title_prefix, vmin=None, vmax=None, cmap='gray'):
             # Axial
-            axes[row_idx, 0].imshow(np.rot90(vol[:, :, cz]), cmap='gray', vmin=vmin, vmax=vmax)
+            axes[row_idx, 0].imshow(np.rot90(vol[:, :, cz]), cmap=cmap, vmin=vmin, vmax=vmax)
             axes[row_idx, 0].set_title(f"{title_prefix} Ax")
             # Sagittal
-            axes[row_idx, 1].imshow(np.rot90(vol[cx, :, :]), cmap='gray', vmin=vmin, vmax=vmax)
+            axes[row_idx, 1].imshow(np.rot90(vol[cx, :, :]), cmap=cmap, vmin=vmin, vmax=vmax)
             axes[row_idx, 1].set_title(f"{title_prefix} Sag")
             # Coronal
-            axes[row_idx, 2].imshow(np.rot90(vol[:, cy, :]), cmap='gray', vmin=vmin, vmax=vmax)
+            axes[row_idx, 2].imshow(np.rot90(vol[:, cy, :]), cmap=cmap, vmin=vmin, vmax=vmax)
             axes[row_idx, 2].set_title(f"{title_prefix} Cor")
             
             # Add stats text to the left of the row
@@ -616,6 +678,24 @@ class Trainer:
 
         # Row 3: CT (Fixed 0-1 range)
         plot_row(2, img_gt, "GT CT", vmin=0, vmax=1)
+        
+        # Row 4: Segmentation (if available)
+        if img_seg is not None:
+            # GT Seg
+            axes[3, 0].imshow(np.rot90(img_seg[:, :, cz]), cmap='tab20', interpolation='nearest')
+            axes[3, 0].set_title("GT Seg Ax")
+            
+            # Pred Seg (if available)
+            if img_pred_seg is not None:
+                axes[3, 1].imshow(np.rot90(img_pred_seg[:, :, cz]), cmap='tab20', interpolation='nearest')
+                axes[3, 1].set_title("Pred Seg Ax")
+            else:
+                axes[3, 1].axis('off')
+                
+            # Overlay on CT (Axial only for brevity)
+            axes[3, 2].imshow(np.rot90(img_gt[:, :, cz]), cmap='gray')
+            axes[3, 2].imshow(np.rot90(img_seg[:, :, cz]), cmap='tab20', alpha=0.3, interpolation='nearest')
+            axes[3, 2].set_title("GT Overlay")
 
         # Cleanup
         for ax in axes.flatten():
@@ -659,6 +739,11 @@ class Trainer:
                 
                 mri = batch['mri'][tio.DATA].to(self.device, non_blocking=True)
                 ct = batch['ct'][tio.DATA].to(self.device, non_blocking=True)
+                
+                # Optional: Load Segmentation for Dice Loss
+                seg = None
+                if 'seg' in batch:
+                    seg = batch['seg'][tio.DATA].to(self.device, non_blocking=True)
 
                 if self.cfg.enable_profiling:
                     torch.cuda.synchronize()
@@ -674,11 +759,38 @@ class Trainer:
                     
                     pred = self.model(features)
                     
+                    # --- Dice Loss Calculation ---
+                    pred_probs = None
+                    if self.cads_model is not None and seg is not None:
+                        # 1. Unnormalize Pred (0..1 -> -1024..1024 HU)
+                        pred_hu = (pred * 2048.0) - 1024.0
+                        
+                        # 2. Extract Spacing
+                        # batch['ct']['spacing'] is typically a list of tensors/tuples
+                        # Convert to list of lists [sx, sy, sz]
+                        spacings = batch['ct']['spacing']
+                        # If spacings is a Tensor (B, 3) or list of Tensors
+                        props_list = []
+                        if isinstance(spacings, torch.Tensor):
+                            for i in range(len(spacings)): props_list.append({'spacing': spacings[i].tolist()})
+                        else: # List
+                            for s in spacings: props_list.append({'spacing': list(s)})
+                        
+                        # 3. Differentiable Prediction
+                        pred_probs = self.cads_model.predict_differentiable(pred_hu, props_list)
+                    # -----------------------------
+                    
                     if self.cfg.wandb and step_idx == 0:
-                        self._log_training_patch(mri, ct, pred, self.global_step, step_idx)
+                        self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg, pred_probs)
                     
                     fe_ref = self.feat_extractor if self.cfg.perceptual_w > 0 else None
-                    loss, comps = self.loss_fn(pred, ct, feat_extractor=fe_ref)
+                    
+                    loss, comps = self.loss_fn(
+                        pred, ct, 
+                        feat_extractor=fe_ref, 
+                        pred_probs=pred_probs, 
+                        target_mask=seg
+                    )
                     
                     for k, v in comps.items():
                         comp_accum[k] = comp_accum.get(k, 0.0) + (v / self.cfg.accum_steps)

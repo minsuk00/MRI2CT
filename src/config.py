@@ -72,6 +72,9 @@ DEFAULT_CONFIG = {
     "l2_w": 0.0,
     "ssim_w": 0.1,
     "perceptual_w": 0.0,
+    "dice_w": 0.0,
+    "dice_exclude_background": True,
+    "dice_bone_only": False,
 
     "wandb_note": "test_run",
     "resume_wandb_id": None, 
