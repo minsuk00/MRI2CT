@@ -13,3 +13,5 @@ data/
 *.pyc
 /anatomix/
 dataset
+CADS/
+maisi-mr-to-ct/
