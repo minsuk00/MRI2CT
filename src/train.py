@@ -26,6 +26,7 @@ os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 EXPERIMENT_CONFIG = [
     {
         "steps_per_epoch": 2000,
+        # "steps_per_epoch": 10,
         "val_interval": 1,
         "total_epochs": 5000,
         "sanity_check": False,
@@ -34,7 +35,7 @@ EXPERIMENT_CONFIG = [
         "viz_limit": 10,
         "model_save_interval": 1,
 
-        "model_compile_mode": "reduce-overhead",
+        "model_compile_mode": "default",
         "accum_steps": 1,
         "enable_safety_padding": False,
         "use_weighted_sampler": False,
@@ -53,17 +54,23 @@ EXPERIMENT_CONFIG = [
         "enable_profiling": True,
         
         "wandb_note": "long_run_anatomix_v2",
-        "resume_wandb_id": "bzum5b0m", 
-        "resume_epoch": 237, # None for last epoch
-        "diverge_wandb_branch": False,
+        # "resume_wandb_id": "bzum5b0m", 
+        "resume_wandb_id": "6zpywdp0", 
+        # "resume_epoch": 237, # None for last epoch
+        # "diverge_wandb_branch": False,
+        # "diverge_wandb_branch": True,
 
+        "steps_per_epoch": 500,
+        "batch_size": 1,
+        "accum_steps": 4,
+        
+        "dataset_spacing": [3.0, 3.0, 3.0],
         "patch_size": 128,
         # "dice_w": 0.0, 
-        "dice_w": 1.0, 
-        "l1_w": 0.0,
-        "ssim_w": 0.0,
+        "dice_w": 0.05, 
 
-        "dice_bone_only": True,
+        # "dice_bone_only": True,
+        "dice_bone_only": False,
         
         # "anatomix_weights": "v1",
         # "wandb_note": "long_run_anatomix_v1",

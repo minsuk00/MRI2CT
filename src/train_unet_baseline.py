@@ -27,13 +27,14 @@ from monai.inferers import sliding_window_inference
 
 import warnings
 warnings.filterwarnings("ignore", message=".*SubjectsLoader in PyTorch >= 2.3.*")
+warnings.filterwarnings("ignore", message=".*Using a non-tuple sequence for multidimensional indexing is deprecated.*")
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from anatomix.model.network import Unet
 from src.config import DEFAULT_CONFIG, Config
-from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info
+from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info, count_parameters
 from src.data import DataPreprocessing, get_augmentations, get_subject_paths, get_region_key
 from src.loss import CompositeLoss
 
@@ -55,7 +56,7 @@ BASELINE_CONFIG = {
     "batch_size": 4,
     "patches_per_volume": 50,
     "data_queue_max_length": 500,
-    "data_queue_num_workers": 6,
+    "data_queue_num_workers": 4,
     "augment": True,
     
     # Model Architecture (Baseline U-Net)
@@ -66,7 +67,7 @@ BASELINE_CONFIG = {
     
     # Optimization
     "lr": 3e-4,
-    "scheduler_t_max": 300000, 
+    "scheduler_t_max": 700000, 
     "scheduler_min_lr": 1e-6,
     "total_epochs": 5000,      
     "steps_per_epoch": 2000,   
@@ -83,6 +84,13 @@ BASELINE_CONFIG = {
     "ssim_w": 0.1,
     "l2_w": 0.0,
     "perceptual_w": 0.0, # Disabled for simple baseline
+
+    # Resuming
+    "resume_wandb_id": "m7q50gpu",
+    "resume_epoch": None, # Optional: specify epoch number
+    "diverge_wandb_branch": False, # Create new run instead of resuming existing
+    # "override_lr": False, # If True, uses 'lr' from config instead of saved state
+    "override_lr": True, 
     
     # Validation
     "val_sliding_window": True,
@@ -126,11 +134,15 @@ class BaselineTrainer:
         self.global_step = 0
         self.start_epoch = 0
         self.global_start_time = None
+        
+        self._load_resume()
 
     def _setup_wandb(self):
         if not self.cfg.wandb: return
         
         os.makedirs(self.cfg.log_dir, exist_ok=True)
+        
+        wandb_id = None if self.cfg.diverge_wandb_branch else self.cfg.resume_wandb_id
         
         wandb.init(
             project=self.cfg.project_name, 
@@ -138,10 +150,120 @@ class BaselineTrainer:
             config=vars(self.cfg),
             notes=self.cfg.wandb_note,
             dir=self.cfg.log_dir,
+            id=wandb_id,
+            resume="allow" if not self.cfg.diverge_wandb_branch else None,
         )
         
         # Save code state for reproducibility
         wandb.run.log_code(".")
+        
+    def _load_resume(self):
+        if not self.cfg.resume_wandb_id: return
+        
+        print(f"[RESUME] 🕵️ Searching for Run ID: {self.cfg.resume_wandb_id}")
+        run_folders = glob(os.path.join(self.cfg.log_dir, "wandb", f"run-*-{self.cfg.resume_wandb_id}"))
+        if not run_folders:
+            print(f"[RESUME] ❌ Run folder not found for ID: {self.cfg.resume_wandb_id}")
+            return
+
+        all_ckpts = []
+        for f in run_folders:
+            ckpts = glob(os.path.join(f, "files", "*.pt"))
+            all_ckpts.extend(ckpts)
+            
+        if not all_ckpts:
+            print("[RESUME] ⚠️ No checkpoints found inside run folder.")
+            return
+
+        if self.cfg.resume_epoch is not None:
+            epoch_str = f"epoch{self.cfg.resume_epoch:05d}"
+            target_ckpts = sorted([c for c in all_ckpts if epoch_str in os.path.basename(c)])
+            if not target_ckpts:
+                print(f"[RESUME] ❌ Could not find checkpoint for epoch {self.cfg.resume_epoch}")
+                return
+            resume_path = target_ckpts[-1]
+        else:
+            resume_path = max(all_ckpts, key=os.path.getmtime)
+            
+        print(f"[RESUME] 📥 Loading: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=self.device)
+        
+        # Load Model
+        if hasattr(self.model, "_orig_mod"):
+             self.model._orig_mod.load_state_dict(checkpoint['model_state_dict'])
+        else:
+             self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load Optimizer
+        if 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            if self.cfg.override_lr:
+                print(f"[RESUME] 🔧 Forcing new Learning Rate: {self.cfg.lr}")
+                for param_group in self.optimizer.param_groups:
+                     param_group['lr'] = self.cfg.lr
+                
+                # Update scheduler base_lrs to match new optimizer LRs
+                if self.scheduler is not None:
+                    self.scheduler.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        
+        # Load Scheduler
+        if self.cfg.override_lr and self.scheduler is not None:
+            print("[RESUME] 🔧 Override LR enabled: Skipping scheduler state load and recalculating LR.")
+            
+            # 1. Restore the step count
+            # Use global_step if available, otherwise estimate from epoch
+            restored_step = checkpoint.get('global_step', (self.start_epoch) * self.cfg.steps_per_epoch)
+            self.scheduler.last_epoch = restored_step
+            
+            # 2. Calculate Closed-Form LR
+            # lr = eta_min + 0.5 * (base - eta_min) * (1 + cos(pi * t / T))
+            t = restored_step
+            T = self.cfg.scheduler_t_max
+            eta_min = self.cfg.scheduler_min_lr
+            base_lr = self.cfg.lr # This is the NEW base LR
+            
+            import math
+            new_lr = eta_min + 0.5 * (base_lr - eta_min) * (1 + math.cos(math.pi * t / T))
+            
+            # 3. Apply to Optimizer
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
+                
+            # 4. Update Scheduler Base LRs (so it knows the peak)
+            self.scheduler.base_lrs = [base_lr] * len(self.optimizer.param_groups)
+            
+            print(f"[RESUME] 🧮 Recalculated LR for step {t}/{T}: {new_lr:.2e} (Base: {base_lr})")
+
+        elif checkpoint.get('scheduler_state_dict') is not None and self.scheduler is not None:
+            print("[RESUME] 📥 Loading Scheduler state...")
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            print(f"[DEBUG] Loaded Scheduler: last_epoch={self.scheduler.last_epoch}, T_max={self.scheduler.T_max}")
+            
+            # Override T_max from config (crucial when extending training)
+            if self.cfg.scheduler_t_max != self.scheduler.T_max:
+                print(f"[RESUME] 🔧 Overriding Scheduler T_max: {self.scheduler.T_max} -> {self.cfg.scheduler_t_max}")
+                self.scheduler.T_max = self.cfg.scheduler_t_max
+            
+            # Step the scheduler to the restored epoch to update optimizer params
+            restored_epoch = self.scheduler.last_epoch
+            self.scheduler.last_epoch = restored_epoch - 1
+            
+            self.scheduler.step()
+            
+            print(f"[RESUME] 🔄 Scheduler stepped to epoch {self.scheduler.last_epoch}. LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Load Scaler
+        if 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        # Load Epoch/Step
+        if 'epoch' in checkpoint:
+            self.start_epoch = checkpoint['epoch'] + 1
+        
+        if 'global_step' in checkpoint:
+            self.global_step = checkpoint['global_step']
 
     def _setup_data(self):
         # 1. Reuse existing logic to find subjects
@@ -286,6 +408,9 @@ class BaselineTrainer:
         if hasattr(torch, "compile") and callable(torch.compile):
             print("[Baseline] 🚀 Compiling model (reduce-overhead)...")
             self.model = torch.compile(self.model, mode="reduce-overhead")
+            
+        tot, train = count_parameters(self.model)
+        print(f"[Baseline] Model Params: Total={tot:,} | Trainable={train:,}")
 
     def _setup_opt(self):
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
@@ -433,13 +558,18 @@ class BaselineTrainer:
             self.scaler.update()
             
             if self.scheduler is not None:
-                self.scheduler.step()
+                if self.scheduler.last_epoch < self.scheduler.T_max:
+                    self.scheduler.step()
 
             total_loss += step_loss
             total_grad += grad_norm.item()
             self.global_step += 1
             
             pbar_dict = {"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"}
+            
+            # Add LR to tqdm
+            current_lr = self.optimizer.param_groups[0]['lr']
+            pbar_dict["lr"] = f"{current_lr:.2e}"
             
             if self.cfg.enable_profiling:
                  step_t_total = time.time() - t_step_start

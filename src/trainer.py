@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
+# from sklearn.decomposition import PCA
 from tqdm import tqdm
 import nibabel as nib
 import wandb
@@ -20,14 +20,11 @@ from anatomix.model.network import Unet
 
 # Add CADS to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "CADS")))
-try:
-    from cads.utils.libs import get_model_weights_dir, setup_nnunet_env
-    from cads.utils.inference import nnUNetv2Predictor
-except ImportError:
-    print("[WARNING] CADS not found. Dice loss will be unavailable.")
+# from cads.utils.libs import get_model_weights_dir, setup_nnunet_env
+# from cads.utils.inference import nnUNetv2Predictor
 
 from src.config import Config
-from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info
+from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info, count_parameters
 from src.data import DataPreprocessing, get_augmentations, get_subject_paths, get_region_key
 from src.loss import CompositeLoss
 
@@ -51,6 +48,7 @@ class Trainer:
         # 3. State Tracking
         self.start_epoch = 0
         self.global_step = 0
+        self.samples_seen = 0
         self.global_start_time = None 
         self._load_resume()
 
@@ -244,6 +242,9 @@ class Trainer:
         if not self.cfg.finetune_feat_extractor:
             for p in self.feat_extractor.parameters(): p.requires_grad = False
             self.feat_extractor.eval()
+            
+        tot, train = count_parameters(self.feat_extractor)
+        print(f"[Model] Anatomix Feat Extractor Params: Total={tot:,} | Trainable={train:,}")
         
         # 2. Unet Translator
         print(f"[DEBUG] 🏗️ Building Unet Translator (Anatomix v1)...")
@@ -263,6 +264,9 @@ class Trainer:
             print(f"[DEBUG] 🐢 specific compile mode not set or None. Skipping compilation.")
             self.model = model
             
+        tot, train = count_parameters(self.model)
+        print(f"[Model] Unet Translator Params: Total={tot:,} | Trainable={train:,}")
+            
         # 3. CADS Model (For Dice Loss)
         self.cads_model = None
         if getattr(self.cfg, 'dice_w', 0) > 0:
@@ -271,6 +275,9 @@ class Trainer:
                 os.environ["CADS_WEIGHTS_PATH"] = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/cads_weights"
             
             try:
+                from cads.utils.libs import get_model_weights_dir, setup_nnunet_env
+                from cads.utils.inference import nnUNetv2Predictor
+                
                 setup_nnunet_env()
                 self.cads_model = nnUNetv2Predictor(
                     model_folder=get_model_weights_dir(), 
@@ -278,10 +285,19 @@ class Trainer:
                     device=self.device
                 )
                 # Freeze CADS model
+                self.cads_model.predictor.network.to(device=self.device, dtype=torch.bfloat16)
                 self.cads_model.predictor.network.eval()
                 for p in self.cads_model.predictor.network.parameters():
                     p.requires_grad = False
-                print("[DEBUG] ✅ CADS Model initialized.")
+                
+                # [Optimization] Enable torch.compile for the teacher in stable 'default' mode
+                # to speed up the massive 256^3 volume pass.
+                print(f"[DEBUG] 🚀 Compiling CADS Teacher with mode: default")
+                self.cads_model.predictor.network = torch.compile(self.cads_model.predictor.network, mode="default")
+                
+                tot, train = count_parameters(self.cads_model.predictor.network)
+                print(f"[Model] CADS Teacher Params: Total={tot:,} | Trainable={train:,} | Dtype=BFloat16")
+                print("[DEBUG] ✅ CADS Teacher initialized.")
             except Exception as e:
                 print(f"[ERROR] ❌ Failed to init CADS Model: {e}")
                 raise e # Fail loudly if dice loss is requested but model fails
@@ -294,16 +310,7 @@ class Trainer:
         self.optimizer = torch.optim.Adam(params)
         
         # 3. Scheduler Setup
-        if self.cfg.scheduler_type == "plateau":
-            print("[DEBUG] 📉 Initializing Scheduler (ReduceLROnPlateau)")
-            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, 
-                mode='min', 
-                factor=0.5, 
-                patience=10, 
-                min_lr=1e-6,
-            )
-        elif self.cfg.scheduler_type == "cosine":
+        if self.cfg.scheduler_type == "cosine":
             print(f"[DEBUG] 📉 Initializing Scheduler (CosineAnnealingLR) T_max={self.cfg.scheduler_t_max}, min_lr={self.cfg.scheduler_min_lr}")
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
@@ -506,6 +513,7 @@ class Trainer:
 
         # 5. PCA Logic
         if self.cfg.viz_pca:
+            from sklearn.decomposition import PCA
             def sample_vox(f, max_v=200_000):
                 X = f.reshape(C, -1).T
                 if X.shape[0] > max_v: X = X[np.random.choice(X.shape[0], max_v, replace=False)]
@@ -681,21 +689,28 @@ class Trainer:
         
         # Row 4: Segmentation (if available)
         if img_seg is not None:
+            # Determine common vmin/vmax for consistent coloring
+            seg_vmin = 0
+            seg_vmax = img_seg.max()
+            if img_pred_seg is not None:
+                seg_vmax = max(seg_vmax, img_pred_seg.max())
+
             # GT Seg
-            axes[3, 0].imshow(np.rot90(img_seg[:, :, cz]), cmap='tab20', interpolation='nearest')
+            axes[3, 0].imshow(np.rot90(img_seg[:, :, cz]), cmap='tab20', vmin=seg_vmin, vmax=seg_vmax, interpolation='nearest')
             axes[3, 0].set_title("GT Seg Ax")
             
             # Pred Seg (if available)
             if img_pred_seg is not None:
-                axes[3, 1].imshow(np.rot90(img_pred_seg[:, :, cz]), cmap='tab20', interpolation='nearest')
+                axes[3, 1].imshow(np.rot90(img_pred_seg[:, :, cz]), cmap='tab20', vmin=seg_vmin, vmax=seg_vmax, interpolation='nearest')
                 axes[3, 1].set_title("Pred Seg Ax")
+                
+                # Overlay on Pred (Axial) - Changed from GT on GT to Pred on Pred
+                axes[3, 2].imshow(np.rot90(img_pred[:, :, cz]), cmap='gray', vmin=0, vmax=1)
+                axes[3, 2].imshow(np.rot90(img_pred_seg[:, :, cz]), cmap='tab20', vmin=seg_vmin, vmax=seg_vmax, alpha=0.3, interpolation='nearest')
+                axes[3, 2].set_title("Pred Overlay")
             else:
                 axes[3, 1].axis('off')
-                
-            # Overlay on CT (Axial only for brevity)
-            axes[3, 2].imshow(np.rot90(img_gt[:, :, cz]), cmap='gray')
-            axes[3, 2].imshow(np.rot90(img_seg[:, :, cz]), cmap='tab20', alpha=0.3, interpolation='nearest')
-            axes[3, 2].set_title("GT Overlay")
+                axes[3, 2].axis('off')
 
         # Cleanup
         for ax in axes.flatten():
@@ -765,16 +780,9 @@ class Trainer:
                         # 1. Unnormalize Pred (0..1 -> -1024..1024 HU)
                         pred_hu = (pred * 2048.0) - 1024.0
                         
-                        # 2. Extract Spacing
-                        # batch['ct']['spacing'] is typically a list of tensors/tuples
-                        # Convert to list of lists [sx, sy, sz]
-                        spacings = batch['ct']['spacing']
-                        # If spacings is a Tensor (B, 3) or list of Tensors
-                        props_list = []
-                        if isinstance(spacings, torch.Tensor):
-                            for i in range(len(spacings)): props_list.append({'spacing': spacings[i].tolist()})
-                        else: # List
-                            for s in spacings: props_list.append({'spacing': list(s)})
+                        # 2. Use dataset spacing from config
+                        batch_size = pred.shape[0]
+                        props_list = [{'spacing': self.cfg.dataset_spacing}] * batch_size
                         
                         # 3. Differentiable Prediction
                         pred_probs = self.cads_model.predict_differentiable(pred_hu, props_list)
@@ -827,6 +835,7 @@ class Trainer:
             total_grad += grad_norm.item()
             
             self.global_step += 1
+            self.samples_seen += self.cfg.batch_size * self.cfg.accum_steps
 
             pbar_dict = {"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"}
             
@@ -846,13 +855,15 @@ class Trainer:
             
             pbar.set_postfix(pbar_dict)
             
-            if self.cfg.wandb and self.cfg.enable_profiling:
-                log_dict = {
-                    "info/time_data(ms)": avg_batch_data,
-                    "info/time_forward(ms)": avg_batch_fwd,
-                    "info/time_backward(ms)": avg_batch_bwd,
-                    "info/time_step_total(s)": step_t_total,
-                }
+            if self.cfg.wandb:
+                log_dict = {"info/samples_seen": self.samples_seen}
+                if self.cfg.enable_profiling:
+                    log_dict.update({
+                        "info/time_data(ms)": avg_batch_data,
+                        "info/time_forward(ms)": avg_batch_fwd,
+                        "info/time_backward(ms)": avg_batch_bwd,
+                        "info/time_step_total(s)": step_t_total,
+                    })
                 wandb.log(log_dict, step=self.global_step)
 
             # ---------------------------------------------------------
@@ -994,9 +1005,6 @@ class Trainer:
             if epoch % self.cfg.val_interval == 0 or (epoch+1) == self.cfg.total_epochs:
                 avg_met = self.validate(epoch)
                 val_loss = avg_met.get('loss', 0)
-
-                if self.scheduler is not None and self.cfg.scheduler_type == "plateau":
-                    self.scheduler.step(val_loss)
                 
                 tqdm.write(
                     f"Ep {epoch} | Train: {loss:.4f} | Val: {val_loss:.4f} | "
@@ -1025,5 +1033,7 @@ class Trainer:
                 self.save_checkpoint(epoch)
                 
         self.save_checkpoint(self.cfg.total_epochs, is_final=True)
+        if self.cfg.wandb:
+            wandb.log({"info/samples_seen_total": self.samples_seen}) # Log total samples at the end
         if self.cfg.wandb: wandb.finish()
         print(f"✅ Training Complete. Total Time: {time.time() - self.global_start_time:.1f}s")
