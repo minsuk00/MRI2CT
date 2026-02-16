@@ -51,7 +51,7 @@ class CompositeLoss(nn.Module):
         return 1.0 - dice.mean()
 
     def forward(self, pred, target, feat_extractor=None, use_sliding_window=False, pred_probs=None, target_mask=None):
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=pred.device)
         loss_components = {}
         
         if self.weights.get("l1", 0) > 0:

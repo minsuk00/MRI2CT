@@ -1,16 +1,31 @@
+import os
 from types import SimpleNamespace
 import torch
+
+BASE_DIR = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined"
 
 class Config(SimpleNamespace):
     def __init__(self, dictionary, **kwargs):
         super().__init__(**kwargs)
         for key, value in dictionary.items():
             setattr(self, key, value)
+        
+        # Dynamic Path Construction based on dataset_spacing
+        if hasattr(self, "dataset_spacing"):
+            sp = self.dataset_spacing
+            sp_str = f"{sp[0]:.1f}x{sp[1]:.1f}x{sp[2]:.1f}mm"
+            
+            # Root directory for data
+            self.root_dir = os.path.join(BASE_DIR, sp_str)
+            
+            # Directory for predictions
+            self.prediction_dir = os.path.join(BASE_DIR, "predictions", sp_str)
+            
+            # Ensure log dir exists or is correctly relative
+            # (Leaving log_dir as provided in dict for now)
 
 DEFAULT_CONFIG = {
     # System
-    # "root_dir": "/home/minsukc/MRI2CT",
-    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm", 
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -20,6 +35,7 @@ DEFAULT_CONFIG = {
     # Data
     "subjects": None,
     "region": None, # "AB", "TH", "HN"
+    "dataset_spacing": [3.0, 3.0, 3.0],
     "val_split": 0.1, # deprecated
     "augment": True,
     "patch_size": 96,
@@ -83,5 +99,4 @@ DEFAULT_CONFIG = {
     
     # Validation Saving
     "save_val_volumes": True, 
-    "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/predictions", 
 }

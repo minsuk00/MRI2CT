@@ -6,6 +6,11 @@ import psutil
 import torch
 from fused_ssim import fused_ssim3d
 
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
 def set_seed(seed=42):
     print(f"[DEBUG] Setting global seed to {seed}")
     random.seed(seed)
@@ -15,7 +20,7 @@ def set_seed(seed=42):
     
     # FOR TESTING & PRODUCTION TRAINING (SPEED):
     # torch.backends.cudnn.deterministic = False
-    # torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True
 
 def cleanup_gpu():
     gc.collect()
