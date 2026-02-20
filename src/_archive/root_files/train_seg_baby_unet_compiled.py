@@ -62,7 +62,7 @@ SEG_CONFIG = {
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
     "project_name": "MRI2CT_Seg_Baby_Unet",
     "wandb": True,
-    "wandb_note": "Finetuning Anatomix on CADS Segmentation (11 classes) - CT Input - 1.5mm - Full Logic Parity",
+    "wandb_note": "Finetuning Anatomix on CADS Segmentation (12 classes) - CT Input - 1.5mm - Full Logic Parity",
     ##### Classes
     "n_classes": 12,
     "class_names": [

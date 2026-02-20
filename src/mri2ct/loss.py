@@ -50,7 +50,7 @@ class CompositeLoss(nn.Module):
         # Average over classes and batch
         return 1.0 - dice.mean()
 
-    def forward(self, pred, target, feat_extractor=None, use_sliding_window=False, pred_probs=None, target_mask=None):
+    def forward(self, pred, target, pred_probs=None, target_mask=None):
         total_loss = torch.tensor(0.0, device=pred.device)
         loss_components = {}
         
@@ -73,18 +73,6 @@ class CompositeLoss(nn.Module):
             val = 1.0 - fused_ssim3d(pred.float(), target.float(), train=True)
             total_loss += self.weights["ssim"] * val
             loss_components["loss_ssim"] = val.item()
-
-        if self.weights.get("perceptual", 0) > 0:
-            if feat_extractor is None: 
-                raise ValueError("Feat extractor missing for perceptual loss")
-            if use_sliding_window:
-                print("Skipping perceptual loss calculation during validation. NOTE: val loss will differ from train loss.")
-            else:
-                pred_feats = feat_extractor(pred)
-                with torch.no_grad(): target_feats = feat_extractor(target)
-                val = self.l1(pred_feats, target_feats)
-                total_loss += self.weights["perceptual"] * val
-                loss_components["loss_perceptual"] = val.item()
         
         if self.weights.get("dice_w", 0) > 0 and pred_probs is not None and target_mask is not None:
             val = self.soft_dice_loss(pred_probs, target_mask)

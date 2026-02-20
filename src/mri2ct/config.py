@@ -41,8 +41,9 @@ DEFAULT_CONFIG = {
     "patch_size": 96,
     "patches_per_volume": 40,
     "data_queue_max_length": 400,
-    "data_queue_num_workers": 4,
+    "data_queue_num_workers": 6,
     "anatomix_weights": "v2", # "v1", "v2"
+    "teacher_weights_path": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs/models/seg_baby_unet_best.pth",
     "res_mult": 32 ,
     "analyze_shapes": True, 
     "enable_profiling": False,
@@ -66,7 +67,8 @@ DEFAULT_CONFIG = {
     
     # Model Choice
     "model_type": "cnn", # deprecated
-    "model_compile_mode": None, # "default", "reduce-overhead", None
+    "model_compile_mode": "default", # "default", "reduce-overhead", None
+    "compile_mode": "model", # New standard: None, "model", "full"
     "total_epochs": 5001,
     "dropout": 0,
     
@@ -77,11 +79,13 @@ DEFAULT_CONFIG = {
     "final_activation": "sigmoid",
     "enable_safety_padding": True,
     "use_weighted_sampler": True,
+    "n_classes": 12, # 11 Organs + Brain
 
     # Sliding Window & Viz Options
     "val_sliding_window": True, 
-    "val_sw_batch_size": 4, 
-    "val_sw_overlap": 0.25, 
+    "val_sw_batch_size": 8, 
+    "val_sw_overlap": 0.7,
+    "validate_dice": False,
     
     # Loss Weights
     "l1_w": 1.0,

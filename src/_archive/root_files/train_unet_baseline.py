@@ -68,6 +68,7 @@ BASELINE_CONFIG = {
     "output_nc": 1,
     "ngf": 16,
     "num_downs": 4,  # Standard depth
+    "compile_mode": "model",  # Options: None, "model", "full"
     # Optimization
     "lr": 3e-4,
     "scheduler_t_max": 700000,
@@ -92,8 +93,7 @@ BASELINE_CONFIG = {
     # "override_lr": False, # If True, uses 'lr' from config instead of saved state
     "override_lr": True,
     # Validation
-    "val_sliding_window": True,
-    "val_sw_batch_size": 4,
+    "val_sw_batch_size": 8,
     "val_sw_overlap": 0.25,
     "save_val_volumes": False,
     "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/predictions",
@@ -124,6 +124,9 @@ class BaselineTrainer:
         if self.cfg.subjects:
             self.run_name += f"_SingleSubj_{len(self.cfg.subjects)}"
 
+        # 0. Data Staging (to local NVMe RAID)
+        self._stage_data_local()
+
         # Setup
         self._setup_models()
         self._setup_data()
@@ -135,6 +138,30 @@ class BaselineTrainer:
         self.global_start_time = None
 
         self._load_resume()
+
+    def _stage_data_local(self):
+        """Copies dataset to local NVMe RAID for blazing fast I/O."""
+        user_id = os.environ.get("USER", "default")
+        local_root = os.path.join("/tmp_data", f"mri2ct_dataset_{user_id}")
+        
+        if not os.path.exists("/tmp_data") or not os.access("/tmp_data", os.W_OK):
+            print("[Baseline] ⚠️ Local storage not available. Staying on GPFS.")
+            return
+
+        print(f"[Baseline] 🚚 Staging data to local NVMe: {local_root}")
+        os.makedirs(local_root, exist_ok=True)
+        
+        # We only need train/val subfolders
+        for split in ["train", "val"]:
+            src = os.path.join(self.cfg.root_dir, split)
+            dst = os.path.join(local_root, split)
+            if os.path.exists(src):
+                print(f"  - Syncing {split}...")
+                # rsync is efficient: only copies if different
+                os.system(f"rsync -am --include='*/' --include='ct.nii.gz' --include='registration_output/' --include='moved_mr.nii.gz' --exclude='*' {src}/ {dst}/")
+
+        self.cfg.root_dir = local_root
+        print(f"[Baseline] ✅ Data staged. New root: {self.cfg.root_dir}")
 
     def _setup_wandb(self):
         if not self.cfg.wandb:
@@ -394,7 +421,7 @@ class BaselineTrainer:
     def _setup_models(self):
         print(f"[Baseline] 🏗️ Building Simple U-Net (In: {self.cfg.input_nc}, Out: {self.cfg.output_nc})")
         # Direct MRI -> CT translation
-        self.model = Unet(
+        model = Unet(
             dimension=3,
             input_nc=self.cfg.input_nc,
             output_nc=self.cfg.output_nc,
@@ -403,13 +430,35 @@ class BaselineTrainer:
             final_act="sigmoid",
         ).to(self.device)
 
-        # Compile for speed if available/configured
-        if hasattr(torch, "compile") and callable(torch.compile):
-            print("[Baseline] 🚀 Compiling model (reduce-overhead)...")
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+        # 1. Model-level compile (only if specifically requested)
+        if self.cfg.compile_mode == "model":
+            print("[Baseline] 🚀 Compiling model (default)...")
+            self.model = torch.compile(model, mode="default")
+        else:
+            self.model = model
+
+        # 2. Step-level compile (only if specifically requested)
+        # Note: If compile_mode is "full", self.model is the RAW model, 
+        # so we avoid nested compilation.
+        if self.cfg.compile_mode == "full":
+            print("[Baseline] 🚀 Compiling training step (default)...")
+            self.train_step = torch.compile(self._train_step, mode="default")
+        else:
+            self.train_step = self._train_step
 
         tot, train = count_parameters(self.model)
         print(f"[Baseline] Model Params: Total={tot:,} | Trainable={train:,}")
+
+    def _train_step(self, mri, ct):
+        """Isolated training step for torch.compile"""
+        # A40 Optimization: Use bfloat16 AMP
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred = self.model(mri)
+            loss, comps = self.loss_fn(pred, ct, feat_extractor=None)
+            loss = loss / self.cfg.accum_steps
+
+        self.scaler.scale(loss).backward()
+        return pred, loss, comps
 
     def _setup_opt(self):
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
@@ -530,24 +579,19 @@ class BaselineTrainer:
 
             for _ in range(self.cfg.accum_steps):
                 batch = next(self.train_iter)
-                mri = batch["mri"][tio.DATA].to(self.device, non_blocking=True)
-                ct = batch["ct"][tio.DATA].to(self.device, non_blocking=True)
+                # Convert to plain tensors for compiler stability
+                mri = batch["mri"][tio.DATA].to(self.device, non_blocking=True).as_tensor()
+                ct = batch["ct"][tio.DATA].to(self.device, non_blocking=True).as_tensor()
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    pred = self.model(mri)
+                pred, loss, comps = self.train_step(mri, ct)
 
-                    if self.cfg.wandb and step_idx == 0:
-                        self._log_training_patch(mri, ct, pred, self.global_step)
+                if self.cfg.wandb and step_idx == 0:
+                    self._log_training_patch(mri, ct, pred, self.global_step)
 
-                    loss, comps = self.loss_fn(pred, ct, feat_extractor=None)
+                for k, v in comps.items():
+                    comp_accum[k] = comp_accum.get(k, 0.0) + (v / self.cfg.accum_steps)
 
-                    loss = loss / self.cfg.accum_steps
-
-                    for k, v in comps.items():
-                        comp_accum[k] = comp_accum.get(k, 0.0) + (v / self.cfg.accum_steps)
-
-                    self.scaler.scale(loss).backward()
-                    step_loss += loss.item()
+                step_loss += loss.item()
 
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -593,8 +637,8 @@ class BaselineTrainer:
         val_metrics = defaultdict(list)
 
         for i, batch in enumerate(tqdm(self.val_loader, desc="Validating", leave=False)):
-            mri = batch["mri"][tio.DATA].to(self.device)
-            ct = batch["ct"][tio.DATA].to(self.device)
+            mri = batch["mri"][tio.DATA].to(self.device).as_tensor()
+            ct = batch["ct"][tio.DATA].to(self.device).as_tensor()
             orig_shape = batch["original_shape"][0].tolist()
             subj_id = batch["subj_id"][0]
 
@@ -608,7 +652,7 @@ class BaselineTrainer:
                 pad_offset = po
 
             # Inference
-            if self.cfg.val_sliding_window:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pred = sliding_window_inference(
                     inputs=mri,
                     roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size),
@@ -618,8 +662,6 @@ class BaselineTrainer:
                     mode="gaussian",
                     device=self.device,
                 )
-            else:
-                pred = self.model(mri)
 
             # Metrics
             pred_unpad = unpad(pred, orig_shape, pad_offset)
@@ -633,7 +675,7 @@ class BaselineTrainer:
             for k, v in met.items():
                 val_metrics[k].append(v)
 
-            # Save Volumes (Optional)
+            # Save Volumes (Optional - only visualized to save time)
             if self.cfg.save_val_volumes and i in self.val_viz_indices:
                 save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
                 os.makedirs(save_dir, exist_ok=True)

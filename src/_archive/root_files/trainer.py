@@ -17,11 +17,10 @@ import wandb
 import torchio as tio
 from monai.inferers import sliding_window_inference
 from anatomix.model.network import Unet
+from anatomix.segmentation.segmentation_utils import load_model_v1_1
 
-# Add CADS to path
+# Add CADS to path (Optional now, but kept for legacy)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "CADS")))
-# from cads.utils.libs import get_model_weights_dir, setup_nnunet_env
-# from cads.utils.inference import nnUNetv2Predictor
 
 from src.config import Config
 from src.utils import set_seed, cleanup_gpu, unpad, compute_metrics, get_ram_info, count_parameters
@@ -39,6 +38,9 @@ class Trainer:
         # Default run name
         self.run_name = f"{datetime.datetime.now():%Y%m%d_%H%M}_{self.cfg.anatomix_weights.upper()}_Train"
 
+        # 1.5. Stage Data to Local NVMe
+        self._stage_data_local()
+
         # 2. Setup Components
         self._setup_models()
         self._setup_data()
@@ -51,6 +53,30 @@ class Trainer:
         self.samples_seen = 0
         self.global_start_time = None 
         self._load_resume()
+
+    def _stage_data_local(self):
+        """Copies dataset to local NVMe RAID for blazing fast I/O."""
+        user_id = os.environ.get("USER", "default")
+        local_root = os.path.join("/tmp_data", f"mri2ct_dataset_{user_id}")
+        
+        if not os.path.exists("/tmp_data") or not os.access("/tmp_data", os.W_OK):
+            print("[Trainer] ⚠️ Local storage not available. Staying on GPFS.")
+            return
+
+        print(f"[Trainer] 🚚 Staging data to local NVMe: {local_root}")
+        os.makedirs(local_root, exist_ok=True)
+        
+        # We only need train/val subfolders
+        # rsync is efficient: only copies if different
+        for split in ["train", "val"]:
+            src = os.path.join(self.cfg.root_dir, split)
+            dst = os.path.join(local_root, split)
+            if os.path.exists(src):
+                print(f"  - Syncing {split}...")
+                os.system(f"rsync -am --include='*/' --include='ct.nii.gz' --include='registration_output/' --include='moved_mr.nii.gz' --include='cads_ct_seg.nii.gz' --exclude='*' {src}/ {dst}/")
+
+        self.cfg.root_dir = local_root
+        print(f"[Trainer] ✅ Data staged. New root: {self.cfg.root_dir}")
 
     def _setup_wandb(self):
         if not self.cfg.wandb: return
@@ -187,7 +213,8 @@ class Trainer:
         self.train_iter = _inf_gen(self.train_loader)
 
         # 6. Val Loader (Full Volume)
-        val_objs = _make_subj_list(self.val_subjects, load_seg=False) # No dice loss in Val for now
+        # Load seg for validation if we are using Dice loss (to measure semantic consistency)
+        val_objs = _make_subj_list(self.val_subjects, load_seg=load_seg)
         val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult)
         val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess) 
         self.val_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
@@ -221,14 +248,12 @@ class Trainer:
         if self.cfg.anatomix_weights == "v1":
             self.cfg.res_mult = 16 
             self.feat_extractor = Unet(3, 1, 16, 4, 16).to(self.device)
-            # ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "anatomix.pth")
             ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/anatomix.pth"
         elif self.cfg.anatomix_weights == "v2":
             self.cfg.res_mult = 32
             self.feat_extractor = Unet(3, 1, 16, 5, 20, norm="instance", interp="trilinear", pooling="Avg").to(self.device)
             # Optimize inference speed
             self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
-            # ckpt = os.path.join(self.cfg.root_dir, "anatomix", "model-weights", "best_val_net_G.pth")
             ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G.pth"
         else:
             raise ValueError("Invalid anatomix_weights")
@@ -246,7 +271,7 @@ class Trainer:
         tot, train = count_parameters(self.feat_extractor)
         print(f"[Model] Anatomix Feat Extractor Params: Total={tot:,} | Trainable={train:,}")
         
-        # 2. Unet Translator
+        # 2. Unet Translator (Generator)
         print(f"[DEBUG] 🏗️ Building Unet Translator (Anatomix v1)...")
         model = Unet(
             dimension=3,
@@ -257,50 +282,83 @@ class Trainer:
             final_act="sigmoid",   
         ).to(self.device)
 
-        if self.cfg.model_compile_mode:
-            print(f"[DEBUG] 🚀 Compiling model with mode: {self.cfg.model_compile_mode}")
-            self.model = torch.compile(model, mode=self.cfg.model_compile_mode)
+        # Non-recursive compilation logic
+        # If 'full' mode, we compile the step, so we leave the models raw.
+        # If 'model' mode, we compile the models individually.
+        should_compile_models = self.cfg.compile_mode == "model"
+        
+        if should_compile_models:
+            print(f"[DEBUG] 🚀 Compiling Generator (mode=default)...")
+            self.model = torch.compile(model, mode="default")
         else:
-            print(f"[DEBUG] 🐢 specific compile mode not set or None. Skipping compilation.")
             self.model = model
             
         tot, train = count_parameters(self.model)
         print(f"[Model] Unet Translator Params: Total={tot:,} | Trainable={train:,}")
             
-        # 3. CADS Model (For Dice Loss)
-        self.cads_model = None
+        # 3. Teacher Model (Baby U-Net) for Dice Loss
+        self.teacher_model = None
         if getattr(self.cfg, 'dice_w', 0) > 0:
-            print("[DEBUG] 👨‍🏫 Initializing CADS Model for Dice Loss...")
-            if "CADS_WEIGHTS_PATH" not in os.environ:
-                os.environ["CADS_WEIGHTS_PATH"] = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/cads_weights"
-            
+            print("[DEBUG] 👨‍🏫 Initializing Baby U-Net Teacher for Dice Loss...")
             try:
-                from cads.utils.libs import get_model_weights_dir, setup_nnunet_env
-                from cads.utils.inference import nnUNetv2Predictor
-                
-                setup_nnunet_env()
-                self.cads_model = nnUNetv2Predictor(
-                    model_folder=get_model_weights_dir(), 
-                    task_id=559, # Saros
-                    device=self.device
+                # Load Baby U-Net (12 classes: 11 organs + Brain)
+                self.teacher_model = load_model_v1_1(
+                    pretrained_ckpt=self.cfg.teacher_weights_path, 
+                    n_classes=self.cfg.n_classes - 1, 
+                    device=self.device,
+                    compile_model=False 
                 )
-                # Freeze CADS model
-                self.cads_model.predictor.network.to(device=self.device, dtype=torch.bfloat16)
-                self.cads_model.predictor.network.eval()
-                for p in self.cads_model.predictor.network.parameters():
+                
+                # Freeze Teacher
+                self.teacher_model.to(device=self.device, dtype=torch.bfloat16)
+                self.teacher_model.eval()
+                for p in self.teacher_model.parameters():
                     p.requires_grad = False
                 
-                # [Optimization] Enable torch.compile for the teacher in stable 'default' mode
-                # to speed up the massive 256^3 volume pass.
-                print(f"[DEBUG] 🚀 Compiling CADS Teacher with mode: default")
-                self.cads_model.predictor.network = torch.compile(self.cads_model.predictor.network, mode="default")
+                if should_compile_models:
+                    print(f"[DEBUG] 🚀 Compiling Teacher with mode: default")
+                    self.teacher_model = torch.compile(self.teacher_model, mode="default")
                 
-                tot, train = count_parameters(self.cads_model.predictor.network)
-                print(f"[Model] CADS Teacher Params: Total={tot:,} | Trainable={train:,} | Dtype=BFloat16")
-                print("[DEBUG] ✅ CADS Teacher initialized.")
+                tot, train = count_parameters(self.teacher_model)
+                print(f"[Model] Teacher Params: Total={tot:,} | Trainable={train:,} | Dtype=BFloat16")
+                print("[DEBUG] ✅ Teacher initialized.")
             except Exception as e:
-                print(f"[ERROR] ❌ Failed to init CADS Model: {e}")
-                raise e # Fail loudly if dice loss is requested but model fails
+                print(f"[ERROR] ❌ Failed to init Teacher Model: {e}")
+                if self.cfg.dice_w > 0: raise e
+
+        # 4. Step Compilation
+        if self.cfg.compile_mode == "full":
+            print("[SegTrainer] 🚀 Compiling Training Step (mode=default)...")
+            self.train_step = torch.compile(self._train_step, mode="default")
+        else:
+            self.train_step = self._train_step
+
+    def _train_step(self, mri, ct, seg=None):
+        # Note: zero_grad is handled in the outer loop for accumulation
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            if self.cfg.finetune_feat_extractor:
+                features = self.feat_extractor(mri)
+            else:
+                # Feat extractor is usually frozen, so we can wrap in no_grad even inside compile
+                with torch.no_grad(): features = self.feat_extractor(mri)
+            
+            pred = self.model(features)
+            
+            # Dice Loss Calculation
+            pred_probs = None
+            if self.teacher_model is not None and seg is not None:
+                pred_probs = self.teacher_model(pred)
+            
+            loss, comps = self.loss_fn(
+                pred, ct, 
+                pred_probs=pred_probs, 
+                target_mask=seg
+            )
+            
+            loss = loss / self.cfg.accum_steps
+        
+        self.scaler.scale(loss).backward()
+        return pred, loss, comps, pred_probs
 
     def _setup_opt(self):
         params = [{'params': self.model.parameters(), 'lr': self.cfg.lr}]
@@ -323,7 +381,7 @@ class Trainer:
 
         self.loss_fn = CompositeLoss(weights={
             "l1": self.cfg.l1_w, "l2": self.cfg.l2_w, 
-            "ssim": self.cfg.ssim_w, "perceptual": self.cfg.perceptual_w,
+            "ssim": self.cfg.ssim_w, 
             "dice_w": getattr(self.cfg, "dice_w", 0.0)
         }).to(self.device)
         # self.scaler = torch.cuda.amp.GradScaler()
@@ -752,71 +810,31 @@ class Trainer:
                     t1 = time.time()
                     step_t_data += (t1 - t0)
                 
+                # Extract tensors (torchio uses [tio.DATA])
                 mri = batch['mri'][tio.DATA].to(self.device, non_blocking=True)
                 ct = batch['ct'][tio.DATA].to(self.device, non_blocking=True)
-                
-                # Optional: Load Segmentation for Dice Loss
-                seg = None
-                if 'seg' in batch:
-                    seg = batch['seg'][tio.DATA].to(self.device, non_blocking=True)
+                seg = batch['seg'][tio.DATA].to(self.device, non_blocking=True) if 'seg' in batch else None
+
+                if self.cfg.enable_profiling: torch.cuda.synchronize(); t2 = time.time()
+
+                # Call the training step (compiled or eager)
+                # Note: self.train_step handles mixed precision context internally
+                pred, loss, comps, pred_probs = self.train_step(mri, ct, seg)
 
                 if self.cfg.enable_profiling:
                     torch.cuda.synchronize()
-                    t2 = time.time()
-
-                # Use 'dtype=torch.bfloat16' for Ampere+ GPUs (3090, 4090, A100, A6000)
-                # Use 'dtype=torch.float16' for older GPUs (2080, V100, Titan)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    if self.cfg.finetune_feat_extractor:
-                        features = self.feat_extractor(mri)
-                    else:
-                        with torch.no_grad(): features = self.feat_extractor(mri)
-                    
-                    pred = self.model(features)
-                    
-                    # --- Dice Loss Calculation ---
-                    pred_probs = None
-                    if self.cads_model is not None and seg is not None:
-                        # 1. Unnormalize Pred (0..1 -> -1024..1024 HU)
-                        pred_hu = (pred * 2048.0) - 1024.0
-                        
-                        # 2. Use dataset spacing from config
-                        batch_size = pred.shape[0]
-                        props_list = [{'spacing': self.cfg.dataset_spacing}] * batch_size
-                        
-                        # 3. Differentiable Prediction
-                        pred_probs = self.cads_model.predict_differentiable(pred_hu, props_list)
-                    # -----------------------------
-                    
-                    if self.cfg.wandb and step_idx == 0:
-                        self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg, pred_probs)
-                    
-                    fe_ref = self.feat_extractor if self.cfg.perceptual_w > 0 else None
-                    
-                    loss, comps = self.loss_fn(
-                        pred, ct, 
-                        feat_extractor=fe_ref, 
-                        pred_probs=pred_probs, 
-                        target_mask=seg
-                    )
-                    
-                    for k, v in comps.items():
-                        comp_accum[k] = comp_accum.get(k, 0.0) + (v / self.cfg.accum_steps)
-                    
-                    loss = loss / self.cfg.accum_steps
-
-                    if self.cfg.enable_profiling:
-                        torch.cuda.synchronize()
-                        t3 = time.time()
-                        step_t_fwd += (t3 - t2)
-                    
-                    self.scaler.scale(loss).backward()
-                    step_loss += loss.item()
-
-                    if self.cfg.enable_profiling:
-                        torch.cuda.synchronize()
-                        t4 = time.time()
-                        step_t_bwd += (t4 - t3)
+                    t3 = time.time()
+                    step_t_fwd += (t3 - t2)
+                    step_t_bwd += 0 # Backward is inside train_step
+                
+                step_loss += loss.item()
+                
+                # Log patch (using the returned predictions)
+                if self.cfg.wandb and step_idx == 0:
+                    self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg, pred_probs)
+                
+                for k, v in comps.items():
+                    comp_accum[k] = comp_accum.get(k, 0.0) + (v / self.cfg.accum_steps)
 
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -911,15 +929,18 @@ class Trainer:
                 def combined_forward(x):
                     return self.model(self.feat_extractor(x))
 
-                pred = sliding_window_inference(
-                    inputs=mri, 
-                    roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size), 
-                    sw_batch_size=self.cfg.val_sw_batch_size, 
-                    predictor=combined_forward,
-                    overlap=self.cfg.val_sw_overlap,
-                    mode="gaussian",
-                    device=self.device
-                )
+                # Optimization: AMP for faster inference
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    pred = sliding_window_inference(
+                        inputs=mri, 
+                        roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size), 
+                        # Optimization: Increase batch size
+                        sw_batch_size=max(self.cfg.val_sw_batch_size, 16), 
+                        predictor=combined_forward,
+                        overlap=self.cfg.val_sw_overlap,
+                        mode="gaussian",
+                        device=self.device
+                    )
             else:
                 feats = self.feat_extractor(mri)
                 pred = self.model(feats)
@@ -930,8 +951,26 @@ class Trainer:
             met = compute_metrics(pred_unpad, ct_unpad)
             
             # Loss (Composite)
-            l_val, _ = self.loss_fn(pred, ct, feat_extractor=self.feat_extractor, use_sliding_window = self.cfg.val_sliding_window)
+            l_val, _ = self.loss_fn(pred, ct)
             met['loss'] = l_val.item()
+            
+            # Validation Dice (Semantic Consistency)
+            # Only run if enabled in config, as Teacher inference is heavy
+            if getattr(self.cfg, "validate_dice", False) and self.teacher_model is not None and seg is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # Always use sliding window for teacher on full volumes to prevent OOM
+                    pred_probs = sliding_window_inference(
+                        inputs=pred, 
+                        roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size), 
+                        sw_batch_size=max(self.cfg.val_sw_batch_size, 16), 
+                        predictor=self.teacher_model,
+                        overlap=self.cfg.val_sw_overlap,
+                        mode="gaussian",
+                        device=self.device
+                    )
+                        
+                val_dice_loss = self.loss_fn.soft_dice_loss(pred_probs, seg)
+                met['dice'] = 1.0 - val_dice_loss.item()
             
             for k, v in met.items():
                 val_metrics[k].append(v)
@@ -939,18 +978,19 @@ class Trainer:
             # Viz & Save
             if i in self.val_viz_indices:
                 save_path = None
+                # Optimization: Only save volumes if visualized
                 if self.cfg.save_val_volumes:
-                    save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
-                    os.makedirs(save_dir, exist_ok=True)
-                    
-                    # Denormalize [0, 1] -> [-1024, 1024]
-                    pred_np = pred_unpad.float().cpu().numpy().squeeze()
-                    pred_hu = (pred_np * 2048.0) - 1024.0
-                    affine = batch['ct']['affine'][0].cpu().numpy()
-                    
-                    nii = nib.Nifti1Image(pred_hu, affine)
-                    save_path = os.path.join(save_dir, f"pred_{subj_id}.nii.gz")
-                    nib.save(nii, save_path)
+                     save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
+                     os.makedirs(save_dir, exist_ok=True)
+                     
+                     # Denormalize [0, 1] -> [-1024, 1024]
+                     pred_np = pred_unpad.float().cpu().numpy().squeeze()
+                     pred_hu = (pred_np * 2048.0) - 1024.0
+                     affine = batch['ct']['affine'][0].cpu().numpy()
+                     
+                     nii = nib.Nifti1Image(pred_hu, affine)
+                     save_path = os.path.join(save_dir, f"pred_{subj_id}.nii.gz")
+                     nib.save(nii, save_path)
 
                 if self.cfg.wandb:
                     if self.cfg.val_sliding_window:

@@ -35,7 +35,8 @@ EXPERIMENT_CONFIG = [
         "viz_limit": 10,
         "model_save_interval": 1,
 
-        "model_compile_mode": "default",
+        "model_compile_mode": "default", # For legacy code
+        "compile_mode": "full", # For new Trainer
         "accum_steps": 1,
         "enable_safety_padding": False,
         "use_weighted_sampler": False,
@@ -53,7 +54,7 @@ EXPERIMENT_CONFIG = [
 
         "enable_profiling": True,
         
-        "wandb_note": "long_run_anatomix_v2",
+        "wandb_note": "long_run_anatomix_v2_baby_unet_teacher",
         # "resume_wandb_id": "bzum5b0m", 
         "resume_wandb_id": "6zpywdp0", 
         # "resume_epoch": 237, # None for last epoch
@@ -71,6 +72,9 @@ EXPERIMENT_CONFIG = [
 
         # "dice_bone_only": True,
         "dice_bone_only": False,
+        "val_sw_batch_size": 8,
+        "val_sw_overlap": 0.7,
+        "validate_dice": True,
         
         # "anatomix_weights": "v1",
         # "wandb_note": "long_run_anatomix_v1",
