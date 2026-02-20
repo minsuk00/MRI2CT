@@ -1,0 +1,3 @@
+# pyproject.toml
+[tool.ruff]
+ignore = ["E402"] # NOTE: 프로젝트 전체에서 E402 규칙 비활성화
