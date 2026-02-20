@@ -9,7 +9,7 @@ import random
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-# Input Datasets (Add/Remove as needed)
+# Input Datasets
 INPUT_DIRS = [
     "/scratch/jjparkcv_root/jjparkcv98/minsukc/SynthRAD2025/Task1",
     "/scratch/jjparkcv_root/jjparkcv98/minsukc/SynthRAD2023/Task1" 
@@ -23,7 +23,8 @@ SPLIT_RATIOS = {"train": 0.7, "val": 0.1, "test": 0.2}
 
 # Target spacing (mm)
 # TARGET_SPACING = [3.0, 3.0, 3.0]
-TARGET_SPACING = [1.0, 1.0, 1.0]
+# TARGET_SPACING = [1.0, 1.0, 1.0]
+TARGET_SPACING = [1.5, 1.5, 1.5]
 
 # Set to None to process ALL volumes
 NUM_VOLUMES = None 
@@ -178,9 +179,9 @@ def process_subject(subj, output_dir, viz_dir, save_viz=False):
                         _, mask_res = resample_volume(mask_path, None, TARGET_SPACING, is_mask=True)
                     
                     orig_dict = {'MRI': minmax(sitk.GetArrayFromImage(sitk.ReadImage(mr_path))), 
-                                 'CT': minmax(sitk.GetArrayFromImage(sitk.ReadImage(ct_path)), -450, 450), 
+                                 'CT': minmax(sitk.GetArrayFromImage(sitk.ReadImage(ct_path)), -1024, 1024), 
                                  'Mask': None}
-                    res_dict = {'MRI': minmax(mr_res), 'CT': minmax(ct_res, -450, 450), 'Mask': mask_res}
+                    res_dict = {'MRI': minmax(mr_res), 'CT': minmax(ct_res, -1024, 1024), 'Mask': mask_res}
                     save_comparison_plot(orig_dict, res_dict, pid, viz_dir, subj['region'])
                 except: pass
         return True 
@@ -197,8 +198,8 @@ def process_subject(subj, output_dir, viz_dir, save_viz=False):
 
         # QC Plot
         if save_viz:
-            orig_dict = {'MRI': minmax(mr_orig), 'CT': minmax(ct_orig, -450, 450), 'Mask': mask_orig}
-            res_dict = {'MRI': minmax(mr_res), 'CT': minmax(ct_res, -450, 450), 'Mask': mask_res}
+            orig_dict = {'MRI': minmax(mr_orig), 'CT': minmax(ct_orig, -1024, 1024), 'Mask': mask_orig}
+            res_dict = {'MRI': minmax(mr_res), 'CT': minmax(ct_res, -1024, 1024), 'Mask': mask_res}
             save_comparison_plot(orig_dict, res_dict, pid, viz_dir, subj['region'])
         
         return True
@@ -211,10 +212,11 @@ def process_subject(subj, output_dir, viz_dir, save_viz=False):
 # UTILITIES
 # ==========================================
 def minmax(arr, minclip=None, maxclip=None):
-    if minclip is not None and maxclip is not None:
+    # if minclip is not None and maxclip is not None:
+    if not (minclip is None) & (maxclip is None):
         arr = np.clip(arr, minclip, maxclip)
     denom = arr.max() - arr.min()
-    if denom == 0: return np.zeros_like(arr)
+    # if denom == 0: return np.zeros_like(arr)
     return (arr - arr.min()) / denom
 
 def get_middle_slice(arr):
