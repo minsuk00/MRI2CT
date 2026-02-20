@@ -2,10 +2,8 @@ import os
 import torch
 import shutil
 import argparse
-from tqdm import tqdm
 import sys
-import tempfile
-import SimpleITK as sitk
+from tqdm import tqdm
 
 # Add project root and CADS to sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -23,35 +21,6 @@ except ImportError:
 DEFAULT_GPFS_WEIGHTS_PATH = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/cads_weights"
 TASK_ID = 559
 
-def resample_sitk(image_path, target_spacing=(1.5, 1.5, 1.5), is_mask=False, out_path=None):
-    """Resamples a NIfTI image to a target isotropic spacing."""
-    img = sitk.ReadImage(image_path)
-    original_spacing = img.GetSpacing()
-    original_size = img.GetSize()
-
-    new_size = [
-        int(round(osz * ospc / tspc))
-        for osz, ospc, tspc in zip(original_size, original_spacing, target_spacing)
-    ]
-
-    resample = sitk.ResampleImageFilter()
-    resample.SetOutputSpacing(target_spacing)
-    resample.SetSize(new_size)
-    resample.SetOutputDirection(img.GetDirection())
-    resample.SetOutputOrigin(img.GetOrigin())
-    resample.SetOutputPixelType(img.GetPixelIDValue())
-    
-    if is_mask:
-        resample.SetInterpolator(sitk.sitkNearestNeighbor)
-    else:
-        resample.SetInterpolator(sitk.sitkLinear)
-
-    new_img = resample.Execute(img)
-    if out_path:
-        sitk.WriteImage(new_img, out_path)
-        return out_path
-    return new_img
-
 def discover_subjects(data_root):
     valid_subjects = []
     splits = ["train", "val", "test"]
@@ -68,7 +37,7 @@ def discover_subjects(data_root):
 
 def main():
     parser = argparse.ArgumentParser(description="Batch CADS Segmentation for MRI2CT")
-    parser.add_argument("--data_dir", type=str, default="/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm")
+    parser.add_argument("--data_dir", type=str, default="/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5x1.5x1.5mm")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--chunk_size", type=int, default=50)
     args = parser.parse_args()
@@ -81,9 +50,8 @@ def main():
     subjects = discover_subjects(args.data_dir)
     to_process = []
     for s in subjects:
-        p3 = os.path.join(s['path'], "cads_ct_seg.nii.gz")
-        p15 = os.path.join(s['path'], "cads_ct_seg_1.5mm.nii.gz")
-        if not (os.path.exists(p3) and os.path.exists(p15)) or args.force:
+        p_final = os.path.join(s['path'], "cads_ct_seg.nii.gz")
+        if not os.path.exists(p_final) or args.force:
             to_process.append(s)
 
     if not to_process:
@@ -93,27 +61,28 @@ def main():
     print(f"Remaining: {len(to_process)} subjects.")
     use_cpu = not torch.cuda.is_available()
 
+    pbar = tqdm(total=len(to_process), desc="CADS Segmentation")
     for i in range(0, len(to_process), args.chunk_size):
         chunk = to_process[i:i + args.chunk_size]
-        print(f"\n--- Processing Chunk {i//args.chunk_size + 1} ---")
-
+        
         batch_temp_dir = os.path.join(args.data_dir, f"cads_batch_tmp_{i}")
         os.makedirs(batch_temp_dir, exist_ok=True)
         tmp_in = os.path.join(batch_temp_dir, "input")
         tmp_out = os.path.join(batch_temp_dir, "output")
         os.makedirs(tmp_in); os.makedirs(tmp_out)
 
-        # 1. Manually resample input CT to 1.5mm
-        chunk_ct_15_paths = []
+        # 1. Link existing CT (renaming to Subject ID for CADS)
+        chunk_ct_paths = []
         for subj in chunk:
-            ct_15_path = os.path.join(tmp_in, f"{subj['id']}.nii.gz")
-            resample_sitk(subj['ct'], (1.5, 1.5, 1.5), is_mask=False, out_path=ct_15_path)
-            chunk_ct_15_paths.append(ct_15_path)
+            ct_link = os.path.join(tmp_in, f"{subj['id']}.nii.gz")
+            if os.path.exists(ct_link): os.remove(ct_link)
+            os.symlink(subj['ct'], ct_link)
+            chunk_ct_paths.append(ct_link)
 
         # 2. Run CADS Prediction
         try:
             predict(
-                files_in=chunk_ct_15_paths,
+                files_in=chunk_ct_paths,
                 folder_out=tmp_out,
                 model_folder=model_folder,
                 task_ids=[TASK_ID],
@@ -125,28 +94,28 @@ def main():
                 verbose=False
             )
 
-            # 3. Handle Outputs
+            # 3. Move results to final destination
             for subj in chunk:
                 pid = subj['id']
-                raw_seg_15 = os.path.join(tmp_out, pid, f"{pid}_part_{TASK_ID}.nii.gz")
-                final_seg_3mm = os.path.join(subj['path'], "cads_ct_seg.nii.gz")
-                final_seg_15mm = os.path.join(subj['path'], "cads_ct_seg_1.5mm.nii.gz")
+                raw_seg = os.path.join(tmp_out, pid, f"{pid}_part_{TASK_ID}.nii.gz")
+                final_seg = os.path.join(subj['path'], "cads_ct_seg.nii.gz")
                 
-                if os.path.exists(raw_seg_15):
-                    # Save the high-res 1.5mm version
-                    shutil.copy(raw_seg_15, final_seg_15mm)
-                    # Downsample to 3.0mm for current training
-                    resample_sitk(raw_seg_15, (3.0, 3.0, 3.0), is_mask=True, out_path=final_seg_3mm)
+                if os.path.exists(raw_seg):
+                    shutil.move(raw_seg, final_seg)
                 else:
-                    print(f"Warning: Failed for {pid}")
+                    print(f"\nWarning: Segmentation failed for subject {pid}")
 
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"\nError during chunk processing: {e}")
         finally:
-            shutil.rmtree(batch_temp_dir)
-            torch.cuda.empty_cache()
+            if os.path.exists(batch_temp_dir):
+                shutil.rmtree(batch_temp_dir)
+            if not use_cpu:
+                torch.cuda.empty_cache()
+            pbar.update(len(chunk))
 
-    print("\nDone.")
+    pbar.close()
+    print("\nBatch processing complete.")
 
 if __name__ == "__main__":
     main()
