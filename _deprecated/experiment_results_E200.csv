@@ -1,6 +1,0 @@
-timestamp,model,loss_name,seg,fourier,sigma,cnn_depth,cnn_hidden,activation,avg_mae,avg_ssim,avg_psnr,wandb_url,status
-2025-11-30 13:48:28,mlp,L1_L2,True,True,2.5,N/A,N/A,N/A,0.00634,0.9584999999999999,42.65,https://wandb.ai/minsuk-choi/mri2ct/runs/x5ijbfa7,Success
-2025-11-30 14:13:02,mlp,L1_L2,True,True,5.0,N/A,N/A,N/A,0.0057,0.9634,43.382,https://wandb.ai/minsuk-choi/mri2ct/runs/zz6f7yo9,Success
-2025-11-30 14:37:19,mlp,L1_L2,True,True,10.0,N/A,N/A,N/A,0.0057599999999999995,0.9612999999999999,42.230000000000004,https://wandb.ai/minsuk-choi/mri2ct/runs/swdqm0w5,Success
-2025-11-30 15:02:03,cnn,L1_L2,True,N/A,N/A,5,64,sigmoid,0.00876,0.9369800000000001,38.288,https://wandb.ai/minsuk-choi/mri2ct/runs/8gjplsmv,Success
-2025-11-30 16:17:53,cnn,SSIM_1.0,True,N/A,N/A,5,64,sigmoid,0.01456,0.90528,34.914,https://wandb.ai/minsuk-choi/mri2ct/runs/xgkl4bhr,Success
