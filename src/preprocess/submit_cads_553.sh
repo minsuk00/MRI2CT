@@ -16,9 +16,11 @@
 # Ensure the logs directory exists
 mkdir -p /home/minsukc/logs/
 
-# Load conda environment
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate mri2ct
+# Load micromamba environment
+export MAMBA_EXE='/home/minsukc/.local/bin/micromamba'
+export MAMBA_ROOT_PREFIX='/home/minsukc/micromamba'
+eval "$("$MAMBA_EXE" shell hook --shell bash --root-prefix "$MAMBA_ROOT_PREFIX")"
+micromamba activate mri2ct_home
 
 # Set CUDA_VISIBLE_DEVICES to the assigned GPU (usually handled by SLURM)
 export CUDA_VISIBLE_DEVICES=$(echo $SLURM_JOB_GPUS | cut -d',' -f1)
