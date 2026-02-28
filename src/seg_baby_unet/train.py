@@ -95,8 +95,10 @@ SEG_CONFIG = {
     "few_shot": False,
     "few_shot_amount": 1,
     "few_shot_region": None,
-    "resume_wandb_id": None,
-    "resume_epoch": None,
+    # "resume_wandb_id": None,
+    # "resume_epoch": None,
+    "resume_wandb_id": "p0i9chz3",
+    "resume_epoch": 469,
     "diverge_wandb_branch": False,
     "override_lr": False,
     ##### Validation / Viz
@@ -108,7 +110,7 @@ SEG_CONFIG = {
     ##### DataLoader
     "cache_rate": 1.0,
     "num_workers": 4,
-    "wandb": True,
+    # "num_workers": 1,
     ##### few shot
     # "lr": 2e-4,
     # "batch_size": 2,
@@ -364,14 +366,14 @@ class SegTrainer:
             # High-Performance Caching: Use Local NVMe RAID (/tmp_data) to eliminate GPFS spikes.
             user_id = os.environ.get("USER", "default")
             local_nvme = "/tmp_data"
-            
+
             if os.path.exists(local_nvme) and os.access(local_nvme, os.W_OK):
                 cache_dir = os.path.join(local_nvme, f"mri2ct_cache_{user_id}")
                 storage_type = "LOCAL NVMe"
             else:
                 cache_dir = os.path.join(os.path.dirname(self.cfg["root_dir"]), "persistent_cache_seg_v2")
                 storage_type = "GPFS (Networked)"
-            
+
             os.makedirs(cache_dir, exist_ok=True)
             print(f"[SegTrainer] 💾 Using {storage_type} (PersistentDataset) for {num_unique_train} training volumes.")
             print(f"[SegTrainer] Cache Directory: {cache_dir}")
@@ -689,7 +691,7 @@ if __name__ == "__main__":
     parser.add_argument("--iters_per_epoch", type=int, default=SEG_CONFIG["iters_per_epoch"])
     parser.add_argument("--num_workers", type=int, default=SEG_CONFIG["num_workers"])
     args = parser.parse_args()
-    
+
     SEG_CONFIG["n_epochs"] = args.n_epochs
     SEG_CONFIG["iters_per_epoch"] = args.iters_per_epoch
     SEG_CONFIG["num_workers"] = args.num_workers
