@@ -47,42 +47,33 @@ def cleanup_gpu():
 
 
 def get_ram_info():
-    # 1. Get System Memory
-    sys_mem = psutil.virtual_memory()
-    total_available_mem = sys_mem.total
+    # 1. Use 48GB as the hardcoded baseline for percentage calculation
+    total_allowed_bytes = 48 * 1024 * 1024 * 1024
 
-    # 2. Check for User Limits (ulimit -m / RLIMIT_RSS)
-    try:
-        import resource
-        soft_limit, _ = resource.getrlimit(resource.RLIMIT_RSS)
-        if soft_limit > 0 and soft_limit != resource.RLIM_INFINITY:
-            total_available_mem = min(total_available_mem, soft_limit)
-    except Exception:
-        pass
-
-    # 3. Calculate Total Usage (Main + Children)
+    # 2. Calculate Total Usage using PSS (Proportional Set Size)
     main_p = psutil.Process()
+    total_used_pss = 0
+
     try:
-        # PSS includes shared memory, more accurate on Linux
-        mem_info = main_p.memory_full_info()
-        total_used = getattr(mem_info, 'pss', mem_info.rss)
-    except (psutil.AccessDenied, AttributeError):
-        total_used = main_p.memory_info().rss
+        # Include main process and all children
+        all_procs = [main_p] + main_p.children(recursive=True)
 
-    for child in main_p.children(recursive=True):
-        try:
-            # Use RSS for children as it is more reliably reported across multiprocessing types
-            total_used += child.memory_info().rss
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+        for p in all_procs:
+            try:
+                # memory_full_info() provides PSS on Linux
+                full_info = p.memory_full_info()
+                # If pss is not available (e.g. non-Linux), fall back to rss
+                total_used_pss += getattr(full_info, "pss", full_info.rss)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        # Extreme fallback
+        total_used_pss = main_p.memory_info().rss
 
-    total_gb = total_used / (1024**3)
-    
-    # This is the % of the ALLOWED memory this process is using
-    process_usage_percent = (total_used / total_available_mem) * 100
-    
-    # Return process usage % and total GB
-    return process_usage_percent, total_gb
+    total_gb = total_used_pss / (1024**3)
+    usage_percent = (total_used_pss / total_allowed_bytes) * 100
+
+    return usage_percent, total_gb
 
 
 def anatomix_normalize(tensor, percentile_range=None, clip_range=None):
