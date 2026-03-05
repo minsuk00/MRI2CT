@@ -157,8 +157,11 @@ def compute_metrics(pred, target, data_range=1.0):
     dice_score = (2.0 * intersection + 1e-5) / (union + 1e-5)
     dice_val = dice_score.item()
 
+    mae_val = torch.mean(torch.abs(pred - target)).item()
+
     return {
-        "mae": torch.mean(torch.abs(pred - target)).item(),
+        "mae": mae_val,
+        "mae_hu": mae_val * 2048.0,
         "psnr": torch.mean(psnr).item(),
         "ssim": ssim_val,
         "grad_diff": grad_diff,  # 낮을수록 좋음 (Lower is better)
