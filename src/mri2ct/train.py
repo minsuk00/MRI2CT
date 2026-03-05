@@ -65,6 +65,7 @@ EXPERIMENT_CONFIG = [
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--dice_w", type=float, help="Dice loss weight")
     parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
@@ -85,7 +86,6 @@ if __name__ == "__main__":
             exp["steps_per_epoch"] = 100
             exp["wandb_note"] = f"Overfitting test on {args.subjects}"
             print(f"🔬 OVERFITTING MODE: Training on {args.subjects}")
-
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")

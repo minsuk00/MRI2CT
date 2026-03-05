@@ -429,7 +429,7 @@ class BaselineTrainer:
         self.val_loader = tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
         # Stratified Validation Sampling (2 per region) - Matching src/trainer.py
-        total_val = len(self.val_subjects)
+        # total_val = len(self.val_subjects)
         rng = random.Random(self.cfg.seed)
 
         region_to_indices = defaultdict(list)
@@ -690,7 +690,7 @@ class BaselineTrainer:
         for ax in axes.flatten():
             ax.axis("off")
         plt.tight_layout()
-        wandb.log({f"train/patch_viz": wandb.Image(fig)}, step=step)
+        wandb.log({"train/patch_viz": wandb.Image(fig)}, step=step)
         plt.close(fig)
 
     # ==========================================

@@ -1,6 +1,5 @@
 import datetime
 import gc
-import math
 import os
 import random
 import sys
@@ -29,7 +28,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 from mri2ct.config import Config
 from mri2ct.data import DataPreprocessing, get_augmentations, get_region_key, get_subject_paths
 from mri2ct.loss import CompositeLoss
-from mri2ct.utils import cleanup_gpu, compute_metrics, count_parameters, get_ram_info, set_seed, unpad
+from mri2ct.utils import compute_metrics, count_parameters, get_ram_info, set_seed, unpad
 
 
 def clean_state_dict(state_dict):
@@ -358,7 +357,7 @@ class Trainer:
         print(f"[Model] Anatomix Feat Extractor Params: Total={tot:,} | Trainable={train:,}")
 
         # 2. Unet Translator (Generator)
-        print(f"[DEBUG] 🏗️ Building Unet Translator (Anatomix v1)...")
+        print("[DEBUG] 🏗️ Building Unet Translator (Anatomix v1)...")
         model = Unet(
             dimension=3,
             input_nc=16,
@@ -374,7 +373,7 @@ class Trainer:
         should_compile_models = self.cfg.compile_mode == "model"
 
         if should_compile_models:
-            print(f"[DEBUG] 🚀 Compiling Generator (mode=default)...")
+            print("[DEBUG] 🚀 Compiling Generator (mode=default)...")
             self.model = torch.compile(model, mode="default")
         else:
             self.model = model
@@ -633,7 +632,7 @@ class Trainer:
 
             fig, ax = plt.subplots(1, 3, figsize=(10, 4))
             ax[0].imshow(np.rot90(orig_sl), cmap="gray", vmin=0, vmax=1)
-            ax[0].set_title(f"Original")
+            ax[0].set_title("Original")
             ax[1].imshow(np.rot90(aug_sl), cmap="gray", vmin=0, vmax=1)
             ax[1].set_title(f"Augmented\n{hist_str}")
 
@@ -904,7 +903,7 @@ class Trainer:
 
         plt.tight_layout()
 
-        wandb.log({f"train/patch_viz": wandb.Image(fig)}, step=step)
+        wandb.log({"train/patch_viz": wandb.Image(fig)}, step=step)
         plt.close(fig)
 
     # ==========================================
