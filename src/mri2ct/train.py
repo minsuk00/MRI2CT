@@ -64,9 +64,29 @@ EXPERIMENT_CONFIG = [
 ]
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dice_w", type=float, help="Dice loss weight")
+    parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
+    parser.add_argument("--subjects", type=str, nargs="+", help="Subject IDs to train on (for overfitting)")
+    args = parser.parse_args()
+
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
 
     for i, exp in enumerate(EXPERIMENT_CONFIG):
+        # Override with CLI args if provided
+        if args.dice_w is not None:
+            exp["dice_w"] = args.dice_w
+        if args.resume_id is not None:
+            exp["resume_wandb_id"] = args.resume_id
+        if args.subjects is not None:
+            exp["subjects"] = args.subjects
+            # For overfitting, we usually want to reduce steps and disable some logic
+            exp["steps_per_epoch"] = 100
+            exp["wandb_note"] = f"Overfitting test on {args.subjects}"
+            print(f"🔬 OVERFITTING MODE: Training on {args.subjects}")
+
+
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")
         print(f"Config: {exp}")

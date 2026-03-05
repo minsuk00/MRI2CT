@@ -1018,11 +1018,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--single_subject", type=str, help="Run overfitting test on specific subject ID (e.g., 1ABA005)")
     parser.add_argument("--wandb", type=str, default="True", choices=["True", "False"], help="Enable/disable wandb (True/False)")
+    parser.add_argument("--dice_w", type=float, help="Dice loss weight")
+    parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
     use_wandb = args.wandb == "True"
     BASELINE_CONFIG["wandb"] = use_wandb
+
+    # Override with CLI args if provided
+    if args.dice_w is not None:
+        BASELINE_CONFIG["dice_w"] = args.dice_w
+    if args.resume_id is not None:
+        BASELINE_CONFIG["resume_wandb_id"] = args.resume_id
 
     # Modify config based on args
     if args.single_subject:
