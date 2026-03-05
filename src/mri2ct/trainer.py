@@ -330,14 +330,16 @@ class Trainer:
             if self.cfg.compile_mode != "full":
                 print("[DEBUG] 🚀 Compiling Anatomix Feature Extractor...")
                 self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
-            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G.pth"
+            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_v2.pth"
         else:
             raise ValueError("Invalid anatomix_weights")
 
         if os.path.exists(ckpt):
             # Strip _orig_mod prefix if present
             state_dict = clean_state_dict(torch.load(ckpt, map_location=self.device))
-            self.feat_extractor.load_state_dict(state_dict, strict=True)
+            # Load into the underlying module if compiled
+            target = getattr(self.feat_extractor, "_orig_mod", self.feat_extractor)
+            target.load_state_dict(state_dict, strict=True)
             print(f"[DEBUG] Loaded Anatomix weights from {ckpt}")
         else:
             print(f"[WARNING] ⚠️ Anatomix weights NOT FOUND at {ckpt}")

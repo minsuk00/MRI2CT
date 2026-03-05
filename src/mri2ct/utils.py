@@ -54,36 +54,35 @@ def get_ram_info():
     # 2. Check for User Limits (ulimit -m / RLIMIT_RSS)
     try:
         import resource
-
         soft_limit, _ = resource.getrlimit(resource.RLIMIT_RSS)
-        # If soft_limit is set (not -1/infinity), use it as the ceiling
-        if soft_limit != resource.RLIM_INFINITY:
+        if soft_limit > 0 and soft_limit != resource.RLIM_INFINITY:
             total_available_mem = min(total_available_mem, soft_limit)
     except Exception:
-        pass  # Fallback to system total if anything fails
+        pass
 
     # 3. Calculate Total Usage (Main + Children)
     main_p = psutil.Process()
-    # Use PSS if available (Linux), else RSS
     try:
-        main_mem = main_p.memory_full_info()
-        total_used = getattr(main_mem, "pss", main_mem.rss)
-    except:
+        # PSS includes shared memory, more accurate on Linux
+        mem_info = main_p.memory_full_info()
+        total_used = getattr(mem_info, 'pss', mem_info.rss)
+    except (psutil.AccessDenied, AttributeError):
         total_used = main_p.memory_info().rss
 
     for child in main_p.children(recursive=True):
         try:
-            mem = child.memory_full_info()
-            total_used += getattr(mem, "pss", mem.rss)
+            # Use RSS for children as it is more reliably reported across multiprocessing types
+            total_used += child.memory_info().rss
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
     total_gb = total_used / (1024**3)
-
-    # Recalculate percentage based on the effective limit
-    usage_percent = (total_used / total_available_mem) * 100
-
-    return usage_percent, total_gb
+    
+    # This is the % of the ALLOWED memory this process is using
+    process_usage_percent = (total_used / total_available_mem) * 100
+    
+    # Return process usage % and total GB
+    return process_usage_percent, total_gb
 
 
 def anatomix_normalize(tensor, percentile_range=None, clip_range=None):
