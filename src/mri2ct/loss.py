@@ -39,6 +39,7 @@ class CompositeLoss(nn.Module):
             t = t[:, 5:6, :]
         elif self.weights.get("dice_exclude_background", True):
             # Exclude index 0
+
             p = p[:, 1:, :]
             t = t[:, 1:, :]
 

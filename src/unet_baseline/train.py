@@ -1040,8 +1040,8 @@ if __name__ == "__main__":
                 "subjects": [args.single_subject],
                 "wandb_note": f"Baseline Overfitting Test - {args.single_subject}",
                 "augment": False,  # Disable aug for pure overfitting check
-                "steps_per_epoch": 50,  # Reduced steps for faster feedback
-                "val_interval": 5,
+                "steps_per_epoch": 100,  # Reduced steps for faster feedback
+                "val_interval": 2,
                 # Speed up startup but ensure enough buffering
                 "data_queue_max_length": 200,
                 "data_queue_num_workers": 4,

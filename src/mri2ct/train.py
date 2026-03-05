@@ -84,6 +84,7 @@ if __name__ == "__main__":
             exp["subjects"] = args.subjects
             # For overfitting, we usually want to reduce steps and disable some logic
             exp["steps_per_epoch"] = 100
+            exp["augment"] = False
             exp["wandb_note"] = f"Overfitting test on {args.subjects}"
             print(f"🔬 OVERFITTING MODE: Training on {args.subjects}")
 
