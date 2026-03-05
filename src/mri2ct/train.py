@@ -20,7 +20,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from mri2ct.config import DEFAULT_CONFIG
 from mri2ct.trainer import Trainer
-from mri2ct.utils import cleanup_gpu
+from mri2ct.utils import cleanup_gpu, send_notification
 
 warnings.filterwarnings("ignore", category=UserWarning, module="monai.utils.module")
 warnings.filterwarnings("ignore", message=".*SubjectsLoader in PyTorch >= 2.3.*")
@@ -29,7 +29,7 @@ os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 
 EXPERIMENT_CONFIG = [
     {
-        "val_interval": 1,
+        "val_interval": 2,
         "steps_per_epoch": 1000,
         "model_save_interval": 1,
         "total_epochs": 1000,
@@ -37,25 +37,22 @@ EXPERIMENT_CONFIG = [
         "accum_steps": 1,
         "sanity_check": False,
         "use_weighted_sampler": True,
-        "use_registered_data": False,
-        # "resume_wandb_id": "a8beg6v1",  # no dice
-        "resume_wandb_id": "b5we7kh6",  # yes dice
-        # "resume_wandb_id": None,
+        "use_registered_data": True,
+        "resume_wandb_id": None,
         "resume_epoch": None,  # Optional: specify epoch number
         "diverge_wandb_branch": False,  # Create new run instead of resuming existing
         "dice_w": 0.05,
-        # "dice_w": 0.00,
-        # "validate_dice": True,
         "validate_dice": True,
         "enable_profiling": True,
         # "enable_profiling": False,
-        "patches_per_volume": 200,
-        "data_queue_max_length": 400,
+        "patches_per_volume": 50,
+        "data_queue_max_length": 500,
+        "data_queue_num_workers": 10,
         # --------------------
+        # "subjects": ["1ABA011"],
         "viz_limit": 10,
         "compile_mode": "full",
         # "compile_mode": "None",
-        "data_queue_num_workers": 4,
         "lr": 3e-4,
         "scheduler_min_lr": 0.0,
         "wandb_note": "long_run_anatomix_v2_baby_unet_teacher",
@@ -94,4 +91,5 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"❌ Experiment {i + 1} Failed: {e}")
+            send_notification(f"❌ Experiment {i + 1} Failed: {e}")
             traceback.print_exc()

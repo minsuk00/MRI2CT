@@ -88,15 +88,15 @@ class Trainer:
             os.makedirs(local_root, exist_ok=True)
 
         # Construct rsync includes dynamically
-        includes = ["--include='*/'", "--include='ct.nii.gz'", "--include='mr.nii.gz'"]
+        includes = ["--include='*/'", "--include='ct.nii*'", "--include='mr.nii*'"]
         if self.cfg.use_registered_data:
             includes.extend(["--include='moved_mr*.nii*'"])
 
         # Only sync masks/segs if needed
         if getattr(self.cfg, "use_weighted_sampler", False):
-            includes.append("--include='body_mask.nii.gz'")
+            includes.append("--include='mask.nii*'")
         if getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False):
-            includes.append("--include='cads_ct_seg.nii.gz'")
+            includes.append("--include='ct_seg.nii*'")
 
         includes.append("--exclude='*'")
         inc_str = " ".join(includes)
@@ -153,22 +153,37 @@ class Trainer:
                 if not os.path.isdir(subj_path):
                     continue
 
-                # Check for required files (must have both CT and MRI)
-                has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz"))
+                subj_id = os.path.join(split_name, d)
+
+                # 1. Check CT
+                has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz")) or os.path.exists(os.path.join(subj_path, "ct.nii"))
+
+                # 2. Check MRI
                 if self.cfg.use_registered_data:
-                    has_mr = len(glob(os.path.join(subj_path, "moved_mr*.nii*"))) > 0
+                    mr_files = glob(os.path.join(subj_path, "moved_mr*.nii*"))
+                    has_mr = len(mr_files) > 0
                 else:
                     has_mr = os.path.exists(os.path.join(subj_path, "mr.nii.gz"))
 
-                # Check for segmentation if Dice is needed
+                # 3. Check Segmentation
                 has_seg = True
                 if load_seg:
-                    has_seg = os.path.exists(os.path.join(subj_path, "cads_ct_seg.nii.gz"))
+                    has_seg = os.path.exists(os.path.join(subj_path, "ct_seg.nii"))
 
+                # 4. Filter logic with detailed logging
                 if has_ct and has_mr and has_seg:
-                    valid_subjs.append(os.path.join(split_name, d))
-                elif not has_seg and load_seg:
-                    print(f"  [Skip] {os.path.join(split_name, d)}: Missing segmentation.")
+                    valid_subjs.append(subj_id)
+                else:
+                    reasons = []
+                    if not has_ct:
+                        reasons.append("CT")
+                    if not has_mr:
+                        reasons.append("MRI")
+                    if not has_seg and load_seg:
+                        reasons.append("ct_seg.nii")
+
+                    if reasons:
+                        print(f"  [Skip] {subj_id:20} | Missing: {', '.join(reasons)}")
 
             return valid_subjs
 
@@ -216,7 +231,7 @@ class Trainer:
 
                 # Conditionally load segmentation
                 if load_seg:
-                    seg_path = os.path.join(self.cfg.root_dir, s, "cads_ct_seg.nii.gz")
+                    seg_path = os.path.join(self.cfg.root_dir, s, "ct_seg.nii")
                     if os.path.exists(seg_path):
                         kwargs["seg"] = tio.LabelMap(seg_path)
                     else:
@@ -232,8 +247,18 @@ class Trainer:
         # Main aligned with baseline: Disable safety padding by default
         use_safety = False
 
+        # from mri2ct.data import Float16Storage
+
         preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=use_safety, res_mult=self.cfg.res_mult, use_weighted_sampler=self.cfg.use_weighted_sampler)
-        transforms = tio.Compose([preprocess, get_augmentations()]) if self.cfg.augment else preprocess
+
+        transform_list = [preprocess]
+        if self.cfg.augment:
+            transform_list.append(get_augmentations())
+
+        # Cast to float16 at the VERY END for RAM storage optimization
+        # transform_list.append(Float16Storage())
+
+        transforms = tio.Compose(transform_list)
 
         train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
 
@@ -474,57 +499,7 @@ class Trainer:
         print(f"[RESUME] 📥 Loading: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=self.device)
 
-        # Helper to load into potentially compiled model
-        def load_state(m, state):
-            state = clean_state_dict(state)
-            getattr(m, "_orig_mod", m).load_state_dict(state)
-
-        load_state(self.model, checkpoint["model_state_dict"])
-
-        if "feat_extractor_state_dict" in checkpoint:
-            print("[RESUME] 📥 Loading Feature Extractor state...")
-            load_state(self.feat_extractor, checkpoint["feat_extractor_state_dict"])
-
-        if checkpoint.get("scheduler_state_dict") is not None and self.scheduler is not None:
-            print("[RESUME] 📥 Loading Scheduler state...")
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-            print(f"[DEBUG] Loaded Scheduler: last_epoch={self.scheduler.last_epoch}, T_max={self.scheduler.T_max}")
-
-            # Automatically update T_max from config
-            new_t_max = self.cfg.steps_per_epoch * self.cfg.total_epochs
-            if new_t_max != self.scheduler.T_max:
-                print(f"[RESUME] 🔧 Updating Scheduler T_max: {self.scheduler.T_max} -> {new_t_max}")
-                self.scheduler.T_max = new_t_max
-
-            # Step the scheduler to the restored epoch to update optimizer params
-            restored_epoch = self.scheduler.last_epoch
-            self.scheduler.last_epoch = restored_epoch - 1
-            self.scheduler.step()
-            print(f"[RESUME] 🔄 Scheduler stepped to epoch {self.scheduler.last_epoch}. LR: {self.optimizer.param_groups[0]['lr']:.2e}")
-
-        if "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-            if self.cfg.override_lr and self.scheduler is not None:
-                print("[RESUME] 🔧 Override LR enabled: Recalculating LR curve.")
-                # Force peak LRs to the config ones
-                feat_params = list(self.feat_extractor.parameters())
-                self.scheduler.base_lrs = [self.cfg.lr_feat_extractor if any(any(p is fp for fp in feat_params) for p in group["params"]) else self.cfg.lr for group in self.optimizer.param_groups]
-                # Recalculate current LR based on step
-                self.scheduler.step(self.global_step)
-
-            elif self.cfg.override_lr:
-                print(f"[RESUME] 🔧 Forcing new Learning Rate: {self.cfg.lr}")
-                feat_params = list(self.feat_extractor.parameters())
-                for param_group in self.optimizer.param_groups:
-                    is_feat = any(any(p is fp for fp in feat_params) for p in param_group["params"])
-                    param_group["lr"] = self.cfg.lr_feat_extractor if is_feat else self.cfg.lr
-
-        if "scaler_state_dict" in checkpoint:
-            print("[RESUME] 📥 Loading GradScaler state...")
-            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
+        # 1. Restore Training State first
         if "epoch" in checkpoint:
             self.start_epoch = checkpoint["epoch"] + 1
 
@@ -545,6 +520,60 @@ class Trainer:
         else:
             self.elapsed_time_at_resume = 0
             print("[RESUME] ⏱️ No elapsed_time found. Starting from 0s.")
+
+        # 2. Restore Model states
+        # Helper to load into potentially compiled model
+        def load_state(m, state):
+            state = clean_state_dict(state)
+            getattr(m, "_orig_mod", m).load_state_dict(state)
+
+        load_state(self.model, checkpoint["model_state_dict"])
+
+        if "feat_extractor_state_dict" in checkpoint:
+            print("[RESUME] 📥 Loading Feature Extractor state...")
+            load_state(self.feat_extractor, checkpoint["feat_extractor_state_dict"])
+
+        # 3. Restore Optimizer BEFORE Scheduler
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # 4. Restore Scheduler and apply updates
+        if checkpoint.get("scheduler_state_dict") is not None and self.scheduler is not None:
+            print("[RESUME] 📥 Loading Scheduler state...")
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+            print(f"[DEBUG] Loaded Scheduler: last_epoch={self.scheduler.last_epoch}, T_max={self.scheduler.T_max}")
+
+            # Automatically update T_max from config
+            new_t_max = self.cfg.steps_per_epoch * self.cfg.total_epochs
+            if new_t_max != self.scheduler.T_max:
+                print(f"[RESUME] 🔧 Updating Scheduler T_max: {self.scheduler.T_max} -> {new_t_max}")
+                self.scheduler.T_max = new_t_max
+
+            if self.cfg.override_lr:
+                print("[RESUME] 🔧 Override LR enabled: Recalculating LR curve.")
+                # Force peak LRs to the config ones
+                feat_params = list(self.feat_extractor.parameters())
+                self.scheduler.base_lrs = [self.cfg.lr_feat_extractor if any(any(p is fp for fp in feat_params) for p in group["params"]) else self.cfg.lr for group in self.optimizer.param_groups]
+                # Recalculate current LR based on step
+                self.scheduler.step(self.global_step)
+            else:
+                # Step the scheduler to the restored epoch to update optimizer params
+                restored_epoch = self.scheduler.last_epoch
+                self.scheduler.last_epoch = restored_epoch - 1
+                self.scheduler.step()
+                print(f"[RESUME] 🔄 Scheduler stepped to epoch {self.scheduler.last_epoch}. LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+        elif "optimizer_state_dict" in checkpoint and self.cfg.override_lr:
+            print(f"[RESUME] 🔧 Forcing new Learning Rate: {self.cfg.lr}")
+            feat_params = list(self.feat_extractor.parameters())
+            for param_group in self.optimizer.param_groups:
+                is_feat = any(any(p is fp for fp in feat_params) for p in param_group["params"])
+                param_group["lr"] = self.cfg.lr_feat_extractor if is_feat else self.cfg.lr
+
+        # 5. Restore Scaler
+        if "scaler_state_dict" in checkpoint:
+            print("[RESUME] 📥 Loading GradScaler state...")
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     def save_checkpoint(self, epoch, is_final=False):
         filename = f"{self.cfg.model_type}_epoch{epoch:05d}.pt"
@@ -962,10 +991,9 @@ class Trainer:
             if self.cfg.enable_profiling:
                 t_step_end = time.time()
                 step_t_total = t_step_end - t_step_start
-                avg_batch_data = step_t_data / self.cfg.accum_steps * 1000
-                avg_batch_fwd = step_t_fwd / self.cfg.accum_steps * 1000
-                avg_batch_bwd = step_t_bwd / self.cfg.accum_steps * 1000
-                pbar_dict.update({"dt(ms)": f"{avg_batch_data:.3f}", "fwd(ms)": f"{avg_batch_fwd:.3f}", "bwd(ms)": f"{avg_batch_bwd:.3f}", "lr": f"{current_lr:.2e}"})
+                avg_batch_data = (step_t_data / self.cfg.accum_steps) * 1000
+                avg_batch_fwd = (step_t_fwd / self.cfg.accum_steps) * 1000
+                pbar_dict.update({"dt": f"{avg_batch_data:.1f}ms", "fwd": f"{avg_batch_fwd:.1f}ms", "tot": f"{step_t_total:.2f}s", "lr": f"{current_lr:.2e}"})
 
             pbar.set_postfix(pbar_dict)
 
@@ -986,7 +1014,6 @@ class Trainer:
                         {
                             "info/time_data(ms)": avg_batch_data,
                             "info/time_forward(ms)": avg_batch_fwd,
-                            "info/time_backward(ms)": avg_batch_bwd,
                             "info/time_step_total(s)": step_t_total,
                         }
                     )
@@ -1015,6 +1042,7 @@ class Trainer:
         torch.cuda.empty_cache()
 
         self.model.eval()
+        self.feat_extractor.eval()
         val_metrics = defaultdict(list)
 
         # 1. Validation Loop

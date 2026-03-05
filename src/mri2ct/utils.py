@@ -8,6 +8,21 @@ import torch
 from fused_ssim import fused_ssim3d
 
 
+def send_notification(message, topic="mri2ct_minsukc"):
+    """
+    Sends a notification via ntfy.sh and email to minsukc@umich.edu.
+    You can subscribe to this topic at ntfy.sh/<topic> to get alerts on phone/desktop.
+    """
+    try:
+        import requests
+
+        print(f"[INFO] Sending notification to ntfy.sh/{topic} (and email to minsukc@umich.edu)...")
+        headers = {"Title": "MRI2CT Training Alert", "Priority": "high", "Tags": "warning,skull", "Email": "minsukc@umich.edu"}
+        requests.post(f"https://ntfy.sh/{topic}", data=message.encode("utf-8"), headers=headers)
+    except Exception as e:
+        print(f"[WARNING] Failed to send notification: {e}")
+
+
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -143,7 +158,7 @@ def compute_metrics(pred, target, data_range=1.0):
     grad_diff = (torch.mean(torch.abs(pred_dz - targ_dz)) + torch.mean(torch.abs(pred_dy - targ_dy)) + torch.mean(torch.abs(pred_dx - targ_dx))).item()
 
     # 3. Bone Dice Coefficient (Structure Metric)
-    bone_thresh = 0.8
+    bone_thresh = 0.7
     pred_bone = (pred > bone_thresh).float()
     targ_bone = (target > bone_thresh).float()
     intersection = (pred_bone * targ_bone).sum()

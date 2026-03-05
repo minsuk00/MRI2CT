@@ -45,10 +45,28 @@ class DataPreprocessing(tio.Transform):
             subject = tio.Pad(padding_params, padding_mode=0, include=spatial_keys)(subject)
 
         if self.use_weighted_sampler and "prob_map" not in subject:
-            prob = (subject["ct"].data > 0.01).to(torch.float32)
+            prob = (subject["ct"].data > 0.01).to(torch.uint8)
             subject.add_image(tio.LabelMap(tensor=prob, affine=subject["mri"].affine), "prob_map")
 
+        # Final RAM optimization: Ensure masks are uint8 (1 byte)
+        if "prob_map" in subject:
+            subject["prob_map"].set_data(subject["prob_map"].data.to(torch.uint8))
+        if "seg" in subject:
+            subject["seg"].set_data(subject["seg"].data.to(torch.uint8))
+
         return subject
+
+
+# class Float16Storage(tio.Transform):
+#     """
+#     RAM optimization: Casts MRI and CT to float16.
+#     MUST be the last transform in the pipeline to avoid SimpleITK errors.
+#     """
+
+#     def apply_transform(self, subject):
+#         subject["mri"].set_data(subject["mri"].data.to(torch.float16))
+#         subject["ct"].set_data(subject["ct"].data.to(torch.float16))
+#         return subject
 
 
 def get_augmentations():
@@ -72,7 +90,11 @@ def get_augmentations():
 
 def get_subject_paths(root, relative_path, use_registered=True):
     subj_dir = os.path.join(root, relative_path)
+
+    # Check for ct.nii or ct.nii.gz
     ct_path = os.path.join(subj_dir, "ct.nii.gz")
+    if not os.path.exists(ct_path):
+        ct_path = os.path.join(subj_dir, "ct.nii")
 
     if use_registered:
         # Search for moved_mr*.nii or moved_mr*.nii.gz directly in subj_dir
@@ -88,8 +110,11 @@ def get_subject_paths(root, relative_path, use_registered=True):
 
     paths = {"ct": ct_path, "mri": mr_path}
 
-    # Optional files
-    body_mask_path = os.path.join(subj_dir, "body_mask.nii.gz")
+    # Optional files (body mask for weighted sampling)
+    body_mask_path = os.path.join(subj_dir, "mask.nii.gz")
+    if not os.path.exists(body_mask_path):
+        body_mask_path = os.path.join(subj_dir, "mask.nii")
+
     if os.path.exists(body_mask_path):
         paths["body_mask"] = body_mask_path
 

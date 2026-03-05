@@ -1,9 +1,6 @@
-import os
 from types import SimpleNamespace
 
 import torch
-
-BASE_DIR = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined"
 
 
 class Config(SimpleNamespace):
@@ -12,24 +9,12 @@ class Config(SimpleNamespace):
         for key, value in dictionary.items():
             setattr(self, key, value)
 
-        # Dynamic Path Construction based on dataset_spacing
-        if hasattr(self, "dataset_spacing"):
-            sp = self.dataset_spacing
-            sp_str = f"{sp[0]:.1f}x{sp[1]:.1f}x{sp[2]:.1f}mm"
-
-            # Root directory for data
-            self.root_dir = os.path.join(BASE_DIR, sp_str)
-
-            # Directory for predictions
-            self.prediction_dir = os.path.join(BASE_DIR, "predictions", sp_str)
-
-            # Ensure log dir exists or is correctly relative
-            # (Leaving log_dir as provided in dict for now)
-
 
 DEFAULT_CONFIG = {
     # System
+    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5x1.5x1.5mm_registered",
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
+    "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/predictions/1.5x1.5x1.5mm_registered",
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "wandb": True,
