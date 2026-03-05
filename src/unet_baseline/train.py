@@ -42,7 +42,7 @@ from anatomix.model.network import Unet
 from mri2ct.config import DEFAULT_CONFIG, Config
 from mri2ct.data import DataPreprocessing, get_augmentations, get_region_key, get_subject_paths
 from mri2ct.loss import CompositeLoss
-from mri2ct.utils import cleanup_gpu, compute_metrics, count_parameters, get_ram_info, set_seed, unpad
+from mri2ct.utils import cleanup_gpu, compute_metrics, count_parameters, get_ram_info, send_notification, set_seed, unpad
 
 
 def clean_state_dict(state_dict):
@@ -62,21 +62,20 @@ BASELINE_CONFIG = {
     "lr": 3e-4,
     "total_epochs": 1000,
     "steps_per_epoch": 1000,
-    "val_interval": 1,
+    "val_interval": 2,
     "model_save_interval": 1,
     "use_weighted_sampler": True,
-    "use_registered_data": False,
-    # "resume_wandb_id": None,
-    "resume_wandb_id": "wq11cuvy",
+    "use_registered_data": True,
+    "resume_wandb_id": None,
     "resume_epoch": None,  # Optional: specify epoch number
     "diverge_wandb_branch": False,  # Create new run instead of resuming existing
-    "dice_w": 0.00,  # Optional Dice loss
+    "dice_w": 0.05,  # Optional Dice loss
     "validate_dice": True,  # Optional Dice validation
-    # "validate_dice": False,
     "enable_profiling": True,
     # "enable_profiling": False,
-    "patches_per_volume": 200,
-    "data_queue_max_length": 400,
+    "patches_per_volume": 50,
+    "data_queue_max_length": 500,
+    "data_queue_num_workers": 10,
     # ----------------------
     # Experiment Basics
     "project_name": "MRI2CT_UNet_Baseline",
@@ -88,7 +87,6 @@ BASELINE_CONFIG = {
     # Data
     "patch_size": 128,  # Same as main
     "res_mult": 16,  # Divisibility requirement
-    "data_queue_num_workers": 4,
     "augment": True,
     # Model Architecture (Baseline U-Net)
     "input_nc": 1,
@@ -175,15 +173,15 @@ class BaselineTrainer:
             os.makedirs(local_root, exist_ok=True)
 
         # Construct rsync includes dynamically
-        includes = ["--include='*/'", "--include='ct.nii.gz'", "--include='mr.nii.gz'"]
+        includes = ["--include='*/'", "--include='ct.nii*'", "--include='mr.nii*'"]
         if self.cfg.use_registered_data:
             includes.extend(["--include='moved_mr*.nii*'"])
 
         # Only sync masks/segs if needed
         if getattr(self.cfg, "use_weighted_sampler", False):
-            includes.append("--include='body_mask.nii.gz'")
+            includes.append("--include='mask.nii*'")
         if getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False):
-            includes.append("--include='cads_ct_seg.nii.gz'")
+            includes.append("--include='ct_seg.nii*'")
 
         includes.append("--exclude='*'")
         inc_str = " ".join(includes)
@@ -253,85 +251,14 @@ class BaselineTrainer:
         print(f"[RESUME] 📥 Loading: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=self.device)
 
-        # Load Model
-        if hasattr(self.model, "_orig_mod"):
-            self.model._orig_mod.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-
-        # Load Optimizer
-        if "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-            if self.cfg.override_lr:
-                print(f"[RESUME] 🔧 Forcing new Learning Rate: {self.cfg.lr}")
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = self.cfg.lr
-
-                # Update scheduler base_lrs to match new optimizer LRs
-                if self.scheduler is not None:
-                    self.scheduler.base_lrs = [group["lr"] for group in self.optimizer.param_groups]
-
-        # Load Scheduler
-        if self.cfg.override_lr and self.scheduler is not None:
-            print("[RESUME] 🔧 Override LR enabled: Skipping scheduler state load and recalculating LR.")
-
-            # 1. Restore the step count
-            # Use global_step if available, otherwise estimate from epoch
-            restored_step = checkpoint.get("global_step", (self.start_epoch) * self.cfg.steps_per_epoch)
-            self.scheduler.last_epoch = restored_step
-
-            # 2. Calculate Closed-Form LR
-            # lr = eta_min + 0.5 * (base - eta_min) * (1 + cos(pi * t / T))
-            t = restored_step
-            T = self.cfg.steps_per_epoch * self.cfg.total_epochs
-            eta_min = self.cfg.scheduler_min_lr
-            base_lr = self.cfg.lr  # This is the NEW base LR
-
-            import math
-
-            new_lr = eta_min + 0.5 * (base_lr - eta_min) * (1 + math.cos(math.pi * t / T))
-
-            # 3. Apply to Optimizer
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = new_lr
-
-            # 4. Update Scheduler Base LRs (so it knows the peak)
-            self.scheduler.base_lrs = [base_lr] * len(self.optimizer.param_groups)
-            self.scheduler.T_max = T
-
-            print(f"[RESUME] 🧮 Recalculated LR for step {t}/{T}: {new_lr:.2e} (Base: {base_lr})")
-
-        elif checkpoint.get("scheduler_state_dict") is not None and self.scheduler is not None:
-            print("[RESUME] 📥 Loading Scheduler state...")
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-            print(f"[DEBUG] Loaded Scheduler: last_epoch={self.scheduler.last_epoch}, T_max={self.scheduler.T_max}")
-
-            # Automatically update T_max from config
-            new_t_max = self.cfg.steps_per_epoch * self.cfg.total_epochs
-            if new_t_max != self.scheduler.T_max:
-                print(f"[RESUME] 🔧 Updating Scheduler T_max: {self.scheduler.T_max} -> {new_t_max}")
-                self.scheduler.T_max = new_t_max
-
-            # Step the scheduler to the restored epoch to update optimizer params
-            restored_epoch = self.scheduler.last_epoch
-            self.scheduler.last_epoch = restored_epoch - 1
-
-            self.scheduler.step()
-
-            print(f"[RESUME] 🔄 Scheduler stepped to epoch {self.scheduler.last_epoch}. LR: {self.optimizer.param_groups[0]['lr']:.2e}")
-
-        # Load Scaler
-        if "scaler_state_dict" in checkpoint:
-            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
-        # Load Epoch/Step
+        # 1. Restore Training State first
         if "epoch" in checkpoint:
             self.start_epoch = checkpoint["epoch"] + 1
 
         if "global_step" in checkpoint:
             self.global_step = checkpoint["global_step"]
+        else:
+            self.global_step = (self.start_epoch) * self.cfg.steps_per_epoch
 
         if "samples_seen" in checkpoint:
             self.samples_seen = checkpoint["samples_seen"]
@@ -342,6 +269,55 @@ class BaselineTrainer:
             print(f"[RESUME] ⏱️ Restored elapsed_time: {self.elapsed_time_at_resume:.1f}s")
         else:
             self.elapsed_time_at_resume = 0
+
+        # 2. Restore Model
+        if hasattr(self.model, "_orig_mod"):
+            self.model._orig_mod.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        # 3. Restore Optimizer BEFORE Scheduler
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # 4. Restore Scheduler and apply updates
+        if self.cfg.override_lr and self.scheduler is not None:
+            print("[RESUME] 🔧 Override LR enabled: Skipping scheduler state load and recalculating LR.")
+            restored_step = self.global_step
+            self.scheduler.last_epoch = restored_step
+            T = self.cfg.steps_per_epoch * self.cfg.total_epochs
+            eta_min = self.cfg.scheduler_min_lr
+            base_lr = self.cfg.lr
+            new_lr = eta_min + 0.5 * (base_lr - eta_min) * (1 + math.cos(math.pi * restored_step / T))
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = new_lr
+            self.scheduler.base_lrs = [base_lr] * len(self.optimizer.param_groups)
+            self.scheduler.T_max = T
+            print(f"[RESUME] 🧮 Recalculated LR for step {restored_step}/{T}: {new_lr:.2e}")
+
+        elif checkpoint.get("scheduler_state_dict") is not None and self.scheduler is not None:
+            print("[RESUME] 📥 Loading Scheduler state...")
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            print(f"[DEBUG] Loaded Scheduler: last_epoch={self.scheduler.last_epoch}, T_max={self.scheduler.T_max}")
+
+            new_t_max = self.cfg.steps_per_epoch * self.cfg.total_epochs
+            if new_t_max != self.scheduler.T_max:
+                print(f"[RESUME] 🔧 Updating Scheduler T_max: {self.scheduler.T_max} -> {new_t_max}")
+                self.scheduler.T_max = new_t_max
+
+            restored_epoch = self.scheduler.last_epoch
+            self.scheduler.last_epoch = restored_epoch - 1
+            self.scheduler.step()
+            print(f"[RESUME] 🔄 Scheduler stepped to epoch {self.scheduler.last_epoch}. LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+
+        elif "optimizer_state_dict" in checkpoint and self.cfg.override_lr:
+            print(f"[RESUME] 🔧 Forcing new Learning Rate: {self.cfg.lr}")
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.cfg.lr
+
+        # 5. Restore Scaler
+        if "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     def _setup_data(self):
         # 1. Reuse existing logic to find subjects
@@ -359,16 +335,16 @@ class BaselineTrainer:
                 subj_path = os.path.join(split_dir, d)
                 if not os.path.isdir(subj_path):
                     continue
-                has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz"))
+                has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz")) or os.path.exists(os.path.join(subj_path, "ct.nii"))
                 if self.cfg.use_registered_data:
                     has_mr = len(glob(os.path.join(subj_path, "moved_mr*.nii*"))) > 0
                 else:
-                    has_mr = os.path.exists(os.path.join(subj_path, "mr.nii.gz"))
+                    has_mr = os.path.exists(os.path.join(subj_path, "mr.nii.gz")) or os.path.exists(os.path.join(subj_path, "mr.nii"))
 
                 # Check for segmentation if Dice is needed
                 has_seg = True
                 if load_seg:
-                    has_seg = os.path.exists(os.path.join(subj_path, "cads_ct_seg.nii.gz"))
+                    has_seg = os.path.exists(os.path.join(subj_path, "ct_seg.nii"))
 
                 if has_ct and has_mr and has_seg:
                     valid_subjs.append(os.path.join(split_name, d))
@@ -406,7 +382,7 @@ class BaselineTrainer:
                     kwargs["prob_map"] = tio.LabelMap(paths["body_mask"])
 
                 if load_seg:
-                    seg_path = os.path.join(self.cfg.root_dir, s, "cads_ct_seg.nii.gz")
+                    seg_path = os.path.join(self.cfg.root_dir, s, "ct_seg.nii")
                     if os.path.exists(seg_path):
                         kwargs["seg"] = tio.LabelMap(seg_path)
                     else:
@@ -733,16 +709,34 @@ class BaselineTrainer:
             step_loss = 0.0
 
             if self.cfg.enable_profiling:
+                step_t_data = 0.0
+                step_t_fwd = 0.0
                 t_step_start = time.time()
 
             for _ in range(self.cfg.accum_steps):
+                if self.cfg.enable_profiling:
+                    t0 = time.time()
                 batch = next(self.train_iter)
+                if self.cfg.enable_profiling:
+                    t1 = time.time()
+                    step_t_data += t1 - t0
+
                 # Convert to plain tensors for compiler stability
                 mri = batch["mri"][tio.DATA].to(self.device, non_blocking=True)
                 ct = batch["ct"][tio.DATA].to(self.device, non_blocking=True)
                 seg = batch["seg"][tio.DATA].to(self.device, non_blocking=True) if "seg" in batch else None
 
+                if self.cfg.enable_profiling:
+                    torch.cuda.synchronize()
+                    t2 = time.time()
+
+                # Call the training step (modular)
                 pred, loss, comps, pred_probs = self.train_step(mri, ct, seg)
+
+                if self.cfg.enable_profiling:
+                    torch.cuda.synchronize()
+                    t3 = time.time()
+                    step_t_fwd += t3 - t2
 
                 if self.cfg.wandb and step_idx == 0:
                     self._log_training_patch(mri, ct, pred, self.global_step, seg, pred_probs)
@@ -756,6 +750,7 @@ class BaselineTrainer:
 
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -775,12 +770,24 @@ class BaselineTrainer:
             pbar_dict["lr"] = f"{current_lr:.2e}"
 
             if self.cfg.enable_profiling:
-                step_t_total = time.time() - t_step_start
-                pbar_dict["t(s)"] = f"{step_t_total:.3f}"
+                t_step_end = time.time()
+                step_t_total = t_step_end - t_step_start
 
-                # Log only every 100 steps to avoid IO bottleneck
+                avg_data = (step_t_data / self.cfg.accum_steps) * 1000
+                avg_fwd = (step_t_fwd / self.cfg.accum_steps) * 1000
+
+                pbar_dict.update({"dt": f"{avg_data:.1f}ms", "fwd": f"{avg_fwd:.1f}ms", "tot": f"{step_t_total:.2f}s", "lr": f"{current_lr:.2e}"})
+
+                # Log to WandB
                 if self.cfg.wandb and step_idx % 100 == 0:
-                    wandb.log({"info/time_step_total(s)": step_t_total}, step=self.global_step)
+                    wandb.log(
+                        {
+                            "info/time_data_ms": avg_data,
+                            "info/time_forward_ms": avg_fwd,
+                            "info/time_step_total_s": step_t_total,
+                        },
+                        step=self.global_step,
+                    )
 
             pbar.set_postfix(pbar_dict)
 
@@ -1032,8 +1039,7 @@ if __name__ == "__main__":
                 "data_queue_num_workers": 4,
             }
         )
-        # Disable compile for quick test
-        torch.compile = None
+        BASELINE_CONFIG["compile_mode"] = None
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)
@@ -1042,6 +1048,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Interrupted.")
         cleanup_gpu()
-    except Exception as _:
+    except Exception as e:
+        send_notification(f"❌ UNet Baseline Failed: {e}")
         traceback.print_exc()
         cleanup_gpu()
