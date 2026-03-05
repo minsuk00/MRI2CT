@@ -18,3 +18,5 @@ maisi-mr-to-ct/
 pyproject.toml
 .vscodde/
 _archive/
+.gemini/
+gha-creds-*.json
