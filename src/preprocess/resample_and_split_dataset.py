@@ -11,8 +11,8 @@ from tqdm import tqdm
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-INPUT_DIR = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/native_masked"
-OUTPUT_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5x1.5x1.5mm_native_masked"
+INPUT_DIR = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/native_registered"
+OUTPUT_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5x1.5x1.5mm_registered"
 
 # Split Ratios
 SPLIT_RATIOS = {"train": 0.7, "val": 0.1, "test": 0.2}
@@ -21,7 +21,7 @@ SPLIT_RATIOS = {"train": 0.7, "val": 0.1, "test": 0.2}
 TARGET_SPACING = (1.5, 1.5, 1.5)
 
 # Hardware Constraint
-MAX_WORKERS = 8
+MAX_WORKERS = 12
 
 
 def get_region_key(subj_id):
@@ -42,28 +42,25 @@ def process_single_subject(args):
     """
     Worker function: Resamples to 1.5mm, converts scalars to int16, and saves as .nii
     """
-    subj_id, split_name = args
-    subj_src_path = os.path.join(INPUT_DIR, subj_id)
+    subj_id, split_name, region_dir = args
+    subj_src_path = os.path.join(INPUT_DIR, region_dir, subj_id)
     subj_out_path = os.path.join(OUTPUT_ROOT, split_name, subj_id)
 
-    ct_path = os.path.join(subj_src_path, "ct.nii")
-    mask_path = os.path.join(subj_src_path, "mask.nii")
-    # Using glob to find the moved_mr regardless of the specific parameters in filename
-    moved_mrs = sorted(glob.glob(os.path.join(subj_src_path, "moved_mr*.nii*")))
+    ct_path = os.path.join(subj_src_path, "ct.nii.gz")
+    mask_path = os.path.join(subj_src_path, "mask.nii.gz")
+    moved_mr_path = os.path.join(subj_src_path, "mr_moved.nii.gz")
 
     # Check for existence of all required files
     missing = []
     if not os.path.exists(ct_path):
-        missing.append("ct.nii")
+        missing.append("ct.nii.gz")
     if not os.path.exists(mask_path):
-        missing.append("mask.nii")
-    if not moved_mrs:
-        missing.append("moved_mr*.nii")
+        missing.append("mask.nii.gz")
+    if not os.path.exists(moved_mr_path):
+        missing.append("mr_moved.nii.gz")
 
     if missing:
         return subj_id, False, f"Missing files: {', '.join(missing)}"
-
-    moved_mr_path = moved_mrs[0]
 
     try:
         os.makedirs(subj_out_path, exist_ok=True)
@@ -72,7 +69,6 @@ def process_single_subject(args):
         subject = tio.Subject(ct=tio.ScalarImage(ct_path), mask=tio.LabelMap(mask_path), moved_mr=tio.ScalarImage(moved_mr_path))
 
         # 2. Resample (1.5mm isotropic)
-        # B-spline for scalars, Nearest Neighbor for labels
         resample = tio.Resample(TARGET_SPACING)
         resampled_subject = resample(subject)
 
@@ -97,17 +93,27 @@ def process_single_subject(args):
 def main():
     print("🚀 Starting Stratified Resampling (1.5mm Isotropic + Int16 + .nii)")
 
-    # --- Step 1: Discover All Subjects ---
-    all_subjects = sorted([d for d in os.listdir(INPUT_DIR) if os.path.isdir(os.path.join(INPUT_DIR, d))])
-    print(f"✅ Found {len(all_subjects)} total subjects in input directory.")
+    # --- Step 1: Discover All Subjects across region subfolders ---
+    regions = ["AB", "HN", "TH", "brain", "pelvis"]
+    all_tasks_data = []  # List of (subj_id, region_dir)
+
+    for r_dir in regions:
+        dir_path = os.path.join(INPUT_DIR, r_dir)
+        if not os.path.exists(dir_path):
+            continue
+        subs = [d for d in os.listdir(dir_path) if os.path.isdir(os.path.join(dir_path, d))]
+        for s in subs:
+            all_tasks_data.append((s, r_dir))
+
+    print(f"✅ Found {len(all_tasks_data)} total subjects in input directories.")
 
     # --- Step 2: Stratified Split ---
     region_groups = {}
-    for sid in all_subjects:
-        r = get_region_key(sid)
-        if r not in region_groups:
-            region_groups[r] = []
-        region_groups[r].append(sid)
+    for sid, r_dir in all_tasks_data:
+        r_key = get_region_key(sid)
+        if r_key not in region_groups:
+            region_groups[r_key] = []
+        region_groups[r_key].append((sid, r_dir))
 
     random.seed(42)
 
@@ -118,22 +124,22 @@ def main():
 
     processing_tasks = []
 
-    for region, sids in sorted(region_groups.items()):
-        random.shuffle(sids)
-        n = len(sids)
+    for region, entries in sorted(region_groups.items()):
+        random.shuffle(entries)
+        n = len(entries)
         n_train = int(n * SPLIT_RATIOS["train"])
         n_val = int(n * SPLIT_RATIOS["val"])
 
-        r_train = sids[:n_train]
-        r_val = sids[n_train : n_train + n_val]
-        r_test = sids[n_train + n_val :]
+        r_train = entries[:n_train]
+        r_val = entries[n_train : n_train + n_val]
+        r_test = entries[n_train + n_val :]
 
-        for sid in r_train:
-            processing_tasks.append((sid, "train"))
-        for sid in r_val:
-            processing_tasks.append((sid, "val"))
-        for sid in r_test:
-            processing_tasks.append((sid, "test"))
+        for sid, r_dir in r_train:
+            processing_tasks.append((sid, "train", r_dir))
+        for sid, r_dir in r_val:
+            processing_tasks.append((sid, "val", r_dir))
+        for sid, r_dir in r_test:
+            processing_tasks.append((sid, "test", r_dir))
 
         print(f"{region:<15} | {n:<6} | {len(r_train):<6} | {len(r_val):<6} | {len(r_test):<6}")
 
