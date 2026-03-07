@@ -99,7 +99,7 @@ class MAISITrainer:
             os.makedirs(local_root, exist_ok=True)
 
         inc_str = "--include='*/' --include='*.nii.gz' --include='datalist.json' --exclude='*'"
-        os.system(f"rsync -am --delete {inc_str} {self.gpfs_root}/ {local_root}/")
+        os.system(f"rsync -am --delete --info=progress2 {inc_str} {self.gpfs_root}/ {local_root}/")
         
         self.cfg['maisi_data_root'] = local_root
         print(f"[MAISI] ✅ Data synchronized. New root: {self.cfg['maisi_data_root']}")

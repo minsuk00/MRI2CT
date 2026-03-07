@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a40:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=5
 #SBATCH --mem=48g
 #SBATCH --time=48:00:00
 #SBATCH --mail-user=minsukc@umich.edu
@@ -12,8 +12,13 @@
 
 # --- Configuration Area ---
 PREFIX="unet"
+# RESUME_ID=""  # Leave empty if not resuming
+
 DICE_W=0.05
-RESUME_ID=""  # Leave empty if not resuming
+RESUME_ID="xmwpkopk"  # 0.05 dice
+
+# DICE_W=0.0
+# RESUME_ID="bpaq1s1o"  # 0.0 dice
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -51,3 +56,6 @@ fi
 
 echo "Running command: $CMD"
 $CMD
+
+# python src/unet_baseline/train.py --dice_w 0.05 --resume_id "xmwpkopk"
+# python src/unet_baseline/train.py --dice_w 0.0 --resume_id "bpaq1s1o"
