@@ -73,8 +73,8 @@ BASELINE_CONFIG = {
     "validate_dice": True,  # Optional Dice validation
     "enable_profiling": True,
     # "enable_profiling": False,
-    "patches_per_volume": 50,
-    "data_queue_max_length": 500,
+    "patches_per_volume": 10,
+    "data_queue_max_length": 100,
     "data_queue_num_workers": 4,
     # ----------------------
     # Experiment Basics
@@ -317,9 +317,15 @@ class BaselineTrainer:
         if "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-    def _setup_data(self, epoch=0):
+    def _setup_data(self, seed=None):
+        if seed is not None:
+            # Seed-based worker rotation for correct data coverage
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
         # 1. Reuse existing logic to find subjects (Skip if already done)
-        if not hasattr(self, "all_train_subjects"):
+        if not hasattr(self, "train_subjects"):
             print(f"[Baseline] 📂 Searching data in: {self.cfg.root_dir}")
 
             # Load seg if Dice weight > 0 or Dice validation is enabled
@@ -356,46 +362,17 @@ class BaselineTrainer:
 
             if self.cfg.subjects:
                 print(f"[Baseline] 🎯 Filtering subjects: {self.cfg.subjects}")
-                self.all_train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
-                self.val_subjects = self.all_train_subjects
+                self.train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
+                self.val_subjects = self.train_subjects
             else:
-                self.all_train_subjects = sorted(train_candidates)
-                self.val_subjects = sorted(val_candidates)
+                self.train_subjects = train_candidates
+                self.val_subjects = val_candidates
 
-            # Initial global shuffle
-            if not hasattr(self, "shuffled_train_deck"):
-                self.shuffled_train_deck = list(self.all_train_subjects)
-                self.deck_index = 0
-                self.deck_rng = random.Random(self.cfg.seed)
-                self.deck_rng.shuffle(self.shuffled_train_deck)
+            print(f"[Baseline] Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
 
-            print(f"[Baseline] Train: {len(self.all_train_subjects)} | Val: {len(self.val_subjects)}")
-
-        # Epoch Chunking Logic
-        if not self.cfg.subjects:
-            patches_needed = self.cfg.steps_per_epoch * self.cfg.batch_size
-            # Add a 20% safety buffer to guarantee we don't run out mid-epoch
-            subjects_needed = math.ceil((patches_needed * 1.2) / self.cfg.patches_per_volume)
-
-            chunk_subjects = []
-            subjects_left = len(self.shuffled_train_deck) - self.deck_index
-
-            if subjects_left >= subjects_needed:
-                chunk_subjects = self.shuffled_train_deck[self.deck_index : self.deck_index + subjects_needed]
-                self.deck_index += subjects_needed
-            else:
-                # Wrap around: take what's left, reshuffle, take remainder
-                chunk_subjects = self.shuffled_train_deck[self.deck_index :]
-                self.deck_rng.shuffle(self.shuffled_train_deck)
-
-                remainder = subjects_needed - len(chunk_subjects)
-                chunk_subjects += self.shuffled_train_deck[:remainder]
-                self.deck_index = remainder
-        else:
-            chunk_subjects = self.all_train_subjects
-
-        print(f"[Baseline] 🔄 Epoch {epoch}: Loading chunk of {len(chunk_subjects)} subjects.")
-
+        # 2. Build Datasets
+        # Load seg if Dice weight > 0 or Dice validation is enabled
+        load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
         # 2. Build Datasets
         # Load seg if Dice weight > 0 or Dice validation is enabled
         load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
@@ -423,7 +400,7 @@ class BaselineTrainer:
             return subj_list
 
         # Train Queue
-        train_objs = _make_subj_list(chunk_subjects, load_seg=load_seg)
+        train_objs = _make_subj_list(self.train_subjects, load_seg=load_seg)
         preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult, use_weighted_sampler=self.cfg.use_weighted_sampler)
         transforms = tio.Compose([preprocess, get_augmentations()]) if self.cfg.augment else preprocess
         train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
@@ -817,8 +794,8 @@ class BaselineTrainer:
 
                 pbar_dict.update({"dt": f"{avg_data:.1f}ms", "fwd": f"{avg_fwd:.1f}ms", "tot": f"{step_t_total:.2f}s", "lr": f"{current_lr:.2e}"})
 
-                # Log to WandB
-                if self.cfg.wandb and step_idx % 100 == 0:
+                # Log to WandB EVERY step for accurate profiling
+                if self.cfg.wandb:
                     wandb.log(
                         {
                             "info/time_data_ms": avg_data,
@@ -983,24 +960,6 @@ class BaselineTrainer:
         global_pbar = tqdm(range(self.start_epoch, self.cfg.total_epochs), desc="🚀 Total Progress", initial=self.start_epoch, total=self.cfg.total_epochs, dynamic_ncols=True, unit="ep")
 
         for epoch in global_pbar:
-            if epoch > self.start_epoch:
-                # ---------------------------------------------------
-                # AGGRESSIVE MEMORY CLEANUP TO PREVENT "GHOST MEMORY"
-                # ---------------------------------------------------
-                del self.train_iter
-                if hasattr(self.train_loader.dataset, "_subjects_iterable"):
-                    del self.train_loader.dataset._subjects_iterable
-                if hasattr(self.train_loader.dataset, "subjects_loader"):
-                    del self.train_loader.dataset.subjects_loader
-                self.train_loader.dataset.patches_list.clear()
-
-                del self.train_loader
-                gc.collect()
-                time.sleep(2)  # Give the OS a moment to reclaim the Shared Memory
-
-                # Load the next chunk of subjects
-                self._setup_data(epoch=epoch)
-
             ep_start = time.time()
             loss, comps, gn = self.train_epoch(epoch)
 

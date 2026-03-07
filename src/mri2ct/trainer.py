@@ -134,9 +134,15 @@ class Trainer:
             resume="allow" if not self.cfg.diverge_wandb_branch else None,
         )
 
-    def _setup_data(self, epoch=0):
+    def _setup_data(self, seed=None):
+        if seed is not None:
+            # Re-seed to ensure different shuffling after worker restart
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
         # 1. Reuse existing logic to find subjects (Skip if already done)
-        if not hasattr(self, "all_train_subjects"):
+        if not hasattr(self, "train_subjects"):
             print(f"[DEBUG] 📂 Searching for data in: {self.cfg.root_dir}")
 
             # Load seg if Dice weight > 0 or Dice validation is enabled
@@ -196,26 +202,18 @@ class Trainer:
                 print(f"[DEBUG] Filtering specific subjects: {self.cfg.subjects}")
                 # Filter candidates that end with the requested ID
                 # e.g., if requested '1ABA005', match 'train/1ABA005'
-                self.all_train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
-                self.val_subjects = self.all_train_subjects  # Validate on the same subject for overfitting
+                self.train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
+                self.val_subjects = self.train_subjects  # Validate on the same subject for overfitting
             else:
                 # Standard Mode: Use the existing splits
-                self.all_train_subjects = sorted(train_candidates)
-                self.val_subjects = sorted(val_candidates)
-                
-            # Initial global shuffle
-            if not hasattr(self, "shuffled_train_deck"):
-                import math
-                self.shuffled_train_deck = list(self.all_train_subjects)
-                self.deck_index = 0
-                self.deck_rng = random.Random(self.cfg.seed)
-                self.deck_rng.shuffle(self.shuffled_train_deck)
+                self.train_subjects = train_candidates
+                self.val_subjects = val_candidates
 
-            print(f"[DEBUG] Data Split - Train: {len(self.all_train_subjects)} | Val: {len(self.val_subjects)}")
+            print(f"[DEBUG] Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
 
             if self.cfg.analyze_shapes:
                 shapes = []
-                for s in tqdm(self.all_train_subjects[:30], desc="Analyzing Shapes (Sample)"):
+                for s in tqdm(self.train_subjects[:30], desc="Analyzing Shapes (Sample)"):
                     try:
                         p = get_subject_paths(self.cfg.root_dir, s, use_registered=self.cfg.use_registered_data)
                         sh = nib.load(p["mri"]).header.get_data_shape()
@@ -226,32 +224,6 @@ class Trainer:
                 if shapes:
                     avg_shape = np.mean(shapes, axis=0).astype(int)
                     print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
-
-        # Epoch Chunking Logic
-        if not self.cfg.subjects:
-            import math
-            patches_needed = self.cfg.steps_per_epoch * self.cfg.batch_size
-            # Add a 20% safety buffer to guarantee we don't run out mid-epoch
-            subjects_needed = math.ceil((patches_needed * 1.2) / self.cfg.patches_per_volume)
-            
-            chunk_subjects = []
-            subjects_left = len(self.shuffled_train_deck) - self.deck_index
-            
-            if subjects_left >= subjects_needed:
-                chunk_subjects = self.shuffled_train_deck[self.deck_index : self.deck_index + subjects_needed]
-                self.deck_index += subjects_needed
-            else:
-                # Wrap around: take what's left, reshuffle, take remainder
-                chunk_subjects = self.shuffled_train_deck[self.deck_index:]
-                self.deck_rng.shuffle(self.shuffled_train_deck)
-                
-                remainder = subjects_needed - len(chunk_subjects)
-                chunk_subjects += self.shuffled_train_deck[:remainder]
-                self.deck_index = remainder
-        else:
-            chunk_subjects = self.all_train_subjects
-            
-        print(f"[Trainer] 🔄 Epoch {epoch}: Loading chunk of {len(chunk_subjects)} subjects.")
 
         # 3. Helper to create paths
         def _make_subj_list(subjs, load_seg=False):
@@ -278,7 +250,7 @@ class Trainer:
         # 5. Train Loader (Queue)
         # Load seg if Dice weight > 0 or Dice validation is enabled
         load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
-        train_objs = _make_subj_list(chunk_subjects, load_seg=load_seg)
+        train_objs = _make_subj_list(self.train_subjects, load_seg=load_seg)
         # Main aligned with baseline: Disable safety padding by default
         use_safety = False
 
@@ -320,10 +292,11 @@ class Trainer:
                 iterator = iter(loader)
                 for batch in iterator:
                     yield batch
-                # CRITICAL FIX: Explicitly destroy the old iterator to kill bloated workers 
+                # CRITICAL FIX: Explicitly destroy the old iterator to kill bloated workers
                 # and flush fragmented RAM before starting the next full pass.
                 del iterator
                 import gc
+
                 gc.collect()
 
         self.train_iter = _inf_gen(self.train_loader)
@@ -1038,6 +1011,16 @@ class Trainer:
                 avg_batch_fwd = (step_t_fwd / self.cfg.accum_steps) * 1000
                 pbar_dict.update({"dt": f"{avg_batch_data:.1f}ms", "fwd": f"{avg_batch_fwd:.1f}ms", "tot": f"{step_t_total:.2f}s", "lr": f"{current_lr:.2e}"})
 
+                if self.cfg.wandb:
+                    wandb.log(
+                        {
+                            "info/time_data_ms": avg_batch_data,
+                            "info/time_forward_ms": avg_batch_fwd,
+                            "info/time_step_total_s": step_t_total,
+                        },
+                        step=self.global_step,
+                    )
+
             pbar.set_postfix(pbar_dict)
 
             # Log step-level info to WandB
@@ -1051,15 +1034,6 @@ class Trainer:
                     "info/epoch": epoch,
                     "info/cumulative_time": cumulative_time,
                 }
-
-                if self.cfg.enable_profiling:
-                    log_dict.update(
-                        {
-                            "info/time_data(ms)": avg_batch_data,
-                            "info/time_forward(ms)": avg_batch_fwd,
-                            "info/time_step_total(s)": step_t_total,
-                        }
-                    )
                 wandb.log(log_dict, step=self.global_step)
 
             # ---------------------------------------------------------
@@ -1220,24 +1194,6 @@ class Trainer:
         global_pbar = tqdm(range(self.start_epoch, self.cfg.total_epochs), desc="🚀 Total Progress", initial=self.start_epoch, total=self.cfg.total_epochs, dynamic_ncols=True, unit="ep")
 
         for epoch in global_pbar:
-            if epoch > self.start_epoch:
-                # ---------------------------------------------------
-                # AGGRESSIVE MEMORY CLEANUP TO PREVENT "GHOST MEMORY"
-                # ---------------------------------------------------
-                del self.train_iter
-                if hasattr(self.train_loader.dataset, '_subjects_iterable'):
-                    del self.train_loader.dataset._subjects_iterable
-                if hasattr(self.train_loader.dataset, 'subjects_loader'):
-                    del self.train_loader.dataset.subjects_loader
-                self.train_loader.dataset.patches_list.clear()
-                
-                del self.train_loader
-                gc.collect()
-                time.sleep(2) # Give the OS a moment to reclaim the Shared Memory
-                
-                # Load the next chunk of subjects
-                self._setup_data(epoch=epoch)
-                
             ep_start = time.time()
             loss, comps, gn = self.train_epoch(epoch)
 
@@ -1268,7 +1224,7 @@ class Trainer:
 
             if epoch % self.cfg.model_save_interval == 0:
                 self.save_checkpoint(epoch)
-            
+
             # Explicit cleanup after each epoch
             gc.collect()
             torch.cuda.empty_cache()
