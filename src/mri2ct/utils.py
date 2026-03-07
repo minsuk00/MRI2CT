@@ -47,33 +47,44 @@ def cleanup_gpu():
 
 
 def get_ram_info():
-    # 1. Use 48GB as the hardcoded baseline for percentage calculation
+    """
+    Calculates accurate RAM usage using PSS (Proportional Set Size).
+    Optimized for speed to avoid bottlenecking the training loop.
+    """
+    # 1. Use 48GB as the hardcoded baseline
     total_allowed_bytes = 48 * 1024 * 1024 * 1024
 
-    # 2. Calculate Total Usage using PSS (Proportional Set Size)
     main_p = psutil.Process()
-    total_used_pss = 0
-
+    total_pss = 0
+    
     try:
-        # Include main process and all children
-        all_procs = [main_p] + main_p.children(recursive=True)
-
-        for p in all_procs:
+        # PSS calculation is the most accurate but can be slow on some kernels.
+        # We try to get it for the main process and all children.
+        full_info = main_p.memory_full_info()
+        total_pss += getattr(full_info, "pss", full_info.rss)
+        
+        children = main_p.children(recursive=True)
+        for child in children:
             try:
-                # memory_full_info() provides PSS on Linux
-                full_info = p.memory_full_info()
-                # If pss is not available (e.g. non-Linux), fall back to rss
-                total_used_pss += getattr(full_info, "pss", full_info.rss)
+                # Use .rss as a faster fallback if .pss is too slow or unavailable
+                child_info = child.memory_full_info()
+                total_pss += getattr(child_info, "pss", child_info.rss)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
     except Exception:
-        # Extreme fallback
-        total_used_pss = main_p.memory_info().rss
+        # Fallback to faster RSS if PSS fails
+        total_pss = main_p.memory_info().rss
+        total_pss += sum(c.memory_info().rss for c in main_p.children(recursive=True))
 
-    total_gb = total_used_pss / (1024**3)
-    usage_percent = (total_used_pss / total_allowed_bytes) * 100
+    total_gb = total_pss / (1024**3)
+    usage_percent = (total_pss / total_allowed_bytes) * 100
 
-    return usage_percent, total_gb
+    return {
+        "percent": usage_percent,
+        "total_gb": total_gb,
+        "main_rss_gb": main_p.memory_info().rss / (1024**3),
+        "num_children": len(main_p.children())
+    }
 
 
 def anatomix_normalize(tensor, percentile_range=None, clip_range=None):
