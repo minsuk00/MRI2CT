@@ -75,7 +75,7 @@ BASELINE_CONFIG = {
     # "enable_profiling": False,
     "patches_per_volume": 50,
     "data_queue_max_length": 500,
-    "data_queue_num_workers": 10,
+    "data_queue_num_workers": 4,
     # ----------------------
     # Experiment Basics
     "project_name": "MRI2CT_UNet_Baseline",
@@ -87,7 +87,6 @@ BASELINE_CONFIG = {
     # Data
     "patch_size": 128,  # Same as main
     "res_mult": 16,  # Divisibility requirement
-    "augment": True,
     # Model Architecture (Baseline U-Net)
     "input_nc": 1,
     "output_nc": 1,
@@ -110,7 +109,6 @@ BASELINE_CONFIG = {
     "val_sw_batch_size": 8,
     "val_sw_overlap": 0.25,
     "save_val_volumes": True,
-    "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/predictions",
     # Mode
     "sanity_check": False,
     # "subjects": ["1ABA005"], # Uncomment for single subject overfitting test
@@ -192,7 +190,7 @@ class BaselineTrainer:
             dst = os.path.join(local_root, split)
             if os.path.exists(src):
                 print(f"  - Syncing {split}...")
-                os.system(f"rsync -am {inc_str} {src}/ {dst}/")
+                os.system(f"rsync -am --info=progress2 {inc_str} {src}/ {dst}/")
 
         self.cfg.root_dir = local_root
         print(f"[Baseline] ✅ Data staged. New root: {self.cfg.root_dir}")
@@ -319,51 +317,84 @@ class BaselineTrainer:
         if "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-    def _setup_data(self):
-        # 1. Reuse existing logic to find subjects
-        print(f"[Baseline] 📂 Searching data in: {self.cfg.root_dir}")
+    def _setup_data(self, epoch=0):
+        # 1. Reuse existing logic to find subjects (Skip if already done)
+        if not hasattr(self, "all_train_subjects"):
+            print(f"[Baseline] 📂 Searching data in: {self.cfg.root_dir}")
 
-        # Load seg if Dice weight > 0 or Dice validation is enabled
-        load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
+            # Load seg if Dice weight > 0 or Dice validation is enabled
+            load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
 
-        def scan_split(split_name):
-            split_dir = os.path.join(self.cfg.root_dir, split_name)
-            if not os.path.exists(split_dir):
-                return []
-            valid_subjs = []
-            for d in sorted(os.listdir(split_dir)):
-                subj_path = os.path.join(split_dir, d)
-                if not os.path.isdir(subj_path):
-                    continue
-                has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz")) or os.path.exists(os.path.join(subj_path, "ct.nii"))
-                if self.cfg.use_registered_data:
-                    has_mr = len(glob(os.path.join(subj_path, "moved_mr*.nii*"))) > 0
-                else:
-                    has_mr = os.path.exists(os.path.join(subj_path, "mr.nii.gz")) or os.path.exists(os.path.join(subj_path, "mr.nii"))
+            def scan_split(split_name):
+                split_dir = os.path.join(self.cfg.root_dir, split_name)
+                if not os.path.exists(split_dir):
+                    return []
+                valid_subjs = []
+                for d in sorted(os.listdir(split_dir)):
+                    subj_path = os.path.join(split_dir, d)
+                    if not os.path.isdir(subj_path):
+                        continue
+                    has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz")) or os.path.exists(os.path.join(subj_path, "ct.nii"))
+                    if self.cfg.use_registered_data:
+                        has_mr = len(glob(os.path.join(subj_path, "moved_mr*.nii*"))) > 0
+                    else:
+                        has_mr = os.path.exists(os.path.join(subj_path, "mr.nii.gz")) or os.path.exists(os.path.join(subj_path, "mr.nii"))
 
-                # Check for segmentation if Dice is needed
-                has_seg = True
-                if load_seg:
-                    has_seg = os.path.exists(os.path.join(subj_path, "ct_seg.nii"))
+                    # Check for segmentation if Dice is needed
+                    has_seg = True
+                    if load_seg:
+                        has_seg = os.path.exists(os.path.join(subj_path, "ct_seg.nii"))
 
-                if has_ct and has_mr and has_seg:
-                    valid_subjs.append(os.path.join(split_name, d))
-                elif not has_seg and load_seg:
-                    print(f"  [Skip] {os.path.join(split_name, d)}: Missing segmentation.")
-            return valid_subjs
+                    if has_ct and has_mr and has_seg:
+                        valid_subjs.append(os.path.join(split_name, d))
+                    elif not has_seg and load_seg:
+                        print(f"  [Skip] {os.path.join(split_name, d)}: Missing segmentation.")
+                return valid_subjs
 
-        train_candidates = scan_split("train")
-        val_candidates = scan_split("val")
+            train_candidates = scan_split("train")
+            val_candidates = scan_split("val")
 
-        if self.cfg.subjects:
-            print(f"[Baseline] 🎯 Filtering subjects: {self.cfg.subjects}")
-            self.train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
-            self.val_subjects = self.train_subjects
+            if self.cfg.subjects:
+                print(f"[Baseline] 🎯 Filtering subjects: {self.cfg.subjects}")
+                self.all_train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
+                self.val_subjects = self.all_train_subjects
+            else:
+                self.all_train_subjects = sorted(train_candidates)
+                self.val_subjects = sorted(val_candidates)
+
+            # Initial global shuffle
+            if not hasattr(self, "shuffled_train_deck"):
+                self.shuffled_train_deck = list(self.all_train_subjects)
+                self.deck_index = 0
+                self.deck_rng = random.Random(self.cfg.seed)
+                self.deck_rng.shuffle(self.shuffled_train_deck)
+
+            print(f"[Baseline] Train: {len(self.all_train_subjects)} | Val: {len(self.val_subjects)}")
+
+        # Epoch Chunking Logic
+        if not self.cfg.subjects:
+            patches_needed = self.cfg.steps_per_epoch * self.cfg.batch_size
+            # Add a 20% safety buffer to guarantee we don't run out mid-epoch
+            subjects_needed = math.ceil((patches_needed * 1.2) / self.cfg.patches_per_volume)
+
+            chunk_subjects = []
+            subjects_left = len(self.shuffled_train_deck) - self.deck_index
+
+            if subjects_left >= subjects_needed:
+                chunk_subjects = self.shuffled_train_deck[self.deck_index : self.deck_index + subjects_needed]
+                self.deck_index += subjects_needed
+            else:
+                # Wrap around: take what's left, reshuffle, take remainder
+                chunk_subjects = self.shuffled_train_deck[self.deck_index :]
+                self.deck_rng.shuffle(self.shuffled_train_deck)
+
+                remainder = subjects_needed - len(chunk_subjects)
+                chunk_subjects += self.shuffled_train_deck[:remainder]
+                self.deck_index = remainder
         else:
-            self.train_subjects = train_candidates
-            self.val_subjects = val_candidates
+            chunk_subjects = self.all_train_subjects
 
-        print(f"[Baseline] Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
+        print(f"[Baseline] 🔄 Epoch {epoch}: Loading chunk of {len(chunk_subjects)} subjects.")
 
         # 2. Build Datasets
         # Load seg if Dice weight > 0 or Dice validation is enabled
@@ -392,7 +423,7 @@ class BaselineTrainer:
             return subj_list
 
         # Train Queue
-        train_objs = _make_subj_list(self.train_subjects, load_seg=load_seg)
+        train_objs = _make_subj_list(chunk_subjects, load_seg=load_seg)
         preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult, use_weighted_sampler=self.cfg.use_weighted_sampler)
         transforms = tio.Compose([preprocess, get_augmentations()]) if self.cfg.augment else preprocess
         train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
@@ -414,10 +445,18 @@ class BaselineTrainer:
         )
         self.train_loader = tio.SubjectsLoader(queue, batch_size=self.cfg.batch_size, num_workers=0)
 
+        # Create infinite iterator (Must re-bind every time loader is created)
         def _inf_gen(loader):
             while True:
-                for batch in loader:
+                iterator = iter(loader)
+                for batch in iterator:
                     yield batch
+                # CRITICAL FIX: Explicitly destroy the old iterator to kill bloated workers
+                # and flush fragmented RAM before starting the next full pass.
+                del iterator
+                import gc
+
+                gc.collect()
 
         self.train_iter = _inf_gen(self.train_loader)
 
@@ -808,15 +847,26 @@ class BaselineTrainer:
             # RAM 모니터링 (Optional)
             # ---------------------------------------------------------
             if self.cfg.wandb and self.cfg.enable_profiling and step_idx % 200 == 0:
-                sys_percent, app_gb = get_ram_info()
+                ram_info = get_ram_info()
 
                 queue = self.train_loader.dataset
                 curr_patches = len(queue.patches_list)
 
-                wandb.log({"perf/ram_system_percent": sys_percent, "perf/ram_app_total_gb": app_gb, "perf/queue_curr_patches": curr_patches}, step=self.global_step)
+                wandb.log(
+                    {
+                        "perf/ram_system_percent": ram_info["percent"],
+                        "perf/ram_app_total_gb": ram_info["total_gb"],
+                        "perf/ram_main_rss_gb": ram_info["main_rss_gb"],
+                        "perf/num_workers": ram_info["num_children"],
+                        "perf/queue_curr_patches": curr_patches,
+                    },
+                    step=self.global_step,
+                )
 
-                if sys_percent > 90:
-                    tqdm.write(f"[WARNING] ⚠️ RAM usage critical: {sys_percent}% (App: {app_gb:.2f} GB)")
+                if ram_info["percent"] > 90:
+                    tqdm.write(f"[WARNING] ⚠️ RAM usage critical: {ram_info['percent']:.1f}% (Total: {ram_info['total_gb']:.2f} GB)")
+                    gc.collect()
+                    torch.cuda.empty_cache()
             # ---------------------------------------------------------
 
         return total_loss / self.cfg.steps_per_epoch, {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, total_grad / self.cfg.steps_per_epoch
@@ -933,8 +983,25 @@ class BaselineTrainer:
         global_pbar = tqdm(range(self.start_epoch, self.cfg.total_epochs), desc="🚀 Total Progress", initial=self.start_epoch, total=self.cfg.total_epochs, dynamic_ncols=True, unit="ep")
 
         for epoch in global_pbar:
-            ep_start = time.time()
+            if epoch > self.start_epoch:
+                # ---------------------------------------------------
+                # AGGRESSIVE MEMORY CLEANUP TO PREVENT "GHOST MEMORY"
+                # ---------------------------------------------------
+                del self.train_iter
+                if hasattr(self.train_loader.dataset, "_subjects_iterable"):
+                    del self.train_loader.dataset._subjects_iterable
+                if hasattr(self.train_loader.dataset, "subjects_loader"):
+                    del self.train_loader.dataset.subjects_loader
+                self.train_loader.dataset.patches_list.clear()
 
+                del self.train_loader
+                gc.collect()
+                time.sleep(2)  # Give the OS a moment to reclaim the Shared Memory
+
+                # Load the next chunk of subjects
+                self._setup_data(epoch=epoch)
+
+            ep_start = time.time()
             loss, comps, gn = self.train_epoch(epoch)
 
             # Validation interval
@@ -965,6 +1032,10 @@ class BaselineTrainer:
 
             if epoch % self.cfg.model_save_interval == 0:
                 self.save_model(epoch)
+
+            # Explicit cleanup after each epoch
+            gc.collect()
+            torch.cuda.empty_cache()
 
         self.save_model(self.cfg.total_epochs, is_final=True)
         if self.cfg.wandb:

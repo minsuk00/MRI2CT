@@ -106,7 +106,7 @@ class Trainer:
             dst = os.path.join(local_root, split)
             if os.path.exists(src):
                 print(f"  - Syncing {split}...")
-                os.system(f"rsync -am {inc_str} {src}/ {dst}/")
+                os.system(f"rsync -am --info=progress2 {inc_str} {src}/ {dst}/")
 
         self.cfg.root_dir = local_root
         print(f"[Trainer] ✅ Data staged. New root: {self.cfg.root_dir}")
@@ -134,88 +134,124 @@ class Trainer:
             resume="allow" if not self.cfg.diverge_wandb_branch else None,
         )
 
-    def _setup_data(self):
-        print(f"[DEBUG] 📂 Searching for data in: {self.cfg.root_dir}")
+    def _setup_data(self, epoch=0):
+        # 1. Reuse existing logic to find subjects (Skip if already done)
+        if not hasattr(self, "all_train_subjects"):
+            print(f"[DEBUG] 📂 Searching for data in: {self.cfg.root_dir}")
 
-        # Load seg if Dice weight > 0 or Dice validation is enabled
-        load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
+            # Load seg if Dice weight > 0 or Dice validation is enabled
+            load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
 
-        # Helper to scan a folder
-        def scan_split(split_name):
-            split_dir = os.path.join(self.cfg.root_dir, split_name)
-            if not os.path.exists(split_dir):
-                return []
+            # Helper to scan a folder
+            def scan_split(split_name):
+                split_dir = os.path.join(self.cfg.root_dir, split_name)
+                if not os.path.exists(split_dir):
+                    return []
 
-            valid_subjs = []
-            for d in sorted(os.listdir(split_dir)):
-                subj_path = os.path.join(split_dir, d)
-                if not os.path.isdir(subj_path):
-                    continue
+                valid_subjs = []
+                for d in sorted(os.listdir(split_dir)):
+                    subj_path = os.path.join(split_dir, d)
+                    if not os.path.isdir(subj_path):
+                        continue
 
-                subj_id = os.path.join(split_name, d)
+                    subj_id = os.path.join(split_name, d)
 
-                # 1. Check CT
-                has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz")) or os.path.exists(os.path.join(subj_path, "ct.nii"))
+                    # 1. Check CT
+                    has_ct = os.path.exists(os.path.join(subj_path, "ct.nii.gz")) or os.path.exists(os.path.join(subj_path, "ct.nii"))
 
-                # 2. Check MRI
-                if self.cfg.use_registered_data:
-                    mr_files = glob(os.path.join(subj_path, "moved_mr*.nii*"))
-                    has_mr = len(mr_files) > 0
-                else:
-                    has_mr = os.path.exists(os.path.join(subj_path, "mr.nii.gz"))
+                    # 2. Check MRI
+                    if self.cfg.use_registered_data:
+                        mr_files = glob(os.path.join(subj_path, "moved_mr*.nii*"))
+                        has_mr = len(mr_files) > 0
+                    else:
+                        has_mr = os.path.exists(os.path.join(subj_path, "mr.nii.gz"))
 
-                # 3. Check Segmentation
-                has_seg = True
-                if load_seg:
-                    has_seg = os.path.exists(os.path.join(subj_path, "ct_seg.nii"))
+                    # 3. Check Segmentation
+                    has_seg = True
+                    if load_seg:
+                        has_seg = os.path.exists(os.path.join(subj_path, "ct_seg.nii"))
 
-                # 4. Filter logic with detailed logging
-                if has_ct and has_mr and has_seg:
-                    valid_subjs.append(subj_id)
-                else:
-                    reasons = []
-                    if not has_ct:
-                        reasons.append("CT")
-                    if not has_mr:
-                        reasons.append("MRI")
-                    if not has_seg and load_seg:
-                        reasons.append("ct_seg.nii")
+                    # 4. Filter logic with detailed logging
+                    if has_ct and has_mr and has_seg:
+                        valid_subjs.append(subj_id)
+                    else:
+                        reasons = []
+                        if not has_ct:
+                            reasons.append("CT")
+                        if not has_mr:
+                            reasons.append("MRI")
+                        if not has_seg and load_seg:
+                            reasons.append("ct_seg.nii")
 
-                    if reasons:
-                        print(f"  [Skip] {subj_id:20} | Missing: {', '.join(reasons)}")
+                        if reasons:
+                            print(f"  [Skip] {subj_id:20} | Missing: {', '.join(reasons)}")
 
-            return valid_subjs
+                return valid_subjs
 
-        train_candidates = scan_split("train")
-        val_candidates = scan_split("val")
+            train_candidates = scan_split("train")
+            val_candidates = scan_split("val")
 
-        # Logic for 'subjects' (Single Image Optimization)
-        if self.cfg.subjects:
-            print(f"[DEBUG] Filtering specific subjects: {self.cfg.subjects}")
-            # Filter candidates that end with the requested ID
-            # e.g., if requested '1ABA005', match 'train/1ABA005'
-            self.train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
-            self.val_subjects = self.train_subjects  # Validate on the same subject for overfitting
+            # Logic for 'subjects' (Single Image Optimization)
+            if self.cfg.subjects:
+                print(f"[DEBUG] Filtering specific subjects: {self.cfg.subjects}")
+                # Filter candidates that end with the requested ID
+                # e.g., if requested '1ABA005', match 'train/1ABA005'
+                self.all_train_subjects = [c for c in train_candidates + val_candidates if os.path.basename(c) in self.cfg.subjects]
+                self.val_subjects = self.all_train_subjects  # Validate on the same subject for overfitting
+            else:
+                # Standard Mode: Use the existing splits
+                self.all_train_subjects = sorted(train_candidates)
+                self.val_subjects = sorted(val_candidates)
+                
+            # Initial global shuffle
+            if not hasattr(self, "shuffled_train_deck"):
+                import math
+                self.shuffled_train_deck = list(self.all_train_subjects)
+                self.deck_index = 0
+                self.deck_rng = random.Random(self.cfg.seed)
+                self.deck_rng.shuffle(self.shuffled_train_deck)
+
+            print(f"[DEBUG] Data Split - Train: {len(self.all_train_subjects)} | Val: {len(self.val_subjects)}")
+
+            if self.cfg.analyze_shapes:
+                shapes = []
+                for s in tqdm(self.all_train_subjects[:30], desc="Analyzing Shapes (Sample)"):
+                    try:
+                        p = get_subject_paths(self.cfg.root_dir, s, use_registered=self.cfg.use_registered_data)
+                        sh = nib.load(p["mri"]).header.get_data_shape()
+                        shapes.append(sh[:3])  # Only take X, Y, Z
+                    except Exception:
+                        print(f"  [WARNING] Failed to load {s} for shape analysis.")
+                        pass
+                if shapes:
+                    avg_shape = np.mean(shapes, axis=0).astype(int)
+                    print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
+
+        # Epoch Chunking Logic
+        if not self.cfg.subjects:
+            import math
+            patches_needed = self.cfg.steps_per_epoch * self.cfg.batch_size
+            # Add a 20% safety buffer to guarantee we don't run out mid-epoch
+            subjects_needed = math.ceil((patches_needed * 1.2) / self.cfg.patches_per_volume)
+            
+            chunk_subjects = []
+            subjects_left = len(self.shuffled_train_deck) - self.deck_index
+            
+            if subjects_left >= subjects_needed:
+                chunk_subjects = self.shuffled_train_deck[self.deck_index : self.deck_index + subjects_needed]
+                self.deck_index += subjects_needed
+            else:
+                # Wrap around: take what's left, reshuffle, take remainder
+                chunk_subjects = self.shuffled_train_deck[self.deck_index:]
+                self.deck_rng.shuffle(self.shuffled_train_deck)
+                
+                remainder = subjects_needed - len(chunk_subjects)
+                chunk_subjects += self.shuffled_train_deck[:remainder]
+                self.deck_index = remainder
         else:
-            # Standard Mode: Use the existing splits
-            self.train_subjects = train_candidates
-            self.val_subjects = val_candidates
-
-        print(f"[DEBUG] Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
-
-        if self.cfg.analyze_shapes:
-            shapes = []
-            for s in tqdm(self.train_subjects[:30], desc="Analyzing Shapes (Sample)"):
-                try:
-                    p = get_subject_paths(self.cfg.root_dir, s, use_registered=self.cfg.use_registered_data)
-                    sh = nib.load(p["mri"]).header.get_data_shape()
-                    shapes.append(sh[:3])  # Only take X, Y, Z
-                except Exception:
-                    print(f"  [WARNING] Failed to load {s} for shape analysis.")
-                    pass
-            if shapes:
-                avg_shape = np.mean(shapes, axis=0).astype(int)
-                print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
+            chunk_subjects = self.all_train_subjects
+            
+        print(f"[Trainer] 🔄 Epoch {epoch}: Loading chunk of {len(chunk_subjects)} subjects.")
 
         # 3. Helper to create paths
         def _make_subj_list(subjs, load_seg=False):
@@ -242,7 +278,7 @@ class Trainer:
         # 5. Train Loader (Queue)
         # Load seg if Dice weight > 0 or Dice validation is enabled
         load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
-        train_objs = _make_subj_list(self.train_subjects, load_seg=load_seg)
+        train_objs = _make_subj_list(chunk_subjects, load_seg=load_seg)
         # Main aligned with baseline: Disable safety padding by default
         use_safety = False
 
@@ -278,11 +314,17 @@ class Trainer:
         )
         self.train_loader = tio.SubjectsLoader(queue, batch_size=self.cfg.batch_size, num_workers=0)
 
-        # Create infinite iterator
+        # Create infinite iterator (Must re-bind every time loader is created)
         def _inf_gen(loader):
             while True:
-                for batch in loader:
+                iterator = iter(loader)
+                for batch in iterator:
                     yield batch
+                # CRITICAL FIX: Explicitly destroy the old iterator to kill bloated workers 
+                # and flush fragmented RAM before starting the next full pass.
+                del iterator
+                import gc
+                gc.collect()
 
         self.train_iter = _inf_gen(self.train_loader)
 
@@ -1024,15 +1066,26 @@ class Trainer:
             # RAM 모니터링 (Optional)
             # ---------------------------------------------------------
             if self.cfg.wandb and self.cfg.enable_profiling and step_idx % 200 == 0:
-                sys_percent, app_gb = get_ram_info()
+                ram_info = get_ram_info()
 
                 queue = self.train_loader.dataset
                 curr_patches = len(queue.patches_list)
 
-                wandb.log({"perf/ram_system_percent": sys_percent, "perf/ram_app_total_gb": app_gb, "perf/queue_curr_patches": curr_patches}, step=self.global_step)
+                wandb.log(
+                    {
+                        "perf/ram_system_percent": ram_info["percent"],
+                        "perf/ram_app_total_gb": ram_info["total_gb"],
+                        "perf/ram_main_rss_gb": ram_info["main_rss_gb"],
+                        "perf/num_workers": ram_info["num_children"],
+                        "perf/queue_curr_patches": curr_patches,
+                    },
+                    step=self.global_step,
+                )
 
-                if sys_percent > 90:
-                    tqdm.write(f"[WARNING] ⚠️ RAM usage critical: {sys_percent}% (App: {app_gb:.2f} GB)")
+                if ram_info["percent"] > 90:
+                    tqdm.write(f"[WARNING] ⚠️ RAM usage critical: {ram_info['percent']:.1f}% (Total: {ram_info['total_gb']:.2f} GB)")
+                    gc.collect()
+                    torch.cuda.empty_cache()
             # ---------------------------------------------------------
 
         return total_loss / self.cfg.steps_per_epoch, {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, total_grad / self.cfg.steps_per_epoch
@@ -1167,8 +1220,25 @@ class Trainer:
         global_pbar = tqdm(range(self.start_epoch, self.cfg.total_epochs), desc="🚀 Total Progress", initial=self.start_epoch, total=self.cfg.total_epochs, dynamic_ncols=True, unit="ep")
 
         for epoch in global_pbar:
+            if epoch > self.start_epoch:
+                # ---------------------------------------------------
+                # AGGRESSIVE MEMORY CLEANUP TO PREVENT "GHOST MEMORY"
+                # ---------------------------------------------------
+                del self.train_iter
+                if hasattr(self.train_loader.dataset, '_subjects_iterable'):
+                    del self.train_loader.dataset._subjects_iterable
+                if hasattr(self.train_loader.dataset, 'subjects_loader'):
+                    del self.train_loader.dataset.subjects_loader
+                self.train_loader.dataset.patches_list.clear()
+                
+                del self.train_loader
+                gc.collect()
+                time.sleep(2) # Give the OS a moment to reclaim the Shared Memory
+                
+                # Load the next chunk of subjects
+                self._setup_data(epoch=epoch)
+                
             ep_start = time.time()
-
             loss, comps, gn = self.train_epoch(epoch)
 
             if (epoch % self.cfg.val_interval == 0) or (epoch + 1) == self.cfg.total_epochs:
@@ -1198,6 +1268,10 @@ class Trainer:
 
             if epoch % self.cfg.model_save_interval == 0:
                 self.save_checkpoint(epoch)
+            
+            # Explicit cleanup after each epoch
+            gc.collect()
+            torch.cuda.empty_cache()
 
         self.save_checkpoint(self.cfg.total_epochs, is_final=True)
         if self.cfg.wandb:

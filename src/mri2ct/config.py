@@ -25,9 +25,9 @@ DEFAULT_CONFIG = {
     "dataset_spacing": [1.5, 1.5, 1.5],
     "augment": True,
     "patch_size": 128,
-    "patches_per_volume": 40,
-    "data_queue_max_length": 400,
-    "data_queue_num_workers": 6,
+    "patches_per_volume": 50,
+    "data_queue_max_length": 500,
+    "data_queue_num_workers": 4,
     "anatomix_weights": "v2",  # "v1", "v2"
     "teacher_weights_path": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs/wandb/run-20260222_160128-p0i9chz3/files/seg_baby_unet_epoch_499.pth",
     "res_mult": 32,

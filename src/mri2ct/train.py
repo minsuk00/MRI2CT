@@ -47,7 +47,7 @@ EXPERIMENT_CONFIG = [
         # "enable_profiling": False,
         "patches_per_volume": 50,
         "data_queue_max_length": 500,
-        "data_queue_num_workers": 10,
+        "data_queue_num_workers": 4,
         # --------------------
         # "subjects": ["1ABA011"],
         "viz_limit": 10,
