@@ -185,11 +185,17 @@ def main():
 
     # 3. Anatomix Inference
     print("🏗️ Running Anatomix MRI2CT...")
-    feat_extractor = Unet(3, 1, 16, 5, 20, norm="instance", interp="trilinear", pooling="Avg").to(device)
-    translator = Unet(dimension=3, input_nc=16, output_nc=1, num_downs=4, ngf=16, final_act="sigmoid").to(device)
-
     amix_ckpt = torch.load(args.amix_ckpt, map_location=device)
     translator_state = clean_state_dict(amix_ckpt["model_state_dict"])
+
+    # Detect input channels from checkpoint
+    first_conv_weight = translator_state.get('model.0.weight', None)
+    translator_input_nc = first_conv_weight.shape[1] if first_conv_weight is not None else 16
+    print(f"   [INFO] Detected Translator Input Channels: {translator_input_nc}")
+
+    feat_extractor = Unet(3, 1, 16, 5, 20, norm="instance", interp="trilinear", pooling="Avg").to(device)
+    translator = Unet(dimension=3, input_nc=translator_input_nc, output_nc=1, num_downs=4, ngf=16, final_act="sigmoid").to(device)
+
     translator.load_state_dict(translator_state, strict=True)
 
     if "feat_extractor_state_dict" in amix_ckpt:
@@ -208,8 +214,10 @@ def main():
     translator.eval()
 
     def amix_forward(x):
-        return translator(feat_extractor(x))
-
+        f = feat_extractor(x)
+        if translator_input_nc > 16:
+            f = torch.cat([f, x], dim=1)
+        return translator(f)
     with torch.autocast(device_type="cuda" if "cuda" in args.device else "cpu", dtype=torch.bfloat16):
         pred_amix = sliding_window_inference(
             inputs=mri_tensor,
