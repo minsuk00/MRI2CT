@@ -43,10 +43,10 @@ EXPERIMENT_CONFIG = [
         "diverge_wandb_branch": False,  # Create new run instead of resuming existing
         "dice_w": 0.05,
         "validate_dice": True,
-        "enable_profiling": True,
-        # "enable_profiling": False,
-        "patches_per_volume": 50,
-        "data_queue_max_length": 500,
+        # "enable_profiling": True,
+        "enable_profiling": False,
+        "patches_per_volume": 15,
+        "data_queue_max_length": 150,
         "data_queue_num_workers": 4,
         # --------------------
         # "subjects": ["1ABA011"],

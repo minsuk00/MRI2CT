@@ -74,9 +74,9 @@ class Trainer:
         user_id = os.environ.get("USER", "default")
         # Extract resolution string (e.g., '1.5x1.5x1.5mm') from GPFS path to differentiate cache
         res_str = os.path.basename(self.gpfs_root.rstrip("/"))
-        local_root = os.path.join("/tmp_data", f"mri2ct_{user_id}_{res_str}")
+        local_root = os.path.join("/tmp", f"mri2ct_{user_id}_{res_str}")
 
-        if not os.path.exists("/tmp_data") or not os.access("/tmp_data", os.W_OK):
+        if not os.path.exists("/tmp") or not os.access("/tmp", os.W_OK):
             print("[Trainer] ⚠️ Local storage not available. Staying on GPFS.")
             return
 
@@ -832,9 +832,8 @@ class Trainer:
             wandb.log({f"viz/{('val_' + str(idx))}": wandb.Image(fig, caption=caption)}, step=step)
         plt.close(fig)
 
-    # Added method to visualize training patches
     @torch.inference_mode()
-    def _log_training_patch(self, mri, ct, pred, step, batch_idx, seg=None, pred_probs=None):
+    def _log_training_patch(self, mri, ct, pred, step, batch_idx, seg=None, pred_probs=None, subj_id=None):
         """
         Visualizes MRI, Prediction, and CT (GT) for the first patch in the batch.
         Optionally overlays Segmentation (GT) and Predicted Probs (Argmax).
@@ -918,7 +917,8 @@ class Trainer:
 
         plt.tight_layout()
 
-        wandb.log({"train/patch_viz": wandb.Image(fig)}, step=step)
+        caption = f"Subject: {subj_id}" if subj_id else None
+        wandb.log({"train/patch_viz": wandb.Image(fig, caption=caption)}, step=step)
         plt.close(fig)
 
     # ==========================================
@@ -978,7 +978,8 @@ class Trainer:
 
                 # Log patch (using the returned predictions)
                 if self.cfg.wandb and step_idx == 0:
-                    self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg, pred_probs)
+                    subj_id = batch["subj_id"][0] if "subj_id" in batch else None
+                    self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg, pred_probs, subj_id=subj_id)
 
                 for k, v in comps.items():
                     # Handle both tensors (from compiled step) and scalars
@@ -1110,12 +1111,8 @@ class Trainer:
             ct_unpad = unpad(ct, orig_shape, pad_offset)
             met = compute_metrics(pred_unpad, ct_unpad)
 
-            # Loss (Composite)
-            l_val, _ = self.loss_fn(pred, ct)
-            met["loss"] = l_val.item()
-
-            # Validation Dice (Semantic Consistency)
-            # Only run if enabled in config, as Teacher inference is heavy
+            # Validation Dice & Probabilities
+            pred_probs = None
             if getattr(self.cfg, "validate_dice", False) and self.teacher_model is not None and seg is not None:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     # Always use sliding window for teacher on full volumes to prevent OOM
@@ -1128,8 +1125,13 @@ class Trainer:
                         device=self.device,
                     )
 
-                val_dice_loss = self.loss_fn.soft_dice_loss(pred_probs, seg)
-                met["dice"] = 1.0 - val_dice_loss.item()
+            # Loss (Composite) - Now includes Dice if pred_probs is available
+            l_val, l_comps = self.loss_fn(pred, ct, pred_probs=pred_probs, target_mask=seg)
+            met["loss"] = l_val.item()
+            for k, v in l_comps.items():
+                met[k] = v.item() if hasattr(v, "item") else v
+
+            if pred_probs is not None:
                 del pred_probs  # Fix memory leak
 
             for k, v in met.items():

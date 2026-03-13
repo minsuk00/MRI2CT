@@ -56,13 +56,13 @@ def get_ram_info():
 
     main_p = psutil.Process()
     total_pss = 0
-    
+
     try:
         # PSS calculation is the most accurate but can be slow on some kernels.
         # We try to get it for the main process and all children.
         full_info = main_p.memory_full_info()
         total_pss += getattr(full_info, "pss", full_info.rss)
-        
+
         children = main_p.children(recursive=True)
         for child in children:
             try:
@@ -79,12 +79,7 @@ def get_ram_info():
     total_gb = total_pss / (1024**3)
     usage_percent = (total_pss / total_allowed_bytes) * 100
 
-    return {
-        "percent": usage_percent,
-        "total_gb": total_gb,
-        "main_rss_gb": main_p.memory_info().rss / (1024**3),
-        "num_children": len(main_p.children())
-    }
+    return {"percent": usage_percent, "total_gb": total_gb, "main_rss_gb": main_p.memory_info().rss / (1024**3), "num_children": len(main_p.children())}
 
 
 def anatomix_normalize(tensor, percentile_range=None, clip_range=None):
