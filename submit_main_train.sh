@@ -12,10 +12,12 @@
 
 # --- Configuration Area ---
 PREFIX="main"
-# RESUME_ID=""  # Leave empty if not resuming
+RESUME_ID=""  # Leave empty if not resuming
 
 DICE_W=0.05
-RESUME_ID="4lyodgtl"  # 0.05 dice
+# AUGMENT="True" # "True" or "False"
+AUGMENT="False"
+# RESUME_ID="4lyodgtl"  # 0.05 dice
 
 # DICE_W=0.0
 # RESUME_ID="jxk30spy"  # 0.0 dice
@@ -23,7 +25,7 @@ RESUME_ID="4lyodgtl"  # 0.05 dice
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
     # Construct descriptive Job Name
-    JOB_NAME="${PREFIX}_dice-${DICE_W}"
+    JOB_NAME="${PREFIX}_dice-${DICE_W}_aug-${AUGMENT}"
     if [ ! -z "$RESUME_ID" ]; then
         JOB_NAME="${JOB_NAME}_res-${RESUME_ID}"
     fi
@@ -49,7 +51,7 @@ micromamba activate mrct
 SCRIPT="src/mri2ct/train.py"
 
 # Construct the command
-CMD="python $SCRIPT --dice_w $DICE_W"
+CMD="python $SCRIPT --dice_w $DICE_W --augment $AUGMENT"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi

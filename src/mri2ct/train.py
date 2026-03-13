@@ -70,6 +70,7 @@ if __name__ == "__main__":
     parser.add_argument("--dice_w", type=float, help="Dice loss weight")
     parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
     parser.add_argument("--subjects", type=str, nargs="+", help="Subject IDs to train on (for overfitting)")
+    parser.add_argument("--augment", type=str, choices=["True", "False"], help="Enable/disable data augmentation (True/False)")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -80,6 +81,8 @@ if __name__ == "__main__":
             exp["dice_w"] = args.dice_w
         if args.resume_id is not None:
             exp["resume_wandb_id"] = args.resume_id
+        if args.augment is not None:
+            exp["augment"] = args.augment == "True"
         if args.subjects is not None:
             exp["subjects"] = args.subjects
             # For overfitting, we usually want to reduce steps and disable some logic
