@@ -100,6 +100,15 @@ class Trainer:
         includes.append("--exclude='*'")
         inc_str = " ".join(includes)
 
+        # If subjects are specified, only sync those directories
+        if getattr(self.cfg, "subjects", None):
+            subj_includes = []
+            for subj in self.cfg.subjects:
+                # Include the specific subject directory and all its contents
+                subj_includes.append(f"--include='{subj}/***'")
+            subj_includes.append("--exclude='*'")
+            inc_str = " ".join(subj_includes)
+
         # rsync is efficient: only copies if different
         for split in ["train", "val"]:
             src = os.path.join(self.gpfs_root, split)  # Use original GPFS root
@@ -372,10 +381,15 @@ class Trainer:
         print(f"[Model] Anatomix Feat Extractor Params: Total={tot:,} | Trainable={train:,}")
 
         # 2. Unet Translator (Generator)
-        print("[DEBUG] 🏗️ Building Unet Translator (Anatomix v1)...")
+        print("[DEBUG] 🏗️ Building Unet Translator...")
+        translator_input_nc = 16
+        if getattr(self.cfg, "pass_mri_to_translator", False):
+            print("[DEBUG] 🧬 Passing Original MRI to Translator (Channels: 16 -> 17)")
+            translator_input_nc = 17
+
         model = Unet(
             dimension=3,
-            input_nc=16,
+            input_nc=translator_input_nc,
             output_nc=1,
             num_downs=4,
             ngf=16,
@@ -439,7 +453,12 @@ class Trainer:
                 with torch.no_grad():
                     features = self.feat_extractor(mri)
 
-            pred = self.model(features)
+            if getattr(self.cfg, "pass_mri_to_translator", False):
+                translator_input = torch.cat([features, mri], dim=1)
+            else:
+                translator_input = features
+
+            pred = self.model(translator_input)
 
             # Dice Loss Calculation
             pred_probs = None
@@ -1088,7 +1107,10 @@ class Trainer:
             if self.cfg.val_sliding_window:
 
                 def combined_forward(x):
-                    return self.model(self.feat_extractor(x))
+                    f = self.feat_extractor(x)
+                    if getattr(self.cfg, "pass_mri_to_translator", False):
+                        f = torch.cat([f, x], dim=1)
+                    return self.model(f)
 
                 # Optimization: AMP for faster inference
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -1104,7 +1126,8 @@ class Trainer:
             else:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     feats = self.feat_extractor(mri)
-                    pred = self.model(feats)
+                    translator_in = torch.cat([feats, mri], dim=1) if getattr(self.cfg, "pass_mri_to_translator", False) else feats
+                    pred = self.model(translator_in)
 
             # Metrics
             pred_unpad = unpad(pred, orig_shape, pad_offset)

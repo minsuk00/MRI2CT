@@ -58,6 +58,7 @@ DEFAULT_CONFIG = {
     "enable_safety_padding": True,
     "use_weighted_sampler": True,
     "use_registered_data": True,
+    "pass_mri_to_translator": False,
     "n_classes": 12,  # 11 Organs + Brain
     # Sliding Window & Viz Options
     "val_sliding_window": True,
