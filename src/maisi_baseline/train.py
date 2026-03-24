@@ -9,7 +9,7 @@ if project_root not in sys.path:
 
 from src.maisi_baseline.config import DEFAULT_CONFIG
 from src.maisi_baseline.trainer import MAISITrainer
-from src.mri2ct.utils import cleanup_gpu
+from common.utils import cleanup_gpu
 
 
 def main():

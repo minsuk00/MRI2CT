@@ -11,8 +11,9 @@ class CompositeLoss(nn.Module):
         self.l1 = nn.L1Loss()
         self.l2 = nn.MSELoss()
 
-    def soft_dice_loss(self, logits, target_mask):
+    def get_class_dice(self, logits, target_mask):
         """
+        Calculates Dice score per class, averaged over the batch.
         logits: [B, C, X, Y, Z] (Raw logits from Teacher)
         target_mask: [B, 1, X, Y, Z] (Integer Hard Labels from GT)
         """
@@ -31,27 +32,14 @@ class CompositeLoss(nn.Module):
         p = probs.view(probs.shape[0], probs.shape[1], -1)
         t = target_one_hot.view(target_one_hot.shape[0], target_one_hot.shape[1], -1)
 
-        # Select Classes based on config
-        if self.weights.get("dice_bone_only", False):
-            if p.shape[1] <= 5:
-                raise RuntimeError(f"Dice Bone Only requested (idx 5), but input has only {p.shape[1]} channels.")
-            # Select just channel 5
-            p = p[:, 5:6, :]
-            t = t[:, 5:6, :]
-        elif self.weights.get("dice_exclude_background", True):
-            # Exclude index 0
-
-            p = p[:, 1:, :]
-            t = t[:, 1:, :]
-
         intersection = (p * t).sum(dim=2)
         union = p.sum(dim=2) + t.sum(dim=2)
 
-        # Dice per class per batch
+        # Dice per class per batch: [B, C]
         dice = (2.0 * intersection + smooth) / (union + smooth)
 
-        # Average over classes and batch
-        return 1.0 - dice.mean()
+        # Average over batch: [C]
+        return dice.mean(dim=0)
 
     def forward(self, pred, target, pred_probs=None, target_mask=None):
         total_loss = torch.tensor(0.0, device=pred.device)
@@ -59,28 +47,44 @@ class CompositeLoss(nn.Module):
 
         # 1. L1 Loss
         l1_val = self.l1(pred, target)
-        loss_components["loss_l1"] = l1_val
         if self.weights.get("l1", 0) > 0:
+            loss_components["loss_l1"] = l1_val
             total_loss += self.weights["l1"] * l1_val
 
         # 2. L2 Loss
-        if self.weights.get("l2", 0) > 0 or "loss_l2" in self.weights:  # Keep if weight exists
+        if self.weights.get("l2", 0) > 0:
             l2_val = self.l2(pred, target)
             loss_components["loss_l2"] = l2_val
-            if self.weights.get("l2", 0) > 0:
-                total_loss += self.weights["l2"] * l2_val
+            total_loss += self.weights["l2"] * l2_val
 
         # 3. SSIM Loss
         ssim_val = 1.0 - fused_ssim3d(pred.float(), target.float(), train=True)
-        loss_components["loss_ssim"] = ssim_val
         if self.weights.get("ssim", 0) > 0:
+            loss_components["loss_ssim"] = ssim_val
             total_loss += self.weights["ssim"] * ssim_val
 
-        # 4. Dice Loss (Only if probabilities are provided)
+        # 4. Dice Losses (Teacher-guided)
         if pred_probs is not None and target_mask is not None:
-            dice_loss_val = self.soft_dice_loss(pred_probs, target_mask)
-            loss_components["loss_dice"] = dice_loss_val
+            class_dices = self.get_class_dice(pred_probs, target_mask)
+
+            # --- General Dice (All classes or Foreground only) ---
+            if self.weights.get("dice_exclude_background", True):
+                gen_dice = class_dices[1:].mean()
+            else:
+                gen_dice = class_dices.mean()
+
+            loss_components["dice_score_all"] = gen_dice
             if self.weights.get("dice_w", 0) > 0:
-                total_loss += self.weights["dice_w"] * dice_loss_val
+                loss_components["loss_dice"] = 1.0 - gen_dice
+                total_loss += self.weights["dice_w"] * (1.0 - gen_dice)
+
+            # --- Bone-Specific Dice ---
+            bone_idx = self.weights.get("dice_bone_idx", 5)  # Default 5 for BabyUNet
+            if class_dices.shape[0] > bone_idx:
+                bone_dice = class_dices[bone_idx]
+                loss_components["dice_score_bone"] = bone_dice
+                if self.weights.get("dice_bone_w", 0) > 0:
+                    loss_components["loss_dice_bone"] = 1.0 - bone_dice
+                    total_loss += self.weights["dice_bone_w"] * (1.0 - bone_dice)
 
         return total_loss, loss_components

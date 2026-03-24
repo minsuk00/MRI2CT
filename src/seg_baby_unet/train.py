@@ -48,8 +48,8 @@ warnings.filterwarnings("ignore", message=".*Dynamo detected a call to a `functo
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from anatomix.segmentation.segmentation_utils import load_model_v1_1, worker_init_fn
 
-from mri2ct.data import get_region_key
-from mri2ct.utils import count_parameters, get_ram_info
+from common.data import get_region_key
+from common.utils import count_parameters, get_ram_info
 
 # ==========================================
 # INLINE CONFIGURATION

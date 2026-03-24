@@ -12,14 +12,17 @@
 
 # --- Configuration Area ---
 PREFIX="unet"
-RESUME_ID=""  # Leave empty if not resuming
+# RESUME_ID=""  # Leave empty if not resuming
 
-DICE_W=0.05
+# UNet Baseline WITH dice
+# DICE_W=0.05
+# AUGMENT="True" # "True" or "False"
+# RESUME_ID="tztefg2e"  # 0.05 dice
+
+# UNet Baseline NO dice
+DICE_W=0.0
 AUGMENT="True" # "True" or "False"
-# RESUME_ID="xmwpkopk"  # 0.05 dice
-
-# DICE_W=0.0
-# RESUME_ID="bpaq1s1o"  # 0.0 dice
+RESUME_ID="bpaq1s1o"  # 0.0 dice
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then

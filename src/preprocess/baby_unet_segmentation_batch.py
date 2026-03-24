@@ -17,7 +17,7 @@ sys.path.append(os.path.join(PROJECT_ROOT, "src"))
 
 from anatomix.segmentation.segmentation_utils import load_model_v1_2
 
-from mri2ct.utils import anatomix_normalize
+from common.utils import anatomix_normalize
 
 
 def discover_subjects(data_root):

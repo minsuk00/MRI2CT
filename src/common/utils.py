@@ -1,5 +1,4 @@
 import gc
-import os
 import random
 
 import numpy as np
@@ -27,6 +26,15 @@ def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def clean_state_dict(state_dict):
+    """Removes '_orig_mod.' prefix from keys if present (added by torch.compile)."""
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k[10:] if k.startswith("_orig_mod.") else k
+        new_state_dict[name] = v
+    return new_state_dict
 
 
 def set_seed(seed=42):
@@ -170,6 +178,6 @@ def compute_metrics(pred, target, data_range=1.0):
         "mae_hu": mae_val * 2048.0,
         "psnr": torch.mean(psnr).item(),
         "ssim": ssim_val,
-        "grad_diff": grad_diff,  # 낮을수록 좋음 (Lower is better)
-        "bone_dice": dice_val,  # 높을수록 좋음 (Higher is better)
+        "grad_diff": grad_diff,
+        "dice_score_bone_threshold": dice_val,  # Thresholded metric (naive)
     }

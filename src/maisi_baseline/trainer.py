@@ -46,7 +46,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.maisi_baseline.config import DEFAULT_CONFIG, AUTOENCODER_PATH, DIFFUSION_PATH, NETWORK_CONFIG_PATH
-from src.mri2ct.utils import cleanup_gpu, count_parameters, set_seed, compute_metrics
+from common.utils import cleanup_gpu, count_parameters, set_seed, compute_metrics
 
 class MAISITrainer:
     def __init__(self, config_dict):

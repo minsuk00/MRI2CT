@@ -4,7 +4,7 @@ from glob import glob
 import torch
 import torchio as tio
 
-from mri2ct.utils import anatomix_normalize
+from common.utils import anatomix_normalize
 
 
 class DataPreprocessing(tio.Transform):
@@ -88,7 +88,7 @@ def get_augmentations():
     )
 
 
-def get_subject_paths(root, relative_path, use_registered=True):
+def get_subject_paths(root, relative_path):
     subj_dir = os.path.join(root, relative_path)
 
     # Check for ct.nii or ct.nii.gz
@@ -96,17 +96,14 @@ def get_subject_paths(root, relative_path, use_registered=True):
     if not os.path.exists(ct_path):
         ct_path = os.path.join(subj_dir, "ct.nii")
 
-    if use_registered:
-        # Search for moved_mr*.nii or moved_mr*.nii.gz directly in subj_dir
-        mr_candidates = sorted(glob(os.path.join(subj_dir, "moved_mr*.nii*")))
-        if not mr_candidates:
-            raise FileNotFoundError(f"No registered MRI (moved_mr*.nii*) found in {subj_dir}")
-        mr_path = mr_candidates[0]
-    else:
-        mr_path = os.path.join(subj_dir, "mr.nii.gz")
+    # Search for moved_mr*.nii or moved_mr*.nii.gz directly in subj_dir
+    mr_candidates = sorted(glob(os.path.join(subj_dir, "moved_mr*.nii*")))
+    if not mr_candidates:
+        raise FileNotFoundError(f"No registered MRI (moved_mr*.nii*) found in {subj_dir}")
+    mr_path = mr_candidates[0]
 
     if not os.path.exists(ct_path) or not os.path.exists(mr_path):
-        raise FileNotFoundError(f"Missing files in {subj_dir} (Registered: {use_registered})")
+        raise FileNotFoundError(f"Missing files in {subj_dir}")
 
     paths = {"ct": ct_path, "mri": mr_path}
 
@@ -121,6 +118,22 @@ def get_subject_paths(root, relative_path, use_registered=True):
     return paths
 
 
+def get_split_subjects(split_file, split_name):
+    """Returns a list of subject IDs for a given split from a text file."""
+    if not os.path.exists(split_file):
+        raise FileNotFoundError(f"Split file not found: {split_file}")
+
+    valid_subjs = []
+    with open(split_file, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                s_name, subj_id = parts[0], parts[1]
+                if s_name == split_name:
+                    valid_subjs.append(subj_id)
+    return sorted(valid_subjs)
+
+
 def get_region_key(subj_id):
     """Determines region key from subject ID (e.g., 1ABA005 -> abdomen)."""
     mapping = {"AB": "abdomen", "TH": "thorax", "HN": "head_neck", "B": "brain", "P": "pelvis"}
@@ -133,3 +146,87 @@ def get_region_key(subj_id):
     if code_1 in mapping:
         return mapping[code_1]
     return "abdomen"
+
+
+def build_tio_subjects(root_dir, subjects, use_weighted_sampler=False, load_seg=False):
+    """
+    Converts a list of subject IDs into torchio.Subject objects.
+    """
+    tio_subjects = []
+    for s in subjects:
+        try:
+            paths = get_subject_paths(root_dir, s)
+            kwargs = {
+                "mri": tio.ScalarImage(paths["mri"]),
+                "ct": tio.ScalarImage(paths["ct"]),
+                "subj_id": os.path.basename(s),
+            }
+
+            # Load body_mask as prob_map if it exists and we want to use weighted sampler
+            if use_weighted_sampler and "body_mask" in paths:
+                kwargs["prob_map"] = tio.LabelMap(paths["body_mask"])
+
+            # Conditionally load segmentation
+            if load_seg:
+                seg_path = os.path.join(root_dir, s, "ct_seg.nii")
+                if os.path.exists(seg_path):
+                    kwargs["seg"] = tio.LabelMap(seg_path)
+                else:
+                    # In some cases we might want to skip, but here we keep it strict
+                    # if the caller asked for segs, they must exist.
+                    print(f"  [WARNING] Segmentation missing for {s}. Skipping.")
+                    continue
+
+            tio_subjects.append(tio.Subject(**kwargs))
+        except Exception as e:
+            print(f"  [ERROR] Failed to build subject {s}: {e}")
+            continue
+
+    return tio_subjects
+
+
+def stage_data_to_local(gpfs_root, subjects, cfg, prefix="Trainer"):
+    """
+    Copies a list of subject directories from GPFS to local NVMe RAID for faster I/O.
+    Returns the new local root path.
+    """
+    if not getattr(cfg, "stage_data", True):
+        print(f"[{prefix}] ⏩ Skipping data staging (staying on GPFS).")
+        return gpfs_root
+
+    user_id = os.environ.get("USER", "default")
+    # Extract resolution string (e.g., '1.5x1.5x1.5mm') from GPFS path to differentiate cache
+    res_str = os.path.basename(gpfs_root.rstrip("/"))
+    local_root = os.path.join("/tmp", f"mri2ct_{user_id}_{res_str}")
+
+    if not os.path.exists("/tmp") or not os.access("/tmp", os.W_OK):
+        print(f"[{prefix}] ⚠️ Local storage not available. Staying on GPFS.")
+        return gpfs_root
+
+    if os.path.exists(local_root):
+        print(f"[{prefix}] ♻️  Local cache found at {local_root}. Syncing updates...")
+    else:
+        print(f"[{prefix}] 🚚 Staging data to local NVMe: {local_root}")
+        os.makedirs(local_root, exist_ok=True)
+
+    # Construct rsync includes dynamically
+    includes = ["--include='*/'", "--include='ct.nii*'", "--include='moved_mr*.nii*'"]
+
+    # Only sync masks/segs if needed
+    if getattr(cfg, "use_weighted_sampler", False):
+        includes.append("--include='mask.nii*'")
+    if getattr(cfg, "dice_w", 0) > 0 or getattr(cfg, "validate_dice", False):
+        includes.append("--include='ct_seg.nii*'")
+
+    includes.append("--exclude='*'")
+    inc_str = " ".join(includes)
+
+    # Sync only the subjects we actually need
+    print(f"  - Syncing {len(subjects)} unique subjects to local storage...")
+    for subj_id in subjects:
+        src = os.path.join(gpfs_root, subj_id)
+        dst = os.path.join(local_root, subj_id)
+        if os.path.exists(src):
+            os.system(f"rsync -am {inc_str} {src}/ {dst}/")
+
+    return local_root

@@ -12,7 +12,7 @@ class Config(SimpleNamespace):
 
 DEFAULT_CONFIG = {
     # System
-    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5x1.5x1.5mm_registered",
+    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5mm_registered_flat",
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
     "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/predictions/1.5x1.5x1.5mm_registered",
     "seed": 42,
@@ -20,9 +20,8 @@ DEFAULT_CONFIG = {
     "wandb": True,
     "project_name": "mri2ct",
     # Data
-    "subjects": None,
-    "region": None,  # "AB", "TH", "HN"
-    "dataset_spacing": [1.5, 1.5, 1.5],
+    "split_file": "splits/original_splits.txt",
+    "stage_data": True,
     "augment": True,
     "patch_size": 128,
     "patches_per_volume": 10,
@@ -55,13 +54,10 @@ DEFAULT_CONFIG = {
     # CNN Specifics
     "batch_size": 4,
     "final_activation": "sigmoid",
-    "enable_safety_padding": True,
     "use_weighted_sampler": True,
-    "use_registered_data": True,
     "pass_mri_to_translator": False,
     "n_classes": 12,  # 11 Organs + Brain
     # Sliding Window & Viz Options
-    "val_sliding_window": True,
     "val_sw_batch_size": 4,
     "val_sw_overlap": 0.25,
     "validate_dice": False,
@@ -70,6 +66,8 @@ DEFAULT_CONFIG = {
     "l2_w": 0.0,
     "ssim_w": 0.1,
     "dice_w": 0.0,
+    "dice_bone_w": 0.0,
+    "dice_bone_idx": 5,
     "dice_exclude_background": True,
     "dice_bone_only": False,
     "wandb_note": "test_run",

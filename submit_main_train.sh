@@ -12,15 +12,31 @@
 
 # --- Configuration Area ---
 PREFIX="main"
-RESUME_ID=""  # Leave empty if not resuming
+# RESUME_ID=""  # Leave empty if not resuming
 
-DICE_W=0.05
-AUGMENT="True" # "True" or "False"
-PASS_MRI="True" # "True" or "False"
-# RESUME_ID="4lyodgtl"  # 0.05 dice
+# Amix with image input
+# DICE_W=0.05
+# AUGMENT="True"
+# PASS_MRI="True"
+# RESUME_ID="qj53y61g" 
 
-# DICE_W=0.0
-# RESUME_ID="jxk30spy"  # 0.0 dice
+# Amix NO aug
+# DICE_W=0.05
+# AUGMENT="False"
+# PASS_MRI="False"
+# RESUME_ID="cq7lp6ry"
+
+# Amix WITH dice
+# DICE_W=0.05
+# AUGMENT="True"
+# PASS_MRI="False"
+# RESUME_ID="bwfwfcrc"
+
+# Amix NO dice
+DICE_W=0.00
+AUGMENT="True"
+PASS_MRI="False"
+RESUME_ID="jxk30spy"  # 0.0 dice
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
