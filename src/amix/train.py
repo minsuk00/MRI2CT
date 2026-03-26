@@ -56,7 +56,6 @@ EXPERIMENT_CONFIG = [
         "scheduler_min_lr": 0.0,
         "wandb_note": "long_run_anatomix_v2_baby_unet_teacher",
         "patch_size": 128,
-        "dice_bone_only": False,
         "val_sw_batch_size": 8,
         "val_sw_overlap": 0.25,
         "feat_instance_norm": False,
@@ -69,10 +68,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dice_w", type=float, help="Dice loss weight")
+    parser.add_argument("--dice_bone_w", type=float, help="Bone-specific dice loss weight")
     parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
     parser.add_argument("--split_file", type=str, help="Path to split mapping file (e.g., splits/original_splits.txt)")
     parser.add_argument("--augment", type=str, choices=["True", "False"], help="Enable/disable data augmentation (True/False)")
     parser.add_argument("--pass_mri", type=str, choices=["True", "False"], help="Pass original MRI to the translator (True/False)")
+    parser.add_argument("--feat_instance_norm", type=str, choices=["True", "False"], help="Enable instance norm for features (True/False)")
+    parser.add_argument("--input_dropout_p", type=float, help="Input dropout probability")
+    parser.add_argument("--amix_weights", type=str, choices=["v1", "v1_2", "v1_3"], help="Anatomix weights version (v1, v1_2, v1_3)")
+    parser.add_argument("--epochs", type=int, help="Total epochs to train")
+    parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
+    parser.add_argument("--num_workers", type=int, help="Number of workers for the data queue")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -81,6 +87,8 @@ if __name__ == "__main__":
         # Override with CLI args if provided
         if args.dice_w is not None:
             exp["dice_w"] = args.dice_w
+        if args.dice_bone_w is not None:
+            exp["dice_bone_w"] = args.dice_bone_w
         if args.resume_id is not None:
             exp["resume_wandb_id"] = args.resume_id
         if args.augment is not None:
@@ -89,6 +97,18 @@ if __name__ == "__main__":
             exp["pass_mri_to_translator"] = args.pass_mri == "True"
         if args.split_file is not None:
             exp["split_file"] = args.split_file
+        if args.feat_instance_norm is not None:
+            exp["feat_instance_norm"] = args.feat_instance_norm == "True"
+        if args.input_dropout_p is not None:
+            exp["input_dropout_p"] = args.input_dropout_p
+        if args.amix_weights is not None:
+            exp["anatomix_weights"] = args.amix_weights
+        if args.epochs is not None:
+            exp["total_epochs"] = args.epochs
+        if args.steps_per_epoch is not None:
+            exp["steps_per_epoch"] = args.steps_per_epoch
+        if args.num_workers is not None:
+            exp["data_queue_num_workers"] = args.num_workers
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")

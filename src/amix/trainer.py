@@ -143,16 +143,20 @@ class Trainer(BaseTrainer):
             self.cfg.res_mult = 16
             self.feat_extractor = Unet(3, 1, 16, 4, 16).to(self.device)
             ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/anatomix.pth"
-        elif self.cfg.anatomix_weights == "v2":
+        elif self.cfg.anatomix_weights in ["v2", "v1_2", "v1_3"]:
             self.cfg.res_mult = 32
             self.feat_extractor = Unet(3, 1, 16, 5, 20, norm="instance", interp="trilinear", pooling="Avg").to(self.device)
             # Optimize inference speed - Only compile if we aren't compiling the full step later
             if self.cfg.compile_mode != "full":
                 print("[DEBUG] 🚀 Compiling Anatomix Feature Extractor...")
                 self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
-            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_v2.pth"
+
+            if self.cfg.anatomix_weights in ["v2", "v1_2"]:
+                ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_v1_2.pth"
+            else:  # v1_3
+                ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_real_v1_3.pth"
         else:
-            raise ValueError("Invalid anatomix_weights")
+            raise ValueError(f"Invalid anatomix_weights: {self.cfg.anatomix_weights}")
 
         if os.path.exists(ckpt):
             # Strip _orig_mod prefix if present
@@ -256,7 +260,7 @@ class Trainer(BaseTrainer):
 
             if getattr(self.cfg, "pass_mri_to_translator", False):
                 translator_input = torch.cat([features, mri], dim=1)
-                
+
                 # B) Optional Input Dropout (3D) - Only if MRI is passed/concatenated
                 drop_p = getattr(self.cfg, "input_dropout_p", 0.0)
                 if drop_p > 0:
@@ -478,7 +482,7 @@ class Trainer(BaseTrainer):
             def combined_forward(x):
                 # 1. Features
                 f = self.feat_extractor(x)
-                
+
                 # 2. Instance Norm
                 if getattr(self.cfg, "feat_instance_norm", False):
                     f = torch.nn.functional.instance_norm(f)
@@ -486,12 +490,12 @@ class Trainer(BaseTrainer):
                 # 3. Concatenation
                 if getattr(self.cfg, "pass_mri_to_translator", False):
                     f = torch.cat([f, x], dim=1)
-                    
+
                     # 4. Input Dropout (Conditional on pass_mri)
                     drop_p = getattr(self.cfg, "input_dropout_p", 0.0)
                     if drop_p > 0:
                         f = torch.nn.functional.dropout3d(f, p=drop_p, training=False)
-                
+
                 return self.model(f)
 
             # Optimization: AMP for faster inference
@@ -563,8 +567,8 @@ class Trainer(BaseTrainer):
                     self._visualize_lite(pred, ct, mri, subj_id, orig_shape, self.global_step, epoch, idx=i, offset=pad_offset, save_path=save_path)
 
             del mri, ct, pred, pred_unpad, ct_unpad
-            if "feats" in locals():
-                del feats
+            # if "feats" in locals():
+            #     del feats
 
         # 2. Augmentation Viz
         if self.cfg.wandb and self.cfg.augment:
@@ -597,8 +601,11 @@ class Trainer(BaseTrainer):
             ep_start = time.time()
             loss, comps, gn = self.train_epoch(epoch)
 
+            val_duration = 0.0
             if (epoch % self.cfg.val_interval == 0) or (epoch + 1) == self.cfg.total_epochs:
+                val_start = time.time()
                 avg_met = self.validate(epoch)
+                val_duration = time.time() - val_start
                 val_loss = avg_met.get("loss", 0)
 
                 tqdm.write(
@@ -614,6 +621,7 @@ class Trainer(BaseTrainer):
                     "train/total": loss,
                     "info/grad_norm": gn,
                     "info/epoch_duration": ep_duration,
+                    "info/val_duration": val_duration,
                     "info/cumulative_time": cumulative_time,
                     "info/lr": current_lr,
                     "info/global_step": self.global_step,
@@ -621,7 +629,7 @@ class Trainer(BaseTrainer):
                     "info/samples_seen": self.samples_seen,
                 }
                 for k, v in comps.items():
-                    if "score" in k: # Skip all non-loss scores from training charts
+                    if "score" in k:  # Skip all non-loss scores from training charts
                         continue
                     log[k.replace("loss_", "train/")] = v
                 wandb.log(log, step=self.global_step)

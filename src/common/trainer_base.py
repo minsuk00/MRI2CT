@@ -35,12 +35,17 @@ class BaseTrainer:
         self.run_name = f"{timestamp}_{self.cfg.run_name_prefix}" if hasattr(self.cfg, "run_name_prefix") else f"{timestamp}_Train"
 
     def _find_subjects(self):
-        """Discovers subjects from split file."""
+        """Discovers subjects from split file, or uses explicit subjects list for SSO."""
         if not hasattr(self, "train_subjects"):
-            print(f"[{self.prefix}] 📂 Using split file: {self.cfg.split_file}")
-            self.train_subjects = get_split_subjects(self.cfg.split_file, "train")
-            self.val_subjects = get_split_subjects(self.cfg.split_file, "val")
-            print(f"[{self.prefix}] Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
+            if hasattr(self.cfg, "subjects") and self.cfg.subjects:
+                self.train_subjects = list(self.cfg.subjects)
+                self.val_subjects = list(self.cfg.subjects)
+                print(f"[{self.prefix}] 🔬 SSO Mode: subjects={self.train_subjects}")
+            else:
+                print(f"[{self.prefix}] 📂 Using split file: {self.cfg.split_file}")
+                self.train_subjects = get_split_subjects(self.cfg.split_file, "train")
+                self.val_subjects = get_split_subjects(self.cfg.split_file, "val")
+                print(f"[{self.prefix}] Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
 
     def _stage_data_local(self):
         """Copies dataset to local NVMe RAID for blazing fast I/O."""
@@ -247,7 +252,6 @@ class BaseTrainer:
                 "dice_w": getattr(self.cfg, "dice_w", 0.0),
                 "dice_bone_w": getattr(self.cfg, "dice_bone_w", 0.0),
                 "dice_bone_idx": getattr(self.cfg, "dice_bone_idx", 5),
-                "dice_bone_only": getattr(self.cfg, "dice_bone_only", False),
                 "dice_exclude_background": getattr(self.cfg, "dice_exclude_background", True),
             }
         ).to(self.device)
@@ -287,8 +291,8 @@ class BaseTrainer:
             # Coronal
             axes[row_idx, 2].imshow(np.rot90(vol[:, cy, :]), cmap=cmap, vmin=vmin, vmax=vmax, interpolation=interpolation, alpha=alpha)
             axes[row_idx, 2].set_title(f"{title_prefix} Cor")
-            
-            if alpha is None: # Only show min/max text for base layers
+
+            if alpha is None:  # Only show min/max text for base layers
                 axes[row_idx, 0].text(-5, 10, f"Min: {vol.min():.2f}\nMax: {vol.max():.2f}", fontsize=8, color="white", backgroundcolor="black")
 
         plot_row(0, img_in, "MRI", vmin=0, vmax=1)
@@ -305,7 +309,7 @@ class BaseTrainer:
 
             if img_pred_seg is not None:
                 plot_row(4, img_pred_seg, "Pred Seg", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest")
-                
+
                 # Overlay Row: Show Pred CT first, then overlay Pred Seg
                 plot_row(5, img_pred, "Overlay", vmin=0, vmax=1, cmap="gray")
                 plot_row(5, img_pred_seg, "Overlay", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest", alpha=0.3)

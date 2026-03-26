@@ -85,7 +85,6 @@ BASELINE_CONFIG = {
     "l1_w": 1.0,
     "ssim_w": 0.1,
     "l2_w": 0.0,
-    "dice_bone_only": False,
     # Resuming
     "override_lr": False,  # If True, uses 'lr' from config instead of saved state
     # Validation
@@ -522,8 +521,11 @@ class BaselineTrainer(BaseTrainer):
             loss, comps, gn = self.train_epoch(epoch)
 
             # Validation interval
+            val_duration = 0.0
             if (epoch % self.cfg.val_interval == 0) or (epoch + 1) == self.cfg.total_epochs:
+                val_start = time.time()
                 avg_met = self.validate(epoch)
+                val_duration = time.time() - val_start
                 print(
                     f"Ep {epoch} | Train: {loss:.4f} | Val: {avg_met.get('loss', 0):.4f} | SSIM: {avg_met.get('ssim', 0):.4f} | PSNR: {avg_met.get('psnr', 0):.2f} | Dice: {avg_met.get('dice_score_all', 0):.4f} | Bone: {avg_met.get('dice_score_bone', 0):.4f}"
                 )
@@ -537,6 +539,7 @@ class BaselineTrainer(BaseTrainer):
                     "train/total": loss,
                     "info/grad_norm": gn,
                     "info/epoch_duration": ep_duration,
+                    "info/val_duration": val_duration,
                     "info/cumulative_time": cumulative_time,
                     "info/lr": current_lr,
                     "info/global_step": self.global_step,
@@ -585,6 +588,9 @@ if __name__ == "__main__":
     parser.add_argument("--dice_w", type=float, help="Dice loss weight")
     parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
     parser.add_argument("--augment", type=str, choices=["True", "False"], help="Enable/disable data augmentation (True/False)")
+    parser.add_argument("--epochs", type=int, help="Total epochs to train")
+    parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
+    parser.add_argument("--num_workers", type=int, help="Number of workers for the data queue")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -600,6 +606,12 @@ if __name__ == "__main__":
         BASELINE_CONFIG["augment"] = args.augment == "True"
     if args.split_file is not None:
         BASELINE_CONFIG["split_file"] = args.split_file
+    if args.epochs is not None:
+        BASELINE_CONFIG["total_epochs"] = args.epochs
+    if args.steps_per_epoch is not None:
+        BASELINE_CONFIG["steps_per_epoch"] = args.steps_per_epoch
+    if args.num_workers is not None:
+        BASELINE_CONFIG["data_queue_num_workers"] = args.num_workers
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

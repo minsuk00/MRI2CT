@@ -8,14 +8,18 @@ from common.utils import anatomix_normalize
 
 
 class DataPreprocessing(tio.Transform):
-    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, use_weighted_sampler=False, **kwargs):
+    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, use_weighted_sampler=False, enforce_ras=False, **kwargs):
         super().__init__(**kwargs)
         self.patch_size = patch_size
         self.enable_safety_padding = enable_safety_padding
         self.res_mult = res_mult
         self.use_weighted_sampler = use_weighted_sampler
+        self.enforce_ras = enforce_ras
 
     def apply_transform(self, subject):
+        if self.enforce_ras:
+            subject = tio.ToCanonical()(subject)
+
         subject["ct"].set_data(anatomix_normalize(subject["ct"].data, clip_range=(-1024, 1024)))
         subject["mri"].set_data(anatomix_normalize(subject["mri"].data))
 
@@ -75,14 +79,9 @@ def get_augmentations():
             tio.RandomAffine(scales=(0.95, 1.1), degrees=7, translation=4, default_pad_value="minimum", p=0.8),
             tio.RandomFlip(axes=(0, 1, 2), p=0.5),
             tio.Clamp(0, 1),
-            tio.Compose(
-                [
-                    tio.RandomBiasField(coefficients=0.5, order=2, p=0.4),
-                    tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.4),
-                    tio.RandomNoise(std=(0, 0.02), p=0.25),
-                ],
-                include=["mri"],
-            ),
+            tio.RandomBiasField(coefficients=0.5, order=2, p=0.4, include=["mri"]),
+            tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.4, include=["mri"]),
+            tio.RandomNoise(std=(0, 0.02), p=0.25, include=["mri"]),
             tio.Clamp(0, 1),
         ]
     )

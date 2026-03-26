@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     "patches_per_volume": 10,
     "data_queue_max_length": 100,
     "data_queue_num_workers": 4,
-    "anatomix_weights": "v2",  # "v1", "v2"
+    "anatomix_weights": "v1_3",  # "v1", "v1_2", "v1_3"
     "teacher_weights_path": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs/wandb/run-20260222_160128-p0i9chz3/files/seg_baby_unet_epoch_499.pth",
     "res_mult": 32,
     "analyze_shapes": True,
@@ -69,11 +69,11 @@ DEFAULT_CONFIG = {
     "dice_bone_w": 0.0,
     "dice_bone_idx": 5,
     "dice_exclude_background": True,
-    "dice_bone_only": False,
     "wandb_note": "test_run",
     "resume_wandb_id": None,
     "resume_epoch": None,
     "diverge_wandb_branch": False,
     # Validation Saving
     "save_val_volumes": True,
+    "full_val": True,
 }
