@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
     "sanity_check": True,
     "accum_steps": 2,
     "model_save_interval": 10,
-    "viz_limit": 6,
+    "viz_limit": 4,
     "viz_pca": False,
     "steps_per_epoch": 1000,
     "finetune_feat_extractor": False,
@@ -56,11 +56,13 @@ DEFAULT_CONFIG = {
     "final_activation": "sigmoid",
     "use_weighted_sampler": True,
     "pass_mri_to_translator": False,
+    "use_zero_mask": False,
     "n_classes": 12,  # 11 Organs + Brain
     # Sliding Window & Viz Options
     "val_sw_batch_size": 4,
     "val_sw_overlap": 0.25,
     "validate_dice": False,
+    "val_body_mask": True,  # If True, also log val_body/ metrics computed on body voxels only
     # Loss Weights
     "l1_w": 1.0,
     "l2_w": 0.0,
@@ -69,6 +71,7 @@ DEFAULT_CONFIG = {
     "dice_bone_w": 0.0,
     "dice_bone_idx": 5,
     "dice_exclude_background": True,
+    "wandb_tags": [],
     "wandb_note": "test_run",
     "resume_wandb_id": None,
     "resume_epoch": None,

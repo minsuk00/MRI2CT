@@ -10,7 +10,7 @@ import torchio as tio
 
 import wandb
 from common.data import DataPreprocessing, get_augmentations, get_split_subjects, get_subject_paths, stage_data_to_local
-from common.utils import clean_state_dict, send_notification, set_seed
+from common.utils import clean_state_dict, log_model_summary, send_notification, set_seed
 
 
 class BaseTrainer:
@@ -65,6 +65,7 @@ class BaseTrainer:
             name=self.run_name,
             config=vars(self.cfg),
             notes=self.cfg.wandb_note,
+            tags=getattr(self.cfg, "wandb_tags", []) or [],
             reinit=True,
             dir=self.cfg.log_dir,
             id=wandb_id,
@@ -73,6 +74,19 @@ class BaseTrainer:
         # Save code state for reproducibility
         if wandb.run:
             wandb.run.log_code(".")
+
+    def _log_model_summary(self, model_dict):
+        """Standardized model summary logging across all trainers."""
+        if not self.cfg.wandb or not wandb.run:
+            return
+
+        summary_path = os.path.join(wandb.run.dir, "model_summary.txt")
+        tot, train = log_model_summary(model_dict, summary_path)
+        
+        # Save to WandB and update config with exact counts
+        wandb.save(summary_path, base_path=wandb.run.dir)
+        wandb.config.update({"total_params": tot, "trainable_params": train}, allow_val_change=True)
+        return tot, train
 
     def _load_resume(self, model, optimizer=None, scheduler=None, scaler=None, extra_modules=None):
         if not self.cfg.resume_wandb_id:
@@ -111,7 +125,7 @@ class BaseTrainer:
                     break
 
         print(f"[RESUME] 🔄 Loading checkpoint: {target_ckpt}")
-        checkpoint = torch.load(target_ckpt, map_location=self.device)
+        checkpoint = torch.load(target_ckpt, map_location=self.device, weights_only=False)
 
         # Helper to load into potentially compiled model
         def load_state(m, state):
@@ -241,6 +255,13 @@ class BaseTrainer:
         except Exception as e:
             print(f"[{self.prefix}] [WARNING] Aug Viz failed: {e}")
 
+    def _compute_val_metrics(self, pred_unpad, ct_unpad, mask_unpad=None):
+        """Returns (standard_met, body_met_or_None). Log under val/ and val_body/ respectively."""
+        from common.utils import compute_metrics, compute_metrics_body
+        met = compute_metrics(pred_unpad, ct_unpad)
+        body_met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad) if mask_unpad is not None else None
+        return met, body_met
+
     def _setup_loss_and_scaler(self):
         from common.loss import CompositeLoss
 
@@ -325,36 +346,4 @@ class BaseTrainer:
         caption = f"Subject: {subj_id}" if subj_id else None
         if self.cfg.wandb:
             wandb.log({"train/patch_viz": wandb.Image(fig, caption=caption)}, step=step)
-        plt.close(fig)
-
-    @torch.inference_mode()
-    def _visualize_lite(self, pred, ct, mri, subj_id, shape, step, epoch, idx, offset=0, save_path=None):
-        """Lightweight visualization: MRI, GT, Pred, Residual."""
-        from common.utils import unpad
-
-        gt_ct = unpad(ct, shape, offset).cpu().numpy().squeeze()
-        gt_mri = unpad(mri, shape, offset).cpu().numpy().squeeze()
-        pred_ct = unpad(pred, shape, offset).cpu().numpy().squeeze()
-        items = [(gt_mri, "GT MRI", "gray", (0, 1)), (gt_ct, "GT CT", "gray", (0, 1)), (pred_ct, "Pred CT", "gray", (0, 1)), (pred_ct - gt_ct, "Residual", "seismic", (-0.5, 0.5))]
-        D_dim = gt_ct.shape[-1]
-        slice_indices = np.linspace(0.1 * D_dim, 0.9 * D_dim, 5, dtype=int)
-        fig, axes = plt.subplots(len(slice_indices), len(items), figsize=(3 * len(items), 3.5 * len(slice_indices)))
-        plt.subplots_adjust(wspace=0.05, hspace=0.15)
-        if len(slice_indices) == 1:
-            axes = axes.reshape(1, -1)
-        for i, z_slice in enumerate(slice_indices):
-            for j, (data, title, cmap, clim) in enumerate(items):
-                ax = axes[i, j]
-                im = ax.imshow(data[:, :, z_slice], cmap=cmap, vmin=clim[0], vmax=clim[1])
-                if title == "Residual":
-                    res_im = im
-                if i == 0:
-                    ax.set_title(title)
-                ax.axis("off")
-        if "res_im" in locals():
-            cbar = fig.colorbar(res_im, ax=axes[:, 3], fraction=0.04, pad=0.01)
-            cbar.set_label("Residual Error")
-        fig.suptitle(f"Subject: {subj_id} | Ep {epoch} | Step {step}", fontsize=16, y=0.99)
-        if self.cfg.wandb:
-            wandb.log({f"viz/{('val_' + str(idx))}": wandb.Image(fig)}, step=step)
         plt.close(fig)
