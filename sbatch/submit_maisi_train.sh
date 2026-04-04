@@ -14,7 +14,7 @@
 # --- Configuration Area ---
 PREFIX="maisi"
 SPLIT_FILE="splits/thorax_center_wise_split.txt" # "splits/center_wise_split.txt" for full
-LR=3e-4
+LR=5e-4
 BATCH_SIZE=1
 ACCUM_STEPS=4
 EPOCHS=1000
@@ -22,7 +22,9 @@ STEPS_PER_EPOCH=500
 VAL_INTERVAL=1
 SAVE_INTERVAL=1
 WANDB="True"
-RESUME_ID="" # Leave empty if not resuming (e.g., "uszjimzg")
+PREENCODED_LATENTS_DIR="" # Leave empty to encode on-the-fly (e.g., "/tmp/maisi_latents")
+RESUME_ID="86funnoa" # Leave empty if not resuming (e.g., "uszjimzg")
+TAGS="thorax" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -60,6 +62,12 @@ SCRIPT="src/maisi_baseline/train.py"
 CMD="python $SCRIPT --split_file $SPLIT_FILE --lr $LR --batch_size $BATCH_SIZE --accum_steps $ACCUM_STEPS --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --model_save_interval $SAVE_INTERVAL --wandb $WANDB"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_wandb_id $RESUME_ID"
+fi
+if [ ! -z "$PREENCODED_LATENTS_DIR" ]; then
+    CMD="$CMD --preencoded_latents_dir $PREENCODED_LATENTS_DIR"
+fi
+if [ ! -z "$TAGS" ]; then
+    CMD="$CMD --tags \"$TAGS\""
 fi
 
 echo "Running command: $CMD"

@@ -20,8 +20,7 @@ WEIGHTED_SAMPLER="False"
 EPOCHS=1000
 STEPS_PER_EPOCH=500
 NUM_WORKERS=4
-RESUME_ID="m3nvntkd"  # Leave empty if not resuming
-TAGS="thorax" # Comma-separated extra WandB tags
+RESUME_ID=""  # Leave empty if not resuming
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -54,9 +53,6 @@ SCRIPT="src/unet_baseline/train.py"
 CMD="python $SCRIPT --split_file $SPLIT_FILE --dice_w $DICE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
-fi
-if [ ! -z "$TAGS" ]; then
-    CMD="$CMD --tags \"$TAGS\""
 fi
 
 echo "Running command: $CMD"
