@@ -34,7 +34,7 @@ from anatomix.model.network import Unet
 from common.config import DEFAULT_CONFIG, Config
 from common.data import DataPreprocessing, build_tio_subjects, get_augmentations, get_region_key, get_subject_paths
 from common.trainer_base import BaseTrainer
-from common.utils import cleanup_gpu, compute_metrics, count_parameters, get_ram_info, send_notification, set_seed, unpad
+from common.utils import cleanup_gpu, count_parameters, get_ram_info, send_notification, set_seed, unpad, visualize_lite
 
 # ==========================================
 # CONFIGURATION
@@ -61,11 +61,12 @@ BASELINE_CONFIG = {
     "data_queue_num_workers": 4,
     # ----------------------
     # Experiment Basics
-    "project_name": "MRI2CT_UNet_Baseline",
-    "run_name_prefix": "UNet_Baseline",
+    "project_name": "mri2ct",
+    "run_name_prefix": "unet",
     "seed": 42,
     "device": "cuda",
     "wandb": True,
+    "wandb_tags": ["unet"],
     "wandb_note": "Baseline U-Net (Input 1 -> Output 1). L1+SSIM.",
     # Data
     "patch_size": 128,  # Same as main
@@ -80,7 +81,7 @@ BASELINE_CONFIG = {
     "compile_mode": "full",  # "full", "model", or None
     "scheduler_min_lr": 0.0,
     "accum_steps": 1,
-    "viz_limit": 10,
+    "viz_limit": 4,
     # Loss Weights (Matches DEFAULT_CONFIG)
     "l1_w": 1.0,
     "ssim_w": 0.1,
@@ -114,6 +115,9 @@ class BaselineTrainer(BaseTrainer):
         self._setup_data()
         self._setup_opt()
         self._setup_wandb()
+
+        # 7. Model Summary Logging
+        self._log_model_summary({"UNet_Baseline": self.model})
 
         self._load_resume(self.model, self.optimizer, self.scheduler, self.scaler)
 
@@ -156,7 +160,9 @@ class BaselineTrainer(BaseTrainer):
         self.train_iter = self._inf_gen(self.train_loader)
 
         # Val Loader
-        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg)
+        # NOTE: use_weighted_sampler here only loads mask.nii.gz as prob_map in the batch —
+        # it does NOT do weighted patch sampling (that's training-only via Queue).
+        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False))
         val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult)
         val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess)
         # Use SubjectsLoader to avoid warnings and ensure correct collation
@@ -173,8 +179,7 @@ class BaselineTrainer(BaseTrainer):
 
         viz_indices = []
         for region, indices in region_to_indices.items():
-            # Pick up to 2 subjects per region
-            num_to_pick = min(len(indices), 2)
+            num_to_pick = min(len(indices), self.cfg.viz_limit)
             viz_indices.extend(rng.sample(indices, num_to_pick))
 
         self.val_viz_indices = set(viz_indices)
@@ -441,7 +446,13 @@ class BaselineTrainer(BaseTrainer):
             # Metrics
             pred_unpad = unpad(pred, orig_shape, pad_offset)
             ct_unpad = unpad(ct, orig_shape, pad_offset)
-            met = compute_metrics(pred_unpad, ct_unpad)
+            mri_unpad = unpad(mri, orig_shape, pad_offset)
+
+            mask_unpad = None
+            if getattr(self.cfg, "val_body_mask", False) and "prob_map" in batch:
+                mask_unpad = unpad(batch["prob_map"][tio.DATA].to(self.device), orig_shape, pad_offset)
+
+            met, body_met = self._compute_val_metrics(pred_unpad, ct_unpad, mask_unpad)
 
             # Validation Dice & Probabilities
             pred_probs = None
@@ -463,11 +474,27 @@ class BaselineTrainer(BaseTrainer):
             for k, v in l_comps.items():
                 met[k] = v.item() if hasattr(v, "item") else v
 
+            # Body-masked dice (only when val_body_mask=True and teacher available)
+            if body_met is not None and pred_probs is not None and seg is not None:
+                from common.loss import get_class_dice
+
+                pred_probs_unpad = unpad(pred_probs, orig_shape, pad_offset)
+                seg_unpad = unpad(seg, orig_shape, pad_offset)
+                bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
+                class_dices, bone_dice = get_class_dice(pred_probs_unpad, seg_unpad, mask=mask_unpad, bone_idx=bone_idx)
+                excl_bg = getattr(self.cfg, "dice_exclude_background", True)
+                body_met["dice_score_all"] = (class_dices[1:].mean() if excl_bg else class_dices.mean()).item()
+                if bone_dice is not None:
+                    body_met["dice_score_bone"] = bone_dice.item()
+
             if pred_probs is not None:
                 del pred_probs  # Fix VRAM leak
 
             for k, v in met.items():
                 val_metrics[k].append(v)
+            if body_met is not None:
+                for k, v in body_met.items():
+                    val_metrics[f"body_{k}"].append(v)
 
             # Save Volumes (Optional - only visualized to save time)
             if self.cfg.save_val_volumes and i in self.val_viz_indices:
@@ -492,17 +519,20 @@ class BaselineTrainer(BaseTrainer):
             # Viz
             if i in self.val_viz_indices:
                 if self.cfg.wandb:
-                    self._visualize_lite(pred, ct, mri, subj_id, orig_shape, self.global_step, epoch, idx=i, offset=pad_offset, save_path=save_path)
+                    visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}")
 
-            del mri, ct, pred, pred_unpad, ct_unpad
+            del mri, ct, pred, pred_unpad, ct_unpad, mri_unpad
 
         # 2. Augmentation Viz
         if self.cfg.wandb and self.cfg.augment:
             self._log_aug_viz(self.global_step)
 
-        avg_met = {k: np.mean(v) for k, v in val_metrics.items()}
+        avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
+        avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
         if self.cfg.wandb:
             wandb.log({f"val/{k}": v for k, v in avg_met.items()}, step=self.global_step)
+            if avg_body:
+                wandb.log({f"val_body/{k}": v for k, v in avg_body.items()}, step=self.global_step)
 
         return avg_met
 
@@ -587,10 +617,14 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", type=str, default="True", choices=["True", "False"], help="Enable/disable wandb (True/False)")
     parser.add_argument("--dice_w", type=float, help="Dice loss weight")
     parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
+    parser.add_argument("--batch_size", type=int, help="Batch size")
+    parser.add_argument("--run_name", type=str, help="WandB run name prefix")
     parser.add_argument("--augment", type=str, choices=["True", "False"], help="Enable/disable data augmentation (True/False)")
+    parser.add_argument("--weighted_sampler", type=str, choices=["True", "False"], help="Enable/disable weighted sampler (True/False)")
     parser.add_argument("--epochs", type=int, help="Total epochs to train")
     parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
     parser.add_argument("--num_workers", type=int, help="Number of workers for the data queue")
+    parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -602,8 +636,14 @@ if __name__ == "__main__":
         BASELINE_CONFIG["dice_w"] = args.dice_w
     if args.resume_id is not None:
         BASELINE_CONFIG["resume_wandb_id"] = args.resume_id
+    if args.batch_size is not None:
+        BASELINE_CONFIG["batch_size"] = args.batch_size
+    if args.run_name is not None:
+        BASELINE_CONFIG["run_name_prefix"] = args.run_name
     if args.augment is not None:
         BASELINE_CONFIG["augment"] = args.augment == "True"
+    if args.weighted_sampler is not None:
+        BASELINE_CONFIG["use_weighted_sampler"] = args.weighted_sampler == "True"
     if args.split_file is not None:
         BASELINE_CONFIG["split_file"] = args.split_file
     if args.epochs is not None:
@@ -612,6 +652,9 @@ if __name__ == "__main__":
         BASELINE_CONFIG["steps_per_epoch"] = args.steps_per_epoch
     if args.num_workers is not None:
         BASELINE_CONFIG["data_queue_num_workers"] = args.num_workers
+    if args.tags is not None:
+        BASELINE_CONFIG.setdefault("wandb_tags", [])
+        BASELINE_CONFIG["wandb_tags"] = BASELINE_CONFIG["wandb_tags"] + [t.strip() for t in args.tags.split(",") if t.strip()]
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

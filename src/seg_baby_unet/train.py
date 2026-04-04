@@ -60,7 +60,7 @@ SEG_CONFIG = {
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5x1.5x1.5mm",
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
-    "project_name": "MRI2CT_Seg_Baby_Unet",
+    "project_name": "mri2ct",
     "wandb": True,
     "wandb_note": "Finetuning Anatomix on CADS Segmentation (11 classes) - CT Input - 1.5mm - Full Logic Parity",
     ##### Classes
@@ -103,7 +103,7 @@ SEG_CONFIG = {
     "override_lr": False,
     ##### Validation / Viz
     "save_val_volumes": True,
-    "viz_limit": 2,
+    "viz_limit": 4,
     "val_sw_overlap": 0.7,
     "augment": True,
     "enable_profiling": False,
