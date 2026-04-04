@@ -24,7 +24,7 @@ MAISI_CONFIG = {
     "stage_data": True,
     "batch_size": 1,
     "accum_steps": 1,  # Match effective batch size of other models (4)
-    "lr": 3e-4,
+    "lr": 5e-4,
     "total_epochs": 1000,
     "steps_per_epoch": 1000,
     "val_interval": 2,
@@ -37,12 +37,14 @@ MAISI_CONFIG = {
     "dataloader_num_workers": 4,
     # ----------------------
     # Experiment Basics
-    "project_name": "MRI2CT_MAISI_Baseline",
-    "run_name_prefix": "MAISI_ControlNet",
+    "project_name": "mri2ct",
+    "run_name_prefix": "maisi",
     "seed": 42,
     "device": "cuda",
     "wandb": True,
+    "wandb_tags": ["maisi"],
     "wandb_note": "MAISI Baseline ControlNet (On-the-fly VAE).",
+    "preencoded_latents_dir": None,  # If set, pre-encode all CT volumes once and cache latents here
     # Data
     "patch_size": 128,  # Must be divisible by 4 (VAE requirement)
     "res_mult": 16,  # Standard alignment
@@ -60,6 +62,7 @@ MAISI_CONFIG = {
 
 def main():
     parser = argparse.ArgumentParser(description="Train MAISI ControlNet Baseline")
+    parser.add_argument("--root_dir", type=str, help="Root directory containing subject folders")
     parser.add_argument("--split_file", type=str, help="Path to split mapping file")
     parser.add_argument("--subjects", nargs="*", help="Specific subjects for single image optimization (e.g., 1ABA005)")
     parser.add_argument("--batch_size", type=int, help="Batch size")
@@ -71,9 +74,31 @@ def main():
     parser.add_argument("--model_save_interval", type=int, help="Model save interval")
     parser.add_argument("--wandb", type=str, choices=["True", "False"], help="Enable/disable wandb")
     parser.add_argument("--resume_wandb_id", type=str, help="WandB Run ID to resume from")
+    parser.add_argument("--preencoded_latents_dir", type=str, help="Directory to cache pre-encoded CT latents")
+    parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
 
     args = parser.parse_args()
 
+    if args.subjects:
+        print(f"🔬 RUNNING SINGLE SUBJECT TEST: {args.subjects}")
+        # Default SSO overrides
+        MAISI_CONFIG.update(
+            {
+                "subjects": args.subjects,
+                "total_epochs": 1000,
+                "lr": 5e-4,
+                "batch_size": 1,
+                "accum_steps": 1,
+                "wandb_note": f"MAISI Overfitting Test - {args.subjects}",
+                "val_interval": 50,
+                "model_save_interval": 100,
+                "augment": False,
+            }
+        )
+
+    # CLI Overrides (Must come last to have priority)
+    if args.root_dir:
+        MAISI_CONFIG["root_dir"] = args.root_dir
     if args.split_file:
         MAISI_CONFIG["split_file"] = args.split_file
     if args.batch_size:
@@ -94,22 +119,11 @@ def main():
         MAISI_CONFIG["wandb"] = args.wandb == "True"
     if args.resume_wandb_id:
         MAISI_CONFIG["resume_wandb_id"] = args.resume_wandb_id
-
-    if args.subjects:
-        print(f"🔬 RUNNING SINGLE SUBJECT TEST: {args.subjects}")
-        MAISI_CONFIG.update(
-            {
-                "subjects": args.subjects,
-                "total_epochs": 1000,
-                "lr": 5e-4,
-                "batch_size": 1,
-                "accum_steps": 1,
-                "wandb_note": f"MAISI Overfitting Test - {args.subjects}",
-                "val_interval": 50,
-                "model_save_interval": 100,
-                "augment": False,  # usually disable augment for overfitting test
-            }
-        )
+    if args.preencoded_latents_dir:
+        MAISI_CONFIG["preencoded_latents_dir"] = args.preencoded_latents_dir
+    if args.tags:
+        MAISI_CONFIG.setdefault("wandb_tags", [])
+        MAISI_CONFIG["wandb_tags"] = MAISI_CONFIG["wandb_tags"] + [t.strip() for t in args.tags.split(",") if t.strip()]
 
     try:
         trainer = MAISITrainer(MAISI_CONFIG)

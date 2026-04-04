@@ -26,7 +26,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.config import Config
 from common.data import DataPreprocessing, build_tio_subjects, get_augmentations, get_region_key
 from common.trainer_base import BaseTrainer
-from common.utils import anatomix_normalize, compute_metrics, count_parameters
+from common.utils import anatomix_normalize, count_parameters, visualize_lite
 
 
 class MAISITrainer(BaseTrainer):
@@ -43,9 +43,21 @@ class MAISITrainer(BaseTrainer):
         self._find_subjects()
         self._stage_data_local()
         self._setup_models()
+        if getattr(self.cfg, "preencoded_latents_dir", None):
+            self.cfg.augment = False
+            print(f"[{self.prefix}] 💾 Pre-encoded latents enabled. Augmentation disabled.")
+            self._pre_encode_all()
         self._setup_data()
         self._setup_opt()
         self._setup_wandb()
+        
+        # 7. Model Summary Logging
+        models_to_log = {
+            "ControlNet (Trainable)": self.controlnet,
+            "UNet (Frozen)": self.unet,
+            "Autoencoder (Frozen)": self.autoencoder
+        }
+        self._log_model_summary(models_to_log)
 
         extra_modules = {"unet": self.unet, "autoencoder": self.autoencoder}
         self._load_resume(self.controlnet, self.optimizer, self.scheduler, self.scaler, extra_modules=extra_modules)
@@ -94,6 +106,51 @@ class MAISITrainer(BaseTrainer):
         tot, train = count_parameters(self.controlnet)
         print(f"[{self.prefix}] ControlNet Params: Total={tot:,} | Trainable={train:,}")
 
+    @staticmethod
+    def _resample_subject(subject):
+        """Normalize and resample subject to nearest multiple of 32 for VAE compatibility."""
+        from monai.transforms import Resized
+
+        subject = tio.ToCanonical()(subject)
+        subject["original_spacing"] = torch.from_numpy(np.array(subject["ct"].spacing)).float()
+        subject["original_spatial_shape"] = torch.tensor(subject["ct"].spatial_shape)
+        subject["ct"].set_data(anatomix_normalize(subject["ct"].data, clip_range=(-1024, 1024)))
+        subject["mri"].set_data(anatomix_normalize(subject["mri"].data))
+        curr_shape = np.array(subject["ct"].spatial_shape)
+        target_shape = np.round(curr_shape / 32.0).astype(int) * 32
+        target_shape = np.maximum(target_shape, 32)
+        resizer = Resized(keys=["ct", "mri"], spatial_size=target_shape, mode="trilinear")
+        data_dict = {"ct": subject["ct"].data, "mri": subject["mri"].data}
+        resized_data = resizer(data_dict)
+        subject["ct"].set_data(resized_data["ct"])
+        subject["mri"].set_data(resized_data["mri"])
+        return subject
+
+    def _pre_encode_all(self):
+        """Pre-encode all train+val CT volumes to VAE latent space and cache to disk."""
+        cache_dir = self.cfg.preencoded_latents_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+        all_subjects = list(dict.fromkeys(self.train_subjects + self.val_subjects))
+        to_encode = [s for s in all_subjects if not os.path.exists(os.path.join(cache_dir, f"{s}_ct_latent.pt"))]
+        print(f"[{self.prefix}] Pre-encoding: {len(to_encode)} to encode, {len(all_subjects) - len(to_encode)} already cached.")
+
+        if not to_encode:
+            return
+
+        subj_objs = build_tio_subjects(self.cfg.root_dir, to_encode, use_weighted_sampler=False, load_seg=False)
+        for subj_obj in tqdm(subj_objs, desc="Pre-encoding CT latents"):
+            sid = subj_obj["subj_id"]
+            subj_obj = MAISITrainer._resample_subject(subj_obj)
+            ct = subj_obj["ct"].data.unsqueeze(0).to(self.device)
+            ct_emb = self._encode_sliding_window(ct) * self.scale_factor
+            torch.save(ct_emb.cpu(), os.path.join(cache_dir, f"{sid}_ct_latent.pt"))
+            del ct, ct_emb
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        print(f"[{self.prefix}] Pre-encoding complete.")
+
     def _setup_data(self, seed=None):
         if seed is not None:
             random.seed(seed)
@@ -112,38 +169,7 @@ class MAISITrainer(BaseTrainer):
         # Full Volume Training Data Pipeline
         train_objs = build_tio_subjects(self.cfg.root_dir, self.train_subjects, use_weighted_sampler=False, load_seg=False)
 
-        from monai.transforms import Resized
-
-        def resample_to_32(subject):
-            # 1. Enforce RAS
-            subject = tio.ToCanonical()(subject)
-
-            # Store original spacing for the model (original code doesn't adjust spacing after Resized)
-            subject["original_spacing"] = torch.from_numpy(np.array(subject["ct"].spacing)).float()
-
-            # Store original shape for logging/metrics
-            subject["original_spatial_shape"] = torch.tensor(subject["ct"].spatial_shape)
-
-            # 2. Normalize
-            subject["ct"].set_data(anatomix_normalize(subject["ct"].data, clip_range=(-1024, 1024)))
-            subject["mri"].set_data(anatomix_normalize(subject["mri"].data))
-
-            # 3. Calculate target dimensions (nearest multiple of 32)
-            curr_shape = np.array(subject["ct"].spatial_shape)
-            target_shape = np.round(curr_shape / 32.0).astype(int) * 32
-            target_shape = np.maximum(target_shape, 32)  # Min size 32
-
-            # 4. Resample using MONAI Resized (trilinear)
-            resizer = Resized(keys=["ct", "mri"], spatial_size=target_shape, mode="trilinear")
-            data_dict = {"ct": subject["ct"].data, "mri": subject["mri"].data}
-            resized_data = resizer(data_dict)
-
-            subject["ct"].set_data(resized_data["ct"])
-            subject["mri"].set_data(resized_data["mri"])
-
-            return subject
-
-        transforms = tio.Compose([resample_to_32, get_augmentations()]) if self.cfg.augment else tio.Compose([resample_to_32])
+        transforms = tio.Compose([MAISITrainer._resample_subject, get_augmentations()]) if self.cfg.augment else tio.Compose([MAISITrainer._resample_subject])
         train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
 
         from torch.utils.data import DataLoader
@@ -158,8 +184,11 @@ class MAISITrainer(BaseTrainer):
         self.train_iter = _cycle(self.train_loader)
 
         # Val Loader
-        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=False)
-        val_ds = tio.SubjectsDataset(val_objs, transform=resample_to_32)
+        # NOTE: use_weighted_sampler here only loads mask.nii.gz as prob_map in the subject —
+        # it does NOT do weighted patch sampling (that's training-only via Queue).
+        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=False,
+                                      use_weighted_sampler=getattr(self.cfg, "val_body_mask", False))
+        val_ds = tio.SubjectsDataset(val_objs, transform=MAISITrainer._resample_subject)
         self.val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda x: x)
 
         # Stratified Validation Sampling
@@ -175,7 +204,7 @@ class MAISITrainer(BaseTrainer):
             # For visualization (pick 2 per region)
             viz_indices = []
             for region, indices in region_to_indices.items():
-                sampled = rng.sample(indices, min(2, len(indices)))
+                sampled = rng.sample(indices, min(self.cfg.viz_limit, len(indices)))
                 viz_indices.extend(sampled)
             self.val_viz_indices = set(viz_indices)
         else:
@@ -208,17 +237,17 @@ class MAISITrainer(BaseTrainer):
 
         inferer = SlidingWindowInferer(
             roi_size=[64, 64, 64],
-            sw_batch_size=self.cfg.val_sw_batch_size,
-            overlap=self.cfg.val_sw_overlap,
+            sw_batch_size=self.cfg.val_sw_batch_size,  # 1
+            overlap=self.cfg.val_sw_overlap,  # 0.4
             mode="gaussian",
             sw_device=self.device,
-            device=torch.device("cpu"),
+            device=self.device,
         )
 
         with torch.amp.autocast("cuda"):
             latent = inferer(ct_norm.to(self.device), self.autoencoder.encode_stage_2_inputs)
 
-        return latent.to(self.device)
+        return latent
 
     @torch.no_grad()
     def _decode(self, z):
@@ -229,7 +258,7 @@ class MAISITrainer(BaseTrainer):
             if all(s <= r for s, r in zip(latent.shape[2:], roi_size)):
                 recon = self.autoencoder.decode_stage_2_outputs(latent)
             else:
-                inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=1, overlap=0.4, mode="gaussian", sw_device=self.device, device=torch.device("cpu"))
+                inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=1, overlap=0.4, mode="gaussian", sw_device=self.device, device=self.device)
                 recon = inferer(latent, self.autoencoder.decode_stage_2_outputs)
         recon = torch.clamp(recon, 0.0, 1.0)
         return recon.to(self.device)
@@ -291,9 +320,14 @@ class MAISITrainer(BaseTrainer):
                 # STRICT PARITY: The original author does NOT adjust the spacing tensor after resizing the image
                 spacing = torch.stack([subj["original_spacing"] for subj in batch_list]).to(self.device) * 100.0
 
-                # 1. On-the-fly Encoding (Sliding Window for full volume)
+                # 1. Encode CT to latent (load from cache or encode on-the-fly)
                 t0_enc = time.time()
-                ct_emb = self._encode_sliding_window(ct) * self.scale_factor
+                if getattr(self.cfg, "preencoded_latents_dir", None):
+                    ct_emb = torch.cat(
+                        [torch.load(os.path.join(self.cfg.preencoded_latents_dir, f"{subj['subj_id']}_ct_latent.pt"), map_location=self.device, weights_only=False) for subj in batch_list], dim=0
+                    )
+                else:
+                    ct_emb = self._encode_sliding_window(ct) * self.scale_factor
                 step_t_encode += time.time() - t0_enc
 
                 with torch.amp.autocast("cuda"):
@@ -391,7 +425,10 @@ class MAISITrainer(BaseTrainer):
             pred_hu = (pred_ct_norm * 2000.0) - 1000.0
 
             # Proxy diffusion loss (on resampled latent space)
-            ct_emb = self._encode_sliding_window(ct) * self.scale_factor
+            if getattr(self.cfg, "preencoded_latents_dir", None):
+                ct_emb = torch.load(os.path.join(self.cfg.preencoded_latents_dir, f"{subj_id}_ct_latent.pt"), map_location=self.device, weights_only=False)
+            else:
+                ct_emb = self._encode_sliding_window(ct) * self.scale_factor
             noise = torch.randn_like(ct_emb)
             if hasattr(self.noise_scheduler, "sample_timesteps"):
                 timesteps = self.noise_scheduler.sample_timesteps(ct_emb)
@@ -401,8 +438,15 @@ class MAISITrainer(BaseTrainer):
             down_res, mid_res = self.controlnet(x=noisy_latent, timesteps=timesteps, controlnet_cond=mr)
             model_output = self.unet(x=noisy_latent, timesteps=timesteps, spacing_tensor=spacing, down_block_additional_residuals=down_res, mid_block_additional_residual=mid_res)
 
-            # Use same proxy loss target as training (RFlow V_PREDICTION)
-            val_metrics["loss"].append(F.l1_loss(model_output.float(), (ct_emb - noise).float()).item())
+            # Use same proxy loss target as training (matches prediction_type)
+            from monai.networks.schedulers.ddpm import DDPMPredictionType
+            if self.noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
+                val_target = noise
+            elif self.noise_scheduler.prediction_type == DDPMPredictionType.SAMPLE:
+                val_target = ct_emb
+            else:  # V_PREDICTION or default
+                val_target = ct_emb - noise
+            val_metrics["loss"].append(F.l1_loss(model_output.float(), val_target.float()).item())
 
             # Evaluate standard metrics in matched [0, 1] range (referring to [-1000, 1000])
             pred_matched = pred_ct_norm
@@ -413,12 +457,17 @@ class MAISITrainer(BaseTrainer):
             gt_resized = F.interpolate(gt_matched.float(), size=orig_shape, mode="trilinear", align_corners=False)
 
             # compute_metrics expects (B, C, D, H, W). Use range 1.0 since data is normalized [0, 1]
-            met = compute_metrics(pred_resized, gt_resized)
+            # prob_map (if loaded) stays at original resolution — same as orig_shape, no interpolation needed
+            mask_unpad = None
+            if getattr(self.cfg, "val_body_mask", False) and "prob_map" in subj:
+                mask_unpad = subj["prob_map"]["data"].unsqueeze(0).to(self.device)
 
-            # NVIDIA MAISI MAE HU Metric Logic (masked HU)
-            mask = gt_hu > -900
-            if mask.any():
-                mae_hu = torch.mean(torch.abs(pred_hu[mask] - gt_hu[mask])).item()
+            met, body_met = self._compute_val_metrics(pred_resized, gt_resized, mask_unpad)
+
+            # NVIDIA MAISI MAE HU Metric Logic (masked HU — separate from body mask)
+            hu_mask = gt_hu > -900
+            if hu_mask.any():
+                mae_hu = torch.mean(torch.abs(pred_hu[hu_mask] - gt_hu[hu_mask])).item()
             else:
                 mae_hu = 0.0
 
@@ -426,58 +475,23 @@ class MAISITrainer(BaseTrainer):
 
             for k, v in met.items():
                 val_metrics[k].append(v)
+            if body_met is not None:
+                for k, v in body_met.items():
+                    val_metrics[f"body_{k}"].append(v)
 
             if i in self.val_viz_indices and self.cfg.wandb:
-                self._visualize_lite(pred_matched, ct, mr, subj_id, orig_shape, self.global_step, epoch, i)
+                from common.utils import visualize_lite
+                visualize_lite(pred_matched, ct, mr, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}")
 
-        avg_met = {k: np.mean(v) for k, v in val_metrics.items()}
-        avg_met["avg_inference_time"] = (time.time() - t_inf_start) / len(self.val_indices_to_run)
+        avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
+        avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
+        n_val = len(self.val_indices_to_run)
+        avg_met["avg_inference_time"] = (time.time() - t_inf_start) / n_val if n_val > 0 else 0.0
         if self.cfg.wandb:
             wandb.log({f"val/{k}": v for k, v in avg_met.items()}, step=self.global_step)
+            if avg_body:
+                wandb.log({f"val_body/{k}": v for k, v in avg_body.items()}, step=self.global_step)
         return avg_met
-
-    @torch.no_grad()
-    def _visualize_lite(self, pred, ct, mri, subj_id, shape, step, epoch, idx, offset=0, save_path=None):
-        """Standard 4-column view: MRI, GT, Pred, Residual."""
-        # Note: volumes are already resampled back to original spatial shape
-        gt_mri = mri.squeeze().cpu().numpy()
-        gt_ct = ct.squeeze().cpu().numpy()
-        pred_ct = pred.squeeze().cpu().numpy()
-
-        items = [
-            (gt_mri, "GT MRI", "gray", (0, 1)),
-            (gt_ct, "GT CT", "gray", (0, 1)),
-            (pred_ct, "Pred CT", "gray", (0, 1)),
-            (pred_ct - gt_ct, "Residual", "seismic", (-0.2, 0.2)),
-        ]
-
-        D_dim = gt_ct.shape[-1]
-        num_cols = len(items)
-        slice_indices = np.linspace(0.1 * D_dim, 0.9 * D_dim, 5, dtype=int)
-
-        fig, axes = plt.subplots(len(slice_indices), num_cols, figsize=(3 * num_cols, 3.5 * len(slice_indices)))
-        plt.subplots_adjust(wspace=0.05, hspace=0.15)
-
-        for i, z_slice in enumerate(slice_indices):
-            for j, (data, title, cmap, clim) in enumerate(items):
-                ax = axes[i, j]
-                im = ax.imshow(np.rot90(data[:, :, z_slice]), cmap=cmap, vmin=clim[0], vmax=clim[1])
-                if title == "Residual":
-                    res_im = im
-                if i == 0:
-                    ax.set_title(title)
-                ax.axis("off")
-
-        if "res_im" in locals():
-            cbar = fig.colorbar(res_im, ax=axes[:, 3], fraction=0.04, pad=0.01)
-            cbar.set_label("Residual Error")
-
-        fig.suptitle(f"Subject: {subj_id} | Ep {epoch} | Step {step}", fontsize=16, y=0.99)
-        if self.cfg.wandb:
-            wandb.log({f"viz/{('val_' + str(idx))}": wandb.Image(fig)}, step=step)
-        plt.close(fig)
-
-    @torch.no_grad()
     def _log_training_patch(self, mr, ct, decoded_ct, step, step_idx, subj_id=None):
         """Visualizes [MR, GT, Decoded GT Latent] for full-volume training."""
         mr_img = mr[0, 0].cpu().numpy()
@@ -547,9 +561,18 @@ class MAISITrainer(BaseTrainer):
                     self.scheduler,
                     self.scaler,
                     epoch,
-                    os.path.join(self.gpfs_root, "results", "models", "maisi", f"maisi_epoch{epoch:05d}.pt"),
+                    os.path.join(wandb.run.dir if self.cfg.wandb and wandb.run and wandb.run.dir else os.path.join(self.gpfs_root, "results", "models", "maisi"), f"maisi_epoch{epoch:05d}.pt"),
                     extra_state={"scale_factor": self.scale_factor},
                 )
+
+        # Final checkpoint
+        save_dir = wandb.run.dir if self.cfg.wandb and wandb.run and wandb.run.dir else os.path.join(self.gpfs_root, "results", "models", "maisi")
+        self.save_checkpoint(
+            self.controlnet, self.optimizer, self.scheduler, self.scaler,
+            self.cfg.total_epochs,
+            os.path.join(save_dir, f"maisi_epoch{self.cfg.total_epochs:05d}.pt"),
+            extra_state={"scale_factor": self.scale_factor},
+        )
 
         if self.cfg.wandb:
             wandb.finish()
