@@ -1,0 +1,139 @@
+============================================================
+MODEL PARAMETER SUMMARY
+============================================================
+
+--- Model: Translator ---
+  Total Params:     5,899,776
+  Trainable Params: 5,899,776
+  Frozen Params:    0
+
+  Trainable Layers Manifest:
+    - model.0.weight (7,344 params)
+    - model.1.weight (16 params)
+    - model.1.bias (16 params)
+    - model.3.weight (6,912 params)
+    - model.4.weight (16 params)
+    - model.4.bias (16 params)
+    - model.6.weight (6,912 params)
+    - model.7.weight (16 params)
+    - model.7.bias (16 params)
+    - model.10.weight (13,824 params)
+    - model.11.weight (32 params)
+    - model.11.bias (32 params)
+    - model.13.weight (27,648 params)
+    - model.14.weight (32 params)
+    - model.14.bias (32 params)
+    - model.17.weight (55,296 params)
+    - model.18.weight (64 params)
+    - model.18.bias (64 params)
+    - model.20.weight (110,592 params)
+    - model.21.weight (64 params)
+    - model.21.bias (64 params)
+    - model.24.weight (221,184 params)
+    - model.25.weight (128 params)
+    - model.25.bias (128 params)
+    - model.27.weight (442,368 params)
+    - model.28.weight (128 params)
+    - model.28.bias (128 params)
+    - model.31.weight (884,736 params)
+    - model.32.weight (256 params)
+    - model.32.bias (256 params)
+    - model.34.weight (1,769,472 params)
+    - model.35.weight (256 params)
+    - model.35.bias (256 params)
+    - model.38.weight (1,327,104 params)
+    - model.39.weight (128 params)
+    - model.39.bias (128 params)
+    - model.41.weight (442,368 params)
+    - model.42.weight (128 params)
+    - model.42.bias (128 params)
+    - model.45.weight (331,776 params)
+    - model.46.weight (64 params)
+    - model.46.bias (64 params)
+    - model.48.weight (110,592 params)
+    - model.49.weight (64 params)
+    - model.49.bias (64 params)
+    - model.52.weight (82,944 params)
+    - model.53.weight (32 params)
+    - model.53.bias (32 params)
+    - model.55.weight (27,648 params)
+    - model.56.weight (32 params)
+    - model.56.bias (32 params)
+    - model.59.weight (20,736 params)
+    - model.60.weight (16 params)
+    - model.60.bias (16 params)
+    - model.62.weight (6,912 params)
+    - model.63.weight (16 params)
+    - model.63.bias (16 params)
+    - model.65.weight (432 params)
+
+--- Model: Extractor ---
+  Total Params:     36,862,576
+  Trainable Params: 36,862,576
+  Frozen Params:    0
+
+  Trainable Layers Manifest:
+    - model.0.weight (540 params)
+    - model.0.bias (20 params)
+    - model.3.weight (10,800 params)
+    - model.3.bias (20 params)
+    - model.6.weight (10,800 params)
+    - model.6.bias (20 params)
+    - model.10.weight (21,600 params)
+    - model.10.bias (40 params)
+    - model.13.weight (43,200 params)
+    - model.13.bias (40 params)
+    - model.17.weight (86,400 params)
+    - model.17.bias (80 params)
+    - model.20.weight (172,800 params)
+    - model.20.bias (80 params)
+    - model.24.weight (345,600 params)
+    - model.24.bias (160 params)
+    - model.27.weight (691,200 params)
+    - model.27.bias (160 params)
+    - model.31.weight (1,382,400 params)
+    - model.31.bias (320 params)
+    - model.34.weight (2,764,800 params)
+    - model.34.bias (320 params)
+    - model.38.weight (5,529,600 params)
+    - model.38.bias (640 params)
+    - model.41.weight (11,059,200 params)
+    - model.41.bias (640 params)
+    - model.45.weight (8,294,400 params)
+    - model.45.bias (320 params)
+    - model.48.weight (2,764,800 params)
+    - model.48.bias (320 params)
+    - model.52.weight (2,073,600 params)
+    - model.52.bias (160 params)
+    - model.55.weight (691,200 params)
+    - model.55.bias (160 params)
+    - model.59.weight (518,400 params)
+    - model.59.bias (80 params)
+    - model.62.weight (172,800 params)
+    - model.62.bias (80 params)
+    - model.66.weight (129,600 params)
+    - model.66.bias (40 params)
+    - model.69.weight (43,200 params)
+    - model.69.bias (40 params)
+    - model.73.weight (32,400 params)
+    - model.73.bias (20 params)
+    - model.76.weight (10,800 params)
+    - model.76.bias (20 params)
+    - model.79.weight (8,640 params)
+    - model.79.bias (16 params)
+
+--- Model: Teacher ---
+  Total Params:     36,862,780
+  Trainable Params: 0
+  Frozen Params:    36,862,780
+
+  Trainable Layers Manifest:
+    (No trainable layers)
+
+============================================================
+FINAL AGGREGATE SUMMARY
+------------------------------------------------------------
+AGGREGATE TOTAL:     79,625,132
+AGGREGATE TRAINABLE: 42,762,352 (53.70%)
+AGGREGATE FROZEN:    36,862,780
+============================================================
