@@ -25,7 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 from common.config import Config
 from common.data import DataPreprocessing, build_tio_subjects, get_augmentations, get_region_key, get_subject_paths
 from common.trainer_base import BaseTrainer
-from common.utils import clean_state_dict, compute_metrics, count_parameters, get_ram_info, set_seed, unpad
+from common.utils import clean_state_dict, count_parameters, get_ram_info, log_model_summary, set_seed, unpad, visualize_lite
 
 
 class Trainer(BaseTrainer):
@@ -41,6 +41,16 @@ class Trainer(BaseTrainer):
         self._setup_data()
         self._setup_opt()
         self._setup_wandb()
+
+        # 7. Model Summary Logging
+        models_to_log = {
+            "Unet_Translator": self.model,
+            "Anatomix_Feat_Extractor": self.feat_extractor,
+        }
+        if self.teacher_model is not None:
+            models_to_log["Teacher_Model"] = self.teacher_model
+
+        self._log_model_summary(models_to_log)
 
         self._load_resume()
 
@@ -109,7 +119,9 @@ class Trainer(BaseTrainer):
 
         # 6. Val Loader (Full Volume)
         # Load seg for validation if we are using Dice loss (to measure semantic consistency)
-        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg)
+        # NOTE: use_weighted_sampler here only loads mask.nii.gz as prob_map in the batch —
+        # it does NOT do weighted patch sampling (that's training-only via Queue).
+        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False))
         val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult)
         val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess)
         self.val_loader = tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
@@ -125,8 +137,7 @@ class Trainer(BaseTrainer):
 
         viz_indices = []
         for region, indices in region_to_indices.items():
-            # Pick up to 2 subjects per region
-            num_to_pick = min(len(indices), 2)
+            num_to_pick = min(len(indices), self.cfg.viz_limit)
             viz_indices.extend(rng.sample(indices, num_to_pick))
 
         self.val_viz_indices = set(viz_indices)
@@ -169,10 +180,30 @@ class Trainer(BaseTrainer):
             print(f"[WARNING] ⚠️ Anatomix weights NOT FOUND at {ckpt}")
 
         if self.cfg.finetune_feat_extractor:
-            print("[DEBUG] 🔓 Unfreezing Anatomix for Fine-Tuning...")
-            for p in self.feat_extractor.parameters():
-                p.requires_grad = True
-            self.feat_extractor.train()
+            depth = getattr(self.cfg, "finetune_depth", 0)
+            if depth == -1:
+                print("[DEBUG] 🔓 Unfreezing Anatomix (Full Fine-Tuning)...")
+                for p in self.feat_extractor.parameters():
+                    p.requires_grad = True
+                self.feat_extractor.train()
+            elif depth > 0:
+                # Access the underlying nn.Sequential model
+                target_model = getattr(self.feat_extractor, "_orig_mod", self.feat_extractor)
+                if hasattr(target_model, "model"):
+                    modules = list(target_model.model.children())
+                    unfreeze_start = max(0, len(modules) - depth)
+                    print(f"[DEBUG] 🔓 Unfreezing Anatomix from module {unfreeze_start}/{len(modules)} (depth={depth})...")
+                    for i in range(unfreeze_start, len(modules)):
+                        for p in modules[i].parameters():
+                            p.requires_grad = True
+                    self.feat_extractor.train()
+                else:
+                    print(f"[WARNING] Feature extractor does not have .model attribute. Cannot unfreeze by depth.")
+            else:
+                # Fallback for depth=0 or unset
+                for p in self.feat_extractor.parameters():
+                    p.requires_grad = False
+                self.feat_extractor.eval()
         else:
             for p in self.feat_extractor.parameters():
                 p.requires_grad = False
@@ -258,6 +289,11 @@ class Trainer(BaseTrainer):
             if getattr(self.cfg, "feat_instance_norm", False):
                 features = torch.nn.functional.instance_norm(features)
 
+            # B) Zero-masking for background noise suppression
+            if getattr(self.cfg, "use_zero_mask", False):
+                mask = (mri > 0.01).to(mri.dtype)
+                features = features * mask
+
             if getattr(self.cfg, "pass_mri_to_translator", False):
                 translator_input = torch.cat([features, mri], dim=1)
 
@@ -283,9 +319,16 @@ class Trainer(BaseTrainer):
         return pred, loss, comps, pred_probs
 
     def _setup_opt(self):
-        params = [{"params": self.model.parameters(), "lr": self.cfg.lr}]
-        if self.cfg.finetune_feat_extractor:
-            params.append({"params": self.feat_extractor.parameters(), "lr": self.cfg.lr_feat_extractor})
+        # We only pass parameters that actually require gradients to the optimizer
+        params = [{"params": [p for p in self.model.parameters() if p.requires_grad], "lr": self.cfg.lr}]
+
+        if getattr(self.cfg, "finetune_feat_extractor", False):
+            feat_params = [p for p in self.feat_extractor.parameters() if p.requires_grad]
+            if feat_params:
+                print(f"[DEBUG] 💡 Adding {len(feat_params)} feat_extractor parameters to optimizer (LR={self.cfg.lr_feat_extractor})")
+                params.append({"params": feat_params, "lr": self.cfg.lr_feat_extractor})
+            else:
+                print("[WARNING] ⚠️ finetune_feat_extractor is True, but no parameters require gradients.")
 
         self.optimizer = torch.optim.Adam(params)
 
@@ -487,11 +530,17 @@ class Trainer(BaseTrainer):
                 if getattr(self.cfg, "feat_instance_norm", False):
                     f = torch.nn.functional.instance_norm(f)
 
-                # 3. Concatenation
+                # 3. Zero-masking for background noise suppression
+                if getattr(self.cfg, "use_zero_mask", False):
+                    # anatomy=1, air=0
+                    mask = (x > 0.01).to(x.dtype)
+                    f = f * mask
+
+                # 4. Concatenation
                 if getattr(self.cfg, "pass_mri_to_translator", False):
                     f = torch.cat([f, x], dim=1)
 
-                    # 4. Input Dropout (Conditional on pass_mri)
+                    # 5. Input Dropout (Conditional on pass_mri)
                     drop_p = getattr(self.cfg, "input_dropout_p", 0.0)
                     if drop_p > 0:
                         f = torch.nn.functional.dropout3d(f, p=drop_p, training=False)
@@ -512,7 +561,13 @@ class Trainer(BaseTrainer):
             # Metrics
             pred_unpad = unpad(pred, orig_shape, pad_offset)
             ct_unpad = unpad(ct, orig_shape, pad_offset)
-            met = compute_metrics(pred_unpad, ct_unpad)
+            mri_unpad = unpad(mri, orig_shape, pad_offset)
+
+            mask_unpad = None
+            if getattr(self.cfg, "val_body_mask", False) and "prob_map" in batch:
+                mask_unpad = unpad(batch["prob_map"][tio.DATA].to(self.device), orig_shape, pad_offset)
+
+            met, body_met = self._compute_val_metrics(pred_unpad, ct_unpad, mask_unpad)
 
             # Validation Dice & Probabilities
             pred_probs = None
@@ -534,11 +589,27 @@ class Trainer(BaseTrainer):
             for k, v in l_comps.items():
                 met[k] = v.item() if hasattr(v, "item") else v
 
+            # Body-masked dice (only when val_body_mask=True and teacher available)
+            if body_met is not None and pred_probs is not None and seg is not None:
+                from common.loss import get_class_dice
+
+                pred_probs_unpad = unpad(pred_probs, orig_shape, pad_offset)
+                seg_unpad = unpad(seg, orig_shape, pad_offset)
+                bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
+                class_dices, bone_dice = get_class_dice(pred_probs_unpad, seg_unpad, mask=mask_unpad, bone_idx=bone_idx)
+                excl_bg = getattr(self.cfg, "dice_exclude_background", True)
+                body_met["dice_score_all"] = (class_dices[1:].mean() if excl_bg else class_dices.mean()).item()
+                if bone_dice is not None:
+                    body_met["dice_score_bone"] = bone_dice.item()
+
             if pred_probs is not None:
                 del pred_probs  # Fix memory leak
 
             for k, v in met.items():
                 val_metrics[k].append(v)
+            if body_met is not None:
+                for k, v in body_met.items():
+                    val_metrics[f"body_{k}"].append(v)
 
             # Viz & Save
             if i in self.val_viz_indices:
@@ -564,9 +635,11 @@ class Trainer(BaseTrainer):
                     nib.save(nii, save_path)
 
                 if self.cfg.wandb:
-                    self._visualize_lite(pred, ct, mri, subj_id, orig_shape, self.global_step, epoch, idx=i, offset=pad_offset, save_path=save_path)
+                    from common.utils import visualize_lite
 
-            del mri, ct, pred, pred_unpad, ct_unpad
+                    visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}")
+
+            del mri, ct, pred, pred_unpad, ct_unpad, mri_unpad
             # if "feats" in locals():
             #     del feats
 
@@ -575,9 +648,12 @@ class Trainer(BaseTrainer):
             self._log_aug_viz(self.global_step)
 
         # 3. Log
-        avg_met = {k: np.mean(v) for k, v in val_metrics.items()}
+        avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
+        avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
         if self.cfg.wandb:
             wandb.log({f"val/{k}": v for k, v in avg_met.items()}, step=self.global_step)
+            if avg_body:
+                wandb.log({f"val_body/{k}": v for k, v in avg_body.items()}, step=self.global_step)
 
         gc.collect()
         torch.cuda.empty_cache()

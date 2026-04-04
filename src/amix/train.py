@@ -36,7 +36,11 @@ EXPERIMENT_CONFIG = [
         "batch_size": 4,
         "accum_steps": 1,
         "sanity_check": False,
+        "run_name_prefix": "amix",
         "use_weighted_sampler": True,
+        "finetune_feat_extractor": False,
+        "finetune_depth": 0,  # 0: Frozen, -1: All, >0: Last N
+        "lr_feat_extractor": 1e-5,
         "resume_wandb_id": None,
         "resume_epoch": None,  # Optional: specify epoch number
         "diverge_wandb_branch": False,  # Create new run instead of resuming existing
@@ -49,11 +53,12 @@ EXPERIMENT_CONFIG = [
         "data_queue_num_workers": 4,
         # --------------------
         # "subjects": ["1ABA011"],
-        "viz_limit": 10,
+        "viz_limit": 4,
         "compile_mode": "full",
         # "compile_mode": "None",
         "lr": 3e-4,
         "scheduler_min_lr": 0.0,
+        "wandb_tags": ["amix"],
         "wandb_note": "long_run_anatomix_v2_baby_unet_teacher",
         "patch_size": 128,
         "val_sw_batch_size": 8,
@@ -69,16 +74,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dice_w", type=float, help="Dice loss weight")
     parser.add_argument("--dice_bone_w", type=float, help="Bone-specific dice loss weight")
+    parser.add_argument("--wandb", type=str, choices=["True", "False"], help="Enable/disable wandb (True/False)")
     parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
+    parser.add_argument("--batch_size", type=int, help="Batch size")
+    parser.add_argument("--run_name", type=str, help="WandB run name prefix")
     parser.add_argument("--split_file", type=str, help="Path to split mapping file (e.g., splits/original_splits.txt)")
     parser.add_argument("--augment", type=str, choices=["True", "False"], help="Enable/disable data augmentation (True/False)")
     parser.add_argument("--pass_mri", type=str, choices=["True", "False"], help="Pass original MRI to the translator (True/False)")
     parser.add_argument("--feat_instance_norm", type=str, choices=["True", "False"], help="Enable instance norm for features (True/False)")
+    parser.add_argument("--use_zero_mask", type=str, choices=["True", "False"], help="Enable zero-masking for background (True/False)")
+    parser.add_argument("--weighted_sampler", type=str, choices=["True", "False"], help="Enable/disable weighted sampler (True/False)")
+    parser.add_argument("--finetune_feat", type=str, choices=["True", "False"], help="Finetune feature extractor (True/False)")
+    parser.add_argument("--finetune_depth", type=int, help="Number of final layers/modules to finetune (-1 for all)")
+    parser.add_argument("--lr_feat", type=float, help="Learning rate for feature extractor")
     parser.add_argument("--input_dropout_p", type=float, help="Input dropout probability")
     parser.add_argument("--amix_weights", type=str, choices=["v1", "v1_2", "v1_3"], help="Anatomix weights version (v1, v1_2, v1_3)")
     parser.add_argument("--epochs", type=int, help="Total epochs to train")
     parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
     parser.add_argument("--num_workers", type=int, help="Number of workers for the data queue")
+    parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -89,6 +103,12 @@ if __name__ == "__main__":
             exp["dice_w"] = args.dice_w
         if args.dice_bone_w is not None:
             exp["dice_bone_w"] = args.dice_bone_w
+        if args.wandb is not None:
+            exp["wandb"] = args.wandb == "True"
+        if args.batch_size is not None:
+            exp["batch_size"] = args.batch_size
+        if args.run_name is not None:
+            exp["run_name_prefix"] = args.run_name
         if args.resume_id is not None:
             exp["resume_wandb_id"] = args.resume_id
         if args.augment is not None:
@@ -99,6 +119,16 @@ if __name__ == "__main__":
             exp["split_file"] = args.split_file
         if args.feat_instance_norm is not None:
             exp["feat_instance_norm"] = args.feat_instance_norm == "True"
+        if args.use_zero_mask is not None:
+            exp["use_zero_mask"] = args.use_zero_mask == "True"
+        if args.weighted_sampler is not None:
+            exp["use_weighted_sampler"] = args.weighted_sampler == "True"
+        if args.finetune_feat is not None:
+            exp["finetune_feat_extractor"] = args.finetune_feat == "True"
+        if args.finetune_depth is not None:
+            exp["finetune_depth"] = args.finetune_depth
+        if args.lr_feat is not None:
+            exp["lr_feat_extractor"] = args.lr_feat
         if args.input_dropout_p is not None:
             exp["input_dropout_p"] = args.input_dropout_p
         if args.amix_weights is not None:
@@ -109,6 +139,9 @@ if __name__ == "__main__":
             exp["steps_per_epoch"] = args.steps_per_epoch
         if args.num_workers is not None:
             exp["data_queue_num_workers"] = args.num_workers
+        if args.tags is not None:
+            exp.setdefault("wandb_tags", [])
+            exp["wandb_tags"] = exp["wandb_tags"] + [t.strip() for t in args.tags.split(",") if t.strip()]
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")
