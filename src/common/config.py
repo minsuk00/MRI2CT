@@ -11,6 +11,10 @@ class Config(SimpleNamespace):
 
 
 DEFAULT_CONFIG = {
+    # Data Augmentation (Training only)
+    "use_cutout": False,
+    "cutout_prob": 0.5,
+    "cutout_alpha": 1.0,
     # System
     "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5mm_registered_flat",
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
@@ -28,7 +32,7 @@ DEFAULT_CONFIG = {
     "data_queue_max_length": 100,
     "data_queue_num_workers": 4,
     "anatomix_weights": "v1_3",  # "v1", "v1_2", "v1_3"
-    "teacher_weights_path": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs/wandb/run-20260222_160128-p0i9chz3/files/seg_baby_unet_epoch_499.pth",
+    "teacher_weights_path": "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth",
     "res_mult": 32,
     "analyze_shapes": True,
     "enable_profiling": False,
@@ -39,11 +43,12 @@ DEFAULT_CONFIG = {
     "val_interval": 1,
     "sanity_check": True,
     "accum_steps": 2,
-    "model_save_interval": 10,
+    "model_save_interval": 200,
     "viz_limit": 4,
     "viz_pca": False,
     "steps_per_epoch": 1000,
     "finetune_feat_extractor": False,
+    "feat_norm": "instance",  # norm layer for feat extractor: "instance", "batch"
     "lr_feat_extractor": 1e-5,
     "override_lr": False,
     # Model Choice
@@ -55,6 +60,7 @@ DEFAULT_CONFIG = {
     "batch_size": 4,
     "final_activation": "sigmoid",
     "use_weighted_sampler": True,
+    "mask_body_input": False,
     "pass_mri_to_translator": False,
     "use_zero_mask": False,
     "n_classes": 12,  # 11 Organs + Brain

@@ -8,13 +8,14 @@ from common.utils import anatomix_normalize
 
 
 class DataPreprocessing(tio.Transform):
-    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, use_weighted_sampler=False, enforce_ras=False, **kwargs):
+    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, use_weighted_sampler=False, enforce_ras=False, mask_body_input=False, **kwargs):
         super().__init__(**kwargs)
         self.patch_size = patch_size
         self.enable_safety_padding = enable_safety_padding
         self.res_mult = res_mult
         self.use_weighted_sampler = use_weighted_sampler
         self.enforce_ras = enforce_ras
+        self.mask_body_input = mask_body_input
 
     def apply_transform(self, subject):
         if self.enforce_ras:
@@ -52,6 +53,12 @@ class DataPreprocessing(tio.Transform):
             prob = (subject["ct"].data > 0.01).to(torch.uint8)
             subject.add_image(tio.LabelMap(tensor=prob, affine=subject["mri"].affine), "prob_map")
 
+        if self.mask_body_input:
+            if "prob_map" not in subject:
+                raise RuntimeError(f"mask_body_input=True but subject '{subject.get('name', '?')}' has no prob_map. Enable use_weighted_sampler (or val_body_mask) to load mask.nii.gz.")
+            body_mask = subject["prob_map"].data.float()
+            subject["mri"].set_data(subject["mri"].data * body_mask)
+
         # Final RAM optimization: Ensure masks are uint8 (1 byte)
         if "prob_map" in subject:
             subject["prob_map"].set_data(subject["prob_map"].data.to(torch.uint8))
@@ -78,11 +85,10 @@ def get_augmentations():
         [
             tio.RandomAffine(scales=(0.95, 1.1), degrees=7, translation=4, default_pad_value="minimum", p=0.8),
             tio.RandomFlip(axes=(0, 1, 2), p=0.5),
-            tio.Clamp(0, 1),
             tio.RandomBiasField(coefficients=0.5, order=2, p=0.4, include=["mri"]),
             tio.RandomGamma(log_gamma=(-0.3, 0.3), p=0.4, include=["mri"]),
             tio.RandomNoise(std=(0, 0.02), p=0.25, include=["mri"]),
-            tio.Clamp(0, 1),
+            tio.RescaleIntensity(),
         ]
     )
 
