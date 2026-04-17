@@ -2,6 +2,8 @@ import argparse
 import os
 import sys
 
+# os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
+
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -28,7 +30,7 @@ MAISI_CONFIG = {
     "total_epochs": 1000,
     "steps_per_epoch": 1000,
     "val_interval": 2,
-    "model_save_interval": 1,
+    "model_save_interval": 200,
     "use_weighted_sampler": True,
     "resume_wandb_id": None,
     "resume_epoch": None,
@@ -76,6 +78,7 @@ def main():
     parser.add_argument("--resume_wandb_id", type=str, help="WandB Run ID to resume from")
     parser.add_argument("--preencoded_latents_dir", type=str, help="Directory to cache pre-encoded CT latents")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
+    parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation (True/False)")
 
     args = parser.parse_args()
 
@@ -91,7 +94,7 @@ def main():
                 "accum_steps": 1,
                 "wandb_note": f"MAISI Overfitting Test - {args.subjects}",
                 "val_interval": 50,
-                "model_save_interval": 100,
+                "model_save_interval": 200,
                 "augment": False,
             }
         )
@@ -121,9 +124,11 @@ def main():
         MAISI_CONFIG["resume_wandb_id"] = args.resume_wandb_id
     if args.preencoded_latents_dir:
         MAISI_CONFIG["preencoded_latents_dir"] = args.preencoded_latents_dir
+    if args.use_cutout is not None:
+        MAISI_CONFIG["use_cutout"] = args.use_cutout == "True"
     if args.tags:
         MAISI_CONFIG.setdefault("wandb_tags", [])
-        MAISI_CONFIG["wandb_tags"] = MAISI_CONFIG["wandb_tags"] + [t.strip() for t in args.tags.split(",") if t.strip()]
+        MAISI_CONFIG["wandb_tags"] = MAISI_CONFIG["wandb_tags"] + [t.strip(' "') for t in args.tags.split(",") if t.strip()]
 
     try:
         trainer = MAISITrainer(MAISI_CONFIG)

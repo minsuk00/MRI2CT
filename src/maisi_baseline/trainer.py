@@ -317,6 +317,10 @@ class MAISITrainer(BaseTrainer):
                 mr = torch.stack(mri_list).to(self.device)
                 ct = torch.stack(ct_list).to(self.device)
 
+                # Modular Synchronized CutOut (via BaseTrainer)
+                # Note: Maisi uses stack of single-channel tensors: (B, 1, D, H, W)
+                mr, ct, _ = self.apply_cutout(mr, ct)
+
                 # STRICT PARITY: The original author does NOT adjust the spacing tensor after resizing the image
                 spacing = torch.stack([subj["original_spacing"] for subj in batch_list]).to(self.device) * 100.0
 
@@ -481,7 +485,9 @@ class MAISITrainer(BaseTrainer):
 
             if i in self.val_viz_indices and self.cfg.wandb:
                 from common.utils import visualize_lite
-                visualize_lite(pred_matched, ct, mr, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}")
+                viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu") if k in met}
+                viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu") if body_met and k in body_met} or None
+                visualize_lite(pred_matched, ct, mr, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
 
         avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
         avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
@@ -554,28 +560,22 @@ class MAISITrainer(BaseTrainer):
                     step=self.global_step,
                 )
 
+            self._save_maisi_checkpoint(epoch, is_last=True)
             if epoch % self.cfg.model_save_interval == 0:
-                self.save_checkpoint(
-                    self.controlnet,
-                    self.optimizer,
-                    self.scheduler,
-                    self.scaler,
-                    epoch,
-                    os.path.join(wandb.run.dir if self.cfg.wandb and wandb.run and wandb.run.dir else os.path.join(self.gpfs_root, "results", "models", "maisi"), f"maisi_epoch{epoch:05d}.pt"),
-                    extra_state={"scale_factor": self.scale_factor},
-                )
-
-        # Final checkpoint
-        save_dir = wandb.run.dir if self.cfg.wandb and wandb.run and wandb.run.dir else os.path.join(self.gpfs_root, "results", "models", "maisi")
-        self.save_checkpoint(
-            self.controlnet, self.optimizer, self.scheduler, self.scaler,
-            self.cfg.total_epochs,
-            os.path.join(save_dir, f"maisi_epoch{self.cfg.total_epochs:05d}.pt"),
-            extra_state={"scale_factor": self.scale_factor},
-        )
+                self._save_maisi_checkpoint(epoch)
 
         if self.cfg.wandb:
             wandb.finish()
+
+    def _save_maisi_checkpoint(self, epoch, is_last=False):
+        save_dir = wandb.run.dir if self.cfg.wandb and wandb.run and wandb.run.dir else os.path.join(self.gpfs_root, "results", "models", "maisi")
+        filename = "checkpoint_last.pt" if is_last else f"maisi_epoch{epoch:05d}.pt"
+        self.save_checkpoint(
+            self.controlnet, self.optimizer, self.scheduler, self.scaler,
+            epoch,
+            os.path.join(save_dir, filename),
+            extra_state={"scale_factor": self.scale_factor},
+        )
 
 
 if __name__ == "__main__":
