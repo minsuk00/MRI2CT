@@ -15,8 +15,10 @@
 PREFIX="amix"
 SPLIT_FILE="splits/thorax_center_wise_split.txt"
 AUGMENT="True"
+USE_CUTOUT="True"
+CUTOUT_ALPHA=1.0
 DICE_W=0.1
-DICE_BONE_W=0.00
+DICE_BONE_W=0.3
 PASS_MRI="True"
 FEAT_INST_NORM="True"
 USE_ZERO_MASK="False"
@@ -24,20 +26,20 @@ WEIGHTED_SAMPLER="True"
 FINETUNE_FEAT="False"
 FINETUNE_DEPTH=0
 LR_FEAT=1e-5
-INPUT_DROPOUT=0.0
+INPUT_DROPOUT=0.5
 AMIX_WEIGHTS="v1_3"
 EPOCHS=1000
 STEPS_PER_EPOCH=500
 NUM_WORKERS=4
-RESUME_ID="5aim9k43" # Leave empty if not resuming
-TAGS="thorax,instance norm" # Comma-separated extra WandB tags
+RESUME_ID="d42wpbq7" # Leave empty if not resuming
+TAGS="thorax,v1_3,cutout" # Comma-separated extra WandB tags (e.g. "high bone dice,instance norm")
 
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
     SPLIT_NAME=$(basename "$SPLIT_FILE" .txt)
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="${PREFIX}_${SPLIT_NAME}_amix-${AMIX_WEIGHTS}_dice-${DICE_W}_bdice-${DICE_BONE_W}_aug-${AUGMENT}_mri-${PASS_MRI}_inorm-${FEAT_INST_NORM}_zmask-${USE_ZERO_MASK}_wsmpl-${WEIGHTED_SAMPLER}_ftune-${FINETUNE_FEAT}_fdepth-${FINETUNE_DEPTH}_drop-${INPUT_DROPOUT}_ep-${EPOCHS}"
+    JOB_NAME="${PREFIX}_${SPLIT_NAME}_amix-${AMIX_WEIGHTS}_dice-${DICE_W}_bdice-${DICE_BONE_W}_aug-${AUGMENT}_mri-${PASS_MRI}_inorm-${FEAT_INST_NORM}_zmask-${USE_ZERO_MASK}_wsmpl-${WEIGHTED_SAMPLER}_ftune-${FINETUNE_FEAT}_fdepth-${FINETUNE_DEPTH}_drop-${INPUT_DROPOUT}_cut-${USE_CUTOUT}_calpha-${CUTOUT_ALPHA}_ep-${EPOCHS}"
     if [ ! -z "$RESUME_ID" ]; then
         JOB_NAME="${JOB_NAME}_res-${RESUME_ID}"
     fi
@@ -62,7 +64,7 @@ cd /home/minsukc/MRI2CT
 # Corrected path to amix/train.py
 SCRIPT="src/amix/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --amix_weights $AMIX_WEIGHTS --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --pass_mri $PASS_MRI --feat_instance_norm $FEAT_INST_NORM --use_zero_mask $USE_ZERO_MASK --weighted_sampler $WEIGHTED_SAMPLER --finetune_feat $FINETUNE_FEAT --finetune_depth $FINETUNE_DEPTH --lr_feat $LR_FEAT --input_dropout_p $INPUT_DROPOUT --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --amix_weights $AMIX_WEIGHTS --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --pass_mri $PASS_MRI --feat_instance_norm $FEAT_INST_NORM --use_zero_mask $USE_ZERO_MASK --weighted_sampler $WEIGHTED_SAMPLER --finetune_feat $FINETUNE_FEAT --finetune_depth $FINETUNE_DEPTH --lr_feat $LR_FEAT --input_dropout_p $INPUT_DROPOUT --use_cutout $USE_CUTOUT --cutout_alpha $CUTOUT_ALPHA --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi

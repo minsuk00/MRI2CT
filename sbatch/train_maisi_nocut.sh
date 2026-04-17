@@ -12,11 +12,20 @@
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
 
 # --- Configuration Area ---
-PREFIX="mcddpm"
-SPLIT_FILE="splits/thorax_single_subject_split.txt"
-EPOCHS=1000
+PREFIX="maisi_nocut"
+SPLIT_FILE="splits/thorax_center_wise_split.txt" 
+LR=5e-4
+BATCH_SIZE=1
+ACCUM_STEPS=4
+EPOCHS=5000
 STEPS_PER_EPOCH=100
-RESUME_ID=""  # Leave empty if not resuming
+VAL_INTERVAL=5
+SAVE_INTERVAL=1
+WANDB="True"
+USE_CUTOUT="False"
+PREENCODED_LATENTS_DIR="" 
+RESUME_ID="6ifc54cz" 
+TAGS="thorax,maisi,no_cutout"
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -26,13 +35,9 @@ if [ -z "$SLURM_JOB_ID" ]; then
     if [ ! -z "$RESUME_ID" ]; then
         JOB_NAME="${JOB_NAME}_res-${RESUME_ID}"
     fi
-
     mkdir -p /home/minsukc/MRI2CT/slurm_logs/
-
     echo "🚀 Submitting: $JOB_NAME"
-    sbatch --job-name="$JOB_NAME" \
-           --output="/home/minsukc/MRI2CT/slurm_logs/${TIMESTAMP}_${JOB_NAME}_%j.log" \
-           "$0"
+    sbatch --job-name="$JOB_NAME" --output="/home/minsukc/MRI2CT/slurm_logs/${TIMESTAMP}_${JOB_NAME}_%j.log" "$0"
     exit
 fi
 
@@ -41,15 +46,11 @@ export MAMBA_EXE='/home/minsukc/.local/bin/micromamba'
 export MAMBA_ROOT_PREFIX='/home/minsukc/micromamba'
 eval "$("$MAMBA_EXE" shell hook --shell bash --root-prefix "$MAMBA_ROOT_PREFIX")"
 micromamba activate mrct
-
 cd /home/minsukc/MRI2CT
-
-SCRIPT="src/mc_ddpm_baseline/train.py"
-
-CMD="python $SCRIPT --split_file $SPLIT_FILE --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH"
-if [ ! -z "$RESUME_ID" ]; then
-    CMD="$CMD --resume_id $RESUME_ID"
-fi
-
+SCRIPT="src/maisi_baseline/train.py"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --lr $LR --batch_size $BATCH_SIZE --accum_steps $ACCUM_STEPS --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --model_save_interval $SAVE_INTERVAL --wandb $WANDB --use_cutout $USE_CUTOUT"
+if [ ! -z "$RESUME_ID" ]; then CMD="$CMD --resume_wandb_id $RESUME_ID"; fi
+if [ ! -z "$PREENCODED_LATENTS_DIR" ]; then CMD="$CMD --preencoded_latents_dir $PREENCODED_LATENTS_DIR"; fi
+if [ ! -z "$TAGS" ]; then CMD="$CMD --tags \"$TAGS\""; fi
 echo "Running command: $CMD"
 $CMD
