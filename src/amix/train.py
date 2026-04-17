@@ -25,13 +25,13 @@ from common.utils import cleanup_gpu, send_notification
 warnings.filterwarnings("ignore", category=UserWarning, module="monai.utils.module")
 warnings.filterwarnings("ignore", message=".*SubjectsLoader in PyTorch >= 2.3.*")
 warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensional indexing.*")
-os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
+# os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 
 EXPERIMENT_CONFIG = [
     {
         "val_interval": 2,
         "steps_per_epoch": 1000,
-        "model_save_interval": 1,
+        "model_save_interval": 200,
         "total_epochs": 1000,
         "batch_size": 4,
         "accum_steps": 1,
@@ -89,10 +89,15 @@ if __name__ == "__main__":
     parser.add_argument("--lr_feat", type=float, help="Learning rate for feature extractor")
     parser.add_argument("--input_dropout_p", type=float, help="Input dropout probability")
     parser.add_argument("--amix_weights", type=str, choices=["v1", "v1_2", "v1_3"], help="Anatomix weights version (v1, v1_2, v1_3)")
+    parser.add_argument("--feat_norm", type=str, choices=["instance", "batch"], help="Norm layer for feat extractor (instance, batch)")
     parser.add_argument("--epochs", type=int, help="Total epochs to train")
     parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
     parser.add_argument("--num_workers", type=int, help="Number of workers for the data queue")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
+    parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation (True/False)")
+    parser.add_argument("--cutout_alpha", type=float, help="Beta(alpha, alpha) parameter controlling cutout box size distribution")
+    parser.add_argument("--mask_body_input", type=str, choices=["True", "False"], help="Zero out MRI voxels outside body mask before sampling (True/False)")
+    parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -133,6 +138,8 @@ if __name__ == "__main__":
             exp["input_dropout_p"] = args.input_dropout_p
         if args.amix_weights is not None:
             exp["anatomix_weights"] = args.amix_weights
+        if args.feat_norm is not None:
+            exp["feat_norm"] = args.feat_norm
         if args.epochs is not None:
             exp["total_epochs"] = args.epochs
         if args.steps_per_epoch is not None:
@@ -141,7 +148,19 @@ if __name__ == "__main__":
             exp["data_queue_num_workers"] = args.num_workers
         if args.tags is not None:
             exp.setdefault("wandb_tags", [])
-            exp["wandb_tags"] = exp["wandb_tags"] + [t.strip() for t in args.tags.split(",") if t.strip()]
+            exp["wandb_tags"] = exp["wandb_tags"] + [t.strip(' "') for t in args.tags.split(",") if t.strip()]
+
+        # Cutout Override
+        if args.use_cutout is not None:
+            exp["use_cutout"] = args.use_cutout == "True"
+        if args.cutout_alpha is not None:
+            exp["cutout_alpha"] = args.cutout_alpha
+        if args.mask_body_input is not None:
+            exp["mask_body_input"] = args.mask_body_input == "True"
+
+        # Dice Validation Override
+        if args.validate_dice is not None:
+            exp["validate_dice"] = args.validate_dice == "True"
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")
