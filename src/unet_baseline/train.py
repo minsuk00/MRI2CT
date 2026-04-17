@@ -16,6 +16,8 @@ from tqdm import tqdm
 
 import wandb
 
+# os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
+
 # Enables TF32 and cuDNN benchmark for significantly faster training on Ampere+ GPUs
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
@@ -47,7 +49,7 @@ BASELINE_CONFIG = {
     "total_epochs": 1000,
     "steps_per_epoch": 1000,
     "val_interval": 2,
-    "model_save_interval": 1,
+    "model_save_interval": 200,
     "use_weighted_sampler": True,
     "resume_wandb_id": None,
     "resume_epoch": None,  # Optional: specify epoch number
@@ -77,6 +79,7 @@ BASELINE_CONFIG = {
     "ngf": 16,
     "num_downs": 4,  # Standard depth
     "model_type": "unet_baseline",
+    "norm": "batch",  # "batch", "instance", or "none"
     # Optimization
     "compile_mode": "full",  # "full", "model", or None
     "scheduler_min_lr": 0.0,
@@ -116,7 +119,7 @@ class BaselineTrainer(BaseTrainer):
         self._setup_opt()
         self._setup_wandb()
 
-        # 7. Model Summary Logging
+        # 8. Model Summary Logging
         self._log_model_summary({"UNet_Baseline": self.model})
 
         self._load_resume(self.model, self.optimizer, self.scheduler, self.scaler)
@@ -193,6 +196,7 @@ class BaselineTrainer(BaseTrainer):
             output_nc=self.cfg.output_nc,
             num_downs=self.cfg.num_downs,
             ngf=self.cfg.ngf,
+            norm=getattr(self.cfg, "norm", "batch"),
             final_act="sigmoid",
         ).to(self.device)
 
@@ -300,6 +304,9 @@ class BaselineTrainer(BaseTrainer):
                 mri = batch["mri"][tio.DATA].to(self.device, non_blocking=True)
                 ct = batch["ct"][tio.DATA].to(self.device, non_blocking=True)
                 seg = batch["seg"][tio.DATA].to(self.device, non_blocking=True) if "seg" in batch else None
+
+                # Modular Synchronized CutOut (via BaseTrainer)
+                mri, ct, seg = self.apply_cutout(mri, ct, seg=seg)
 
                 if self.cfg.enable_profiling:
                     torch.cuda.synchronize()
@@ -519,7 +526,9 @@ class BaselineTrainer(BaseTrainer):
             # Viz
             if i in self.val_viz_indices:
                 if self.cfg.wandb:
-                    visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}")
+                    viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if k in met}
+                    viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if body_met and k in body_met} or None
+                    visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
 
             del mri, ct, pred, pred_unpad, ct_unpad, mri_unpad
 
@@ -530,7 +539,8 @@ class BaselineTrainer(BaseTrainer):
         avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
         avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
         if self.cfg.wandb:
-            wandb.log({f"val/{k}": v for k, v in avg_met.items()}, step=self.global_step)
+            _val_exclude = {"mae", "loss_ssim", "loss_dice", "grad_diff"}
+            wandb.log({f"val/{k}": v for k, v in avg_met.items() if k not in _val_exclude}, step=self.global_step)
             if avg_body:
                 wandb.log({f"val_body/{k}": v for k, v in avg_body.items()}, step=self.global_step)
 
@@ -565,6 +575,7 @@ class BaselineTrainer(BaseTrainer):
 
             if self.cfg.wandb:
                 current_lr = self.optimizer.param_groups[0]["lr"]
+                total_steps = self.cfg.steps_per_epoch * self.cfg.total_epochs
                 log = {
                     "train/total": loss,
                     "info/grad_norm": gn,
@@ -575,6 +586,7 @@ class BaselineTrainer(BaseTrainer):
                     "info/global_step": self.global_step,
                     "info/epoch": epoch,
                     "info/samples_seen": self.samples_seen,
+                    "info/train_pct": self.global_step / total_steps,
                 }
                 for k, v in comps.items():
                     if "score" in k:
@@ -582,6 +594,7 @@ class BaselineTrainer(BaseTrainer):
                     log[k.replace("loss_", "train/")] = v
                 wandb.log(log, step=self.global_step)
 
+            self.save_checkpoint(epoch, is_last=True)
             if epoch % self.cfg.model_save_interval == 0:
                 self.save_checkpoint(epoch)
 
@@ -589,18 +602,16 @@ class BaselineTrainer(BaseTrainer):
             gc.collect()
             torch.cuda.empty_cache()
 
-        self.save_checkpoint(self.cfg.total_epochs)
         if self.cfg.wandb:
             wandb.finish()
 
-    def save_checkpoint(self, epoch):
-        # Determine save directory: use wandb dir if active, else fallback to results/models/baseline
+    def save_checkpoint(self, epoch, is_last=False):
         if self.cfg.wandb and wandb.run and wandb.run.dir:
             save_dir = wandb.run.dir
         else:
             save_dir = os.path.join(self.gpfs_root, "results", "models", "baseline")
 
-        filename = f"{self.cfg.model_type}_epoch{epoch:05d}.pt"
+        filename = "checkpoint_last.pt" if is_last else f"{self.cfg.model_type}_epoch{epoch:05d}.pt"
         path = os.path.join(save_dir, filename)
 
         super().save_checkpoint(self.model, self.optimizer, self.scheduler, self.scaler, epoch, path)
@@ -624,7 +635,12 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, help="Total epochs to train")
     parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
     parser.add_argument("--num_workers", type=int, help="Number of workers for the data queue")
+    parser.add_argument("--norm", type=str, choices=["batch", "instance", "none"], help="Normalization type for U-Net (batch, instance, or none)")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
+    parser.add_argument("--dice_bone_w", type=float, help="Bone-specific dice loss weight")
+    parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation (True/False)")
+    parser.add_argument("--cutout_alpha", type=float, help="Beta(alpha, alpha) parameter controlling cutout box size distribution")
+    parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -632,8 +648,16 @@ if __name__ == "__main__":
     BASELINE_CONFIG["wandb"] = use_wandb
 
     # Override with CLI args if provided
+    if args.use_cutout is not None:
+        BASELINE_CONFIG["use_cutout"] = args.use_cutout == "True"
+    if args.cutout_alpha is not None:
+        BASELINE_CONFIG["cutout_alpha"] = args.cutout_alpha
+    if args.validate_dice is not None:
+        BASELINE_CONFIG["validate_dice"] = args.validate_dice == "True"
     if args.dice_w is not None:
         BASELINE_CONFIG["dice_w"] = args.dice_w
+    if args.dice_bone_w is not None:
+        BASELINE_CONFIG["dice_bone_w"] = args.dice_bone_w
     if args.resume_id is not None:
         BASELINE_CONFIG["resume_wandb_id"] = args.resume_id
     if args.batch_size is not None:
@@ -652,9 +676,11 @@ if __name__ == "__main__":
         BASELINE_CONFIG["steps_per_epoch"] = args.steps_per_epoch
     if args.num_workers is not None:
         BASELINE_CONFIG["data_queue_num_workers"] = args.num_workers
+    if args.norm is not None:
+        BASELINE_CONFIG["norm"] = args.norm
     if args.tags is not None:
         BASELINE_CONFIG.setdefault("wandb_tags", [])
-        BASELINE_CONFIG["wandb_tags"] = BASELINE_CONFIG["wandb_tags"] + [t.strip() for t in args.tags.split(",") if t.strip()]
+        BASELINE_CONFIG["wandb_tags"] = BASELINE_CONFIG["wandb_tags"] + [t.strip(' "') for t in args.tags.split(",") if t.strip()]
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

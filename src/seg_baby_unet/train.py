@@ -7,6 +7,8 @@ import time
 import warnings
 from collections import defaultdict
 
+os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
+
 import matplotlib.pyplot as plt
 import monai
 import nibabel as nib
@@ -49,7 +51,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from anatomix.segmentation.segmentation_utils import load_model_v1_1, worker_init_fn
 
 from common.data import get_region_key
-from common.utils import count_parameters, get_ram_info
+from common.utils import count_parameters
 
 # ==========================================
 # INLINE CONFIGURATION
@@ -83,22 +85,20 @@ SEG_CONFIG = {
     "patch_size": 128,
     "batch_size": 8,
     "lr": 3e-4,
-    "n_epochs": 500,
+    "n_epochs": 750,
     "iters_per_epoch": 250,
     "val_interval": 5,
-    "model_save_interval": 10,
+    "model_save_interval": 1,
     ##### Model
     # "anatomix_weights_path": "/home/minsukc/MRI2CT/anatomix/model-weights/anatomix.pth",
-    "anatomix_weights_path": "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G.pth",
+    "anatomix_weights_path": "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_v1_2.pth",
     "finetune": True,
     "compile_mode": "model",  # Options: None, "model", "full"
     "few_shot": False,
     "few_shot_amount": 1,
     "few_shot_region": None,
-    # "resume_wandb_id": None,
-    # "resume_epoch": None,
-    "resume_wandb_id": "p0i9chz3",
-    "resume_epoch": 469,
+    "resume_wandb_id": None,
+    "resume_epoch": None,
     "diverge_wandb_branch": False,
     "override_lr": False,
     ##### Validation / Viz
@@ -199,23 +199,30 @@ class SegTrainer:
             tqdm.write("[RESUME] ⚠️ No checkpoints found.")
             return
 
+        def get_epoch(path):
+            try:
+                return int(os.path.basename(path).split("epoch_")[-1].split(".")[0])
+            except Exception:
+                return -1
+
+        all_ckpts.sort(key=get_epoch)
+
         if self.cfg.get("resume_epoch") is not None:
-            epoch_str = f"epoch_{self.cfg['resume_epoch']}.pth"
-            target_ckpts = sorted([c for c in all_ckpts if epoch_str in os.path.basename(c)])
+            target_ckpts = [c for c in all_ckpts if get_epoch(c) == self.cfg["resume_epoch"]]
             if not target_ckpts:
                 tqdm.write(f"[RESUME] ❌ Could not find checkpoint for epoch {self.cfg['resume_epoch']}")
                 return
             resume_path = target_ckpts[-1]
         else:
-            # Try to find 'best' or latest
-            best_ckpts = [c for c in all_ckpts if "best" in os.path.basename(c)]
-            if best_ckpts:
-                resume_path = max(best_ckpts, key=os.path.getmtime)
+            # Prefer latest epoch; fall back to best if no epoch checkpoints
+            epoch_ckpts = [c for c in all_ckpts if get_epoch(c) >= 0]
+            if epoch_ckpts:
+                resume_path = epoch_ckpts[-1]
             else:
                 resume_path = max(all_ckpts, key=os.path.getmtime)
 
         tqdm.write(f"[RESUME] 📥 Loading: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=self.device)
+        checkpoint = torch.load(resume_path, map_location=self.device, weights_only=False)
 
         # Load state dict (handle potential compile)
         def load_state(m, state):
@@ -564,11 +571,6 @@ class SegTrainer:
                 if self.cfg["wandb"] and step == 1:
                     self._log_training_patch(inputs, labels, outputs, self.global_step)
 
-                # RAM Monitoring (Optional Parity)
-                if self.cfg["wandb"] and self.global_step % 100 == 0:
-                    sys_percent, app_gb = get_ram_info()
-                    wandb.log({"perf/ram_system_percent": sys_percent, "perf/ram_app_total_gb": app_gb}, step=self.global_step)
-
                 self.global_step += 1
 
             epoch_loss /= step
@@ -588,6 +590,8 @@ class SegTrainer:
 
             if (epoch + 1) % self.cfg["model_save_interval"] == 0:
                 self.save_checkpoint(epoch)
+
+        self.save_checkpoint(self.cfg["n_epochs"] - 1)
 
     def validate(self, epoch):
         self.model.eval()
@@ -690,11 +694,14 @@ if __name__ == "__main__":
     parser.add_argument("--n_epochs", type=int, default=SEG_CONFIG["n_epochs"])
     parser.add_argument("--iters_per_epoch", type=int, default=SEG_CONFIG["iters_per_epoch"])
     parser.add_argument("--num_workers", type=int, default=SEG_CONFIG["num_workers"])
+    parser.add_argument("--resume_id", type=str, default=None)
     args = parser.parse_args()
 
     SEG_CONFIG["n_epochs"] = args.n_epochs
     SEG_CONFIG["iters_per_epoch"] = args.iters_per_epoch
     SEG_CONFIG["num_workers"] = args.num_workers
+    if args.resume_id:
+        SEG_CONFIG["resume_wandb_id"] = args.resume_id
     try:
         trainer = SegTrainer(SEG_CONFIG)
         trainer.train()
