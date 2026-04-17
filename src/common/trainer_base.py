@@ -1,5 +1,6 @@
 import datetime
 import os
+import random
 import time
 from glob import glob
 
@@ -7,10 +8,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchio as tio
+from monai.transforms import CutOut
 
 import wandb
 from common.data import DataPreprocessing, get_augmentations, get_split_subjects, get_subject_paths, stage_data_to_local
-from common.utils import clean_state_dict, log_model_summary, send_notification, set_seed
+from common.utils import apply_synchronized_cutout, clean_state_dict, log_model_summary, send_notification, set_seed
 
 
 class BaseTrainer:
@@ -33,6 +35,23 @@ class BaseTrainer:
         # Consistent run name
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
         self.run_name = f"{timestamp}_{self.cfg.run_name_prefix}" if hasattr(self.cfg, "run_name_prefix") else f"{timestamp}_Train"
+
+        # Modular Augmentations
+        self.cutout_transform = None
+        if getattr(self.cfg, "use_cutout", False):
+            print(f"[{self.prefix}] ✂️ Initializing Synchronized CutOut (Prob={self.cfg.cutout_prob}, Alpha={self.cfg.cutout_alpha})")
+            self.cutout_transform = CutOut(batch_size=self.cfg.batch_size, alpha=self.cfg.cutout_alpha)
+
+    def apply_cutout(self, mri, ct, seg=None):
+        """
+        Helper method for subclasses to apply synchronized cutout in their training loops.
+        Handles the probability check and calls the centralized utility.
+        """
+        if self.cutout_transform is not None and random.random() < self.cfg.cutout_prob:
+            mri_aug, ct_aug, seg_aug = apply_synchronized_cutout(mri, ct, self.cutout_transform, seg=seg)
+            # If seg was None, seg_aug will be None
+            return mri_aug, ct_aug, seg_aug
+        return mri, ct, seg
 
     def _find_subjects(self):
         """Discovers subjects from split file, or uses explicit subjects list for SSO."""
@@ -71,9 +90,15 @@ class BaseTrainer:
             id=wandb_id,
             resume="allow" if not self.cfg.diverge_wandb_branch else None,
         )
-        # Save code state for reproducibility
+        # Save code state and final config for reproducibility
         if wandb.run:
             wandb.run.log_code(".")
+            import yaml
+
+            config_path = os.path.join(wandb.run.dir, "config_final.yaml")
+            with open(config_path, "w") as f:
+                yaml.dump(vars(self.cfg), f, default_flow_style=False, sort_keys=True)
+            wandb.save(config_path, base_path=wandb.run.dir)
 
     def _log_model_summary(self, model_dict):
         """Standardized model summary logging across all trainers."""
@@ -82,7 +107,7 @@ class BaseTrainer:
 
         summary_path = os.path.join(wandb.run.dir, "model_summary.txt")
         tot, train = log_model_summary(model_dict, summary_path)
-        
+
         # Save to WandB and update config with exact counts
         wandb.save(summary_path, base_path=wandb.run.dir)
         wandb.config.update({"total_params": tot, "trainable_params": train}, allow_val_change=True)
@@ -98,31 +123,46 @@ class BaseTrainer:
             print(f"[RESUME] ❌ Run folder not found for ID: {self.cfg.resume_wandb_id}")
             return
 
-        all_ckpts = []
-        for rf in run_folders:
-            all_ckpts.extend(glob(os.path.join(rf, "files", "*.pt")))
-            all_ckpts.extend(glob(os.path.join(rf, "files", "*.pth")))
+        files_dirs = [os.path.join(rf, "files") for rf in run_folders]
 
-        if not all_ckpts:
-            print("[RESUME] ⚠️ No checkpoints found in run folder.")
-            return
-
-        # Sort by epoch if possible
-        def get_epoch(path):
-            try:
-                name = os.path.basename(path)
-                return int(name.split("epoch")[-1].split(".")[0].strip("_"))
-            except Exception:
-                return -1
-
-        all_ckpts.sort(key=get_epoch)
-
-        target_ckpt = all_ckpts[-1]
         if self.cfg.resume_epoch is not None:
-            for ckpt in all_ckpts:
-                if get_epoch(ckpt) == self.cfg.resume_epoch:
-                    target_ckpt = ckpt
+            # Load a specific epoch snapshot
+            target_ckpt = None
+            for fd in files_dirs:
+                matches = glob(os.path.join(fd, f"*epoch{self.cfg.resume_epoch:05d}.pt"))
+                if matches:
+                    target_ckpt = matches[0]
                     break
+            if target_ckpt is None:
+                print(f"[RESUME] ❌ No checkpoint found for epoch {self.cfg.resume_epoch}.")
+                return
+        else:
+            # Default: prefer checkpoint_last.pt, fall back to highest epoch-numbered file
+            target_ckpt = None
+            for fd in files_dirs:
+                last = os.path.join(fd, "checkpoint_last.pt")
+                if os.path.exists(last):
+                    target_ckpt = last
+                    break
+            if target_ckpt is None:
+                # Fallback for runs that predate checkpoint_last.pt
+                all_ckpts = []
+                for fd in files_dirs:
+                    all_ckpts.extend(glob(os.path.join(fd, "*.pt")))
+                    all_ckpts.extend(glob(os.path.join(fd, "*.pth")))
+                if not all_ckpts:
+                    print("[RESUME] ⚠️ No checkpoints found in run folder.")
+                    return
+
+                def get_epoch(path):
+                    try:
+                        name = os.path.basename(path)
+                        return int(name.split("epoch")[-1].split(".")[0].strip("_"))
+                    except Exception:
+                        return -1
+
+                all_ckpts.sort(key=get_epoch)
+                target_ckpt = all_ckpts[-1]
 
         print(f"[RESUME] 🔄 Loading checkpoint: {target_ckpt}")
         checkpoint = torch.load(target_ckpt, map_location=self.device, weights_only=False)
@@ -258,6 +298,7 @@ class BaseTrainer:
     def _compute_val_metrics(self, pred_unpad, ct_unpad, mask_unpad=None):
         """Returns (standard_met, body_met_or_None). Log under val/ and val_body/ respectively."""
         from common.utils import compute_metrics, compute_metrics_body
+
         met = compute_metrics(pred_unpad, ct_unpad)
         body_met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad) if mask_unpad is not None else None
         return met, body_met

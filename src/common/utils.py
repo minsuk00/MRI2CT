@@ -2,10 +2,38 @@ import gc
 import random
 
 import numpy as np
-import wandb
 import psutil
 import torch
 from fused_ssim import fused_ssim3d
+
+import wandb
+
+
+def apply_synchronized_cutout(mri, ct, cutout_obj, seg=None):
+    """
+    Applies the same spatial cutout to MRI, CT, and optionally Seg by concatenating them.
+    mri, ct: (B, 1, D, H, W) tensors.
+    cutout_obj: An initialized monai.transforms.CutOut instance.
+    seg: Optional (B, 1, D, H, W) segmentation tensor.
+    Returns: (mri_aug, ct_aug, seg_aug) where seg_aug is None if seg is None.
+    """
+    # Robustness: Update batch size on the fly to match current input
+    # MONAI CutOut expects weights for each sample in the batch
+    cutout_obj.batch_size = mri.shape[0]
+
+    if seg is not None:
+        # Concatenate MRI, CT, and Seg (B, 3, D, H, W)
+        # Cast seg to float for cat compatibility, restore original dtype after
+        combined = torch.cat([mri, ct, seg.float()], dim=1)
+        combined_aug = cutout_obj(combined)
+        mri_aug, ct_aug, seg_aug = torch.split(combined_aug, 1, dim=1)
+        return mri_aug, ct_aug, seg_aug.to(seg.dtype)
+    else:
+        # Concatenate MRI and CT (B, 2, D, H, W)
+        combined = torch.cat([mri, ct], dim=1)
+        combined_aug = cutout_obj(combined)
+        mri_aug, ct_aug = torch.split(combined_aug, 1, dim=1)
+        return mri_aug, ct_aug, None
 
 
 def send_notification(message, topic="mri2ct_minsukc"):
@@ -33,57 +61,65 @@ def log_model_summary(model_dict, save_path):
     """
     Computes total, trainable, and frozen parameters across multiple models.
     Saves a detailed layer-by-layer manifest to save_path.
-    
+
     model_dict: Dict mapping model name to the model instance.
     """
     with open(save_path, "w") as f:
         f.write("=" * 60 + "\n")
         f.write(f"MODEL PARAMETER SUMMARY\n")
         f.write("=" * 60 + "\n\n")
-        
+
         grand_total = 0
         grand_trainable = 0
-        
+
         for name, model in model_dict.items():
             if model is None:
                 continue
-            
+
             # Unpack compiled models if needed
             target_model = getattr(model, "_orig_mod", model)
-                
+
             total = sum(p.numel() for p in target_model.parameters())
             trainable = sum(p.numel() for p in target_model.parameters() if p.requires_grad)
             frozen = total - trainable
-            
+
             grand_total += total
             grand_trainable += trainable
-            
+
             f.write(f"--- Model: {name} ---\n")
             f.write(f"  Total Params:     {total:,}\n")
             f.write(f"  Trainable Params: {trainable:,}\n")
             f.write(f"  Frozen Params:    {frozen:,}\n\n")
-            
+
+            # Build param_name → module type lookup
+            param_to_type = {}
+            for mod_name, mod in target_model.named_modules():
+                for pname, _ in mod.named_parameters(recurse=False):
+                    full_name = f"{mod_name}.{pname}" if mod_name else pname
+                    param_to_type[full_name] = type(mod).__name__
+
             f.write("  Trainable Layers Manifest:\n")
             found_trainable = False
             for layer_name, p in target_model.named_parameters():
                 if p.requires_grad:
                     found_trainable = True
-                    f.write(f"    - {layer_name} ({p.numel():,} params)\n")
-            
+                    layer_type = param_to_type.get(layer_name, "?")
+                    f.write(f"    - {layer_name} [{layer_type}] ({p.numel():,} params)\n")
+
             if not found_trainable:
                 f.write("    (No trainable layers)\n")
             f.write("\n")
-            
+
         f.write("=" * 60 + "\n")
         f.write("FINAL AGGREGATE SUMMARY\n")
         f.write("-" * 60 + "\n")
         f.write(f"AGGREGATE TOTAL:     {grand_total:,}\n")
-        f.write(f"AGGREGATE TRAINABLE: {grand_trainable:,} ({grand_trainable/max(1, grand_total)*100:.2f}%)\n")
+        f.write(f"AGGREGATE TRAINABLE: {grand_trainable:,} ({grand_trainable / max(1, grand_total) * 100:.2f}%)\n")
         f.write(f"AGGREGATE FROZEN:    {grand_total - grand_trainable:,}\n")
         f.write("=" * 60 + "\n")
-    
+
     print(f"[Utils] 📝 Model summary saved to {save_path}")
-    print(f"[Model Summary] 📊 Total Params: {grand_total:,} | Trainable: {grand_trainable:,} ({grand_trainable/max(1, grand_total)*100:.2f}%)")
+    print(f"[Model Summary] 📊 Total Params: {grand_total:,} | Trainable: {grand_trainable:,} ({grand_trainable / max(1, grand_total) * 100:.2f}%)")
     return grand_total, grand_trainable
 
 
@@ -246,6 +282,7 @@ def compute_metrics(pred, target, data_range=1.0):
         "dice_score_bone_threshold": dice_val,  # Thresholded metric (naive)
     }
 
+
 def compute_metrics_body(pred, target, mask):
     """Like compute_metrics but restricted to body voxels (from mask.nii.gz).
     - MAE, PSNR: computed on masked voxels only
@@ -270,22 +307,28 @@ def compute_metrics_body(pred, target, mask):
     return {"mae": mae_val, "mae_hu": mae_val * 2048.0, "psnr": psnr, "ssim": ssim_val}
 
 
-def visualize_lite(pred, ct, mri, subj_id, shape, step, epoch, offset=0, log_name=None):
+def visualize_lite(pred, ct, mri, subj_id, shape, step, epoch, offset=0, log_name=None, metrics=None, body_metrics=None):
     import matplotlib.pyplot as plt
     import numpy as np
-    
+
     gt_ct = ct.squeeze()
-    if gt_ct.ndim > 3: gt_ct = gt_ct[0]
-    
+    if gt_ct.ndim > 3:
+        gt_ct = gt_ct[0]
+
     gt_mri = mri.squeeze()
-    if gt_mri.ndim > 3: gt_mri = gt_mri[0]
-    
+    if gt_mri.ndim > 3:
+        gt_mri = gt_mri[0]
+
     pred_ct = pred.squeeze()
-    if pred_ct.ndim > 3: pred_ct = pred_ct[0]
-    
-    if isinstance(gt_ct, torch.Tensor): gt_ct = gt_ct.cpu().numpy()
-    if isinstance(gt_mri, torch.Tensor): gt_mri = gt_mri.cpu().numpy()
-    if isinstance(pred_ct, torch.Tensor): pred_ct = pred_ct.cpu().numpy()
+    if pred_ct.ndim > 3:
+        pred_ct = pred_ct[0]
+
+    if isinstance(gt_ct, torch.Tensor):
+        gt_ct = gt_ct.cpu().numpy()
+    if isinstance(gt_mri, torch.Tensor):
+        gt_mri = gt_mri.cpu().numpy()
+    if isinstance(pred_ct, torch.Tensor):
+        pred_ct = pred_ct.cpu().numpy()
 
     items = [
         (gt_mri, "GT MRI", "gray", (0, 1)),
@@ -319,9 +362,14 @@ def visualize_lite(pred, ct, mri, subj_id, shape, step, epoch, offset=0, log_nam
         cbar.set_label("Residual Error")
 
     fig.suptitle(f"Subject: {subj_id} | Ep {epoch} | Step {step}", fontsize=16, y=0.99)
-    
+
     if log_name is not None:
-        wandb.log({log_name: wandb.Image(fig)}, step=step)
-        
+        caption = None
+        if metrics:
+            caption = " | ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+            if body_metrics:
+                caption += "\n[body] " + " | ".join(f"{k}: {v:.4f}" for k, v in body_metrics.items())
+        wandb.log({log_name: wandb.Image(fig, caption=caption)}, step=step)
+
     plt.close(fig)
     return fig
