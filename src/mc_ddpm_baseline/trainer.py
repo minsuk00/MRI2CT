@@ -142,11 +142,9 @@ class MCDDPMTrainer(BaseTrainer):
         val_ds = tio.SubjectsDataset(val_objs, transform=preprocess)
         self.val_loader = tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
-        # Viz indices
-        rng = np.random.RandomState(self.cfg.seed)
         # Stratified Validation Sampling
+        rng = np.random.RandomState(self.cfg.seed)
         from collections import defaultdict
-
         from common.data import get_region_key
 
         region_to_indices = defaultdict(list)
@@ -154,12 +152,18 @@ class MCDDPMTrainer(BaseTrainer):
             region = get_region_key(subj_id)
             region_to_indices[region].append(idx)
 
-        viz_indices = []
-        for region, indices in region_to_indices.items():
-            num_to_pick = min(len(indices), self.cfg.viz_limit)
-            viz_indices.extend(rng.choice(indices, num_to_pick, replace=False))
+        if self.cfg.full_val:
+            self.val_indices_to_run = set(range(len(self.val_subjects)))
+            viz_indices = []
+            for region, indices in region_to_indices.items():
+                viz_indices.extend(rng.choice(indices, min(len(indices), self.cfg.viz_limit), replace=False))
+            self.val_viz_indices = set(viz_indices)
+        else:
+            reduced_indices = [rng.choice(indices) for indices in region_to_indices.values()]
+            self.val_indices_to_run = set(reduced_indices)
+            self.val_viz_indices = set(reduced_indices)
 
-        self.val_viz_indices = set(viz_indices)
+        print(f"[{self.prefix}] 📊 Validation strategy: full_val={self.cfg.full_val}, running on {len(self.val_indices_to_run)}/{len(self.val_subjects)} volumes.")
 
     def _setup_opt(self):
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
@@ -182,6 +186,10 @@ class MCDDPMTrainer(BaseTrainer):
                 # the diffusion model expects channel dimension 1, which tio provides [B, 1, X, Y, Z]
                 mri = batch["mri"][tio.DATA].to(self.device, non_blocking=True)
                 ct = batch["ct"][tio.DATA].to(self.device, non_blocking=True)
+
+                # Modular Synchronized CutOut (via BaseTrainer)
+                # Apply on [0, 1] range before scaling to [-1, 1]
+                mri, ct, _ = self.apply_cutout(mri, ct)
 
                 # Scale from [0, 1] (from DataPreprocessing) to [-1, 1] (for MC-DDPM)
                 mri = mri * 2.0 - 1.0
@@ -227,6 +235,8 @@ class MCDDPMTrainer(BaseTrainer):
             return sampled_images
 
         for i, batch in enumerate(tqdm(self.val_loader, desc="Validating", leave=False)):
+            if i not in self.val_indices_to_run:
+                continue
             mri = batch["mri"][tio.DATA].to(self.device)
             ct = batch["ct"][tio.DATA].to(self.device)
             orig_shape = batch["original_shape"][0].tolist()
@@ -259,8 +269,9 @@ class MCDDPMTrainer(BaseTrainer):
 
             if i in self.val_viz_indices and self.cfg.wandb:
                 from common.utils import visualize_lite
-
-                visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}")
+                viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu") if k in met}
+                viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu") if body_met and k in body_met} or None
+                visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
 
         avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
         avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
@@ -270,6 +281,16 @@ class MCDDPMTrainer(BaseTrainer):
                 wandb.log({f"val_body/{k}": v for k, v in avg_body.items()}, step=self.global_step)
 
         return avg_met
+
+    def _save_checkpoint_wandb(self, epoch, is_last=False):
+        if self.cfg.wandb and wandb.run and wandb.run.dir:
+            save_dir = wandb.run.dir
+        else:
+            save_dir = os.path.join(self.gpfs_root, "results", "models", "mcddpm")
+        os.makedirs(save_dir, exist_ok=True)
+        filename = "checkpoint_last.pt" if is_last else f"{self.run_name}_epoch{epoch:05d}.pt"
+        path = os.path.join(save_dir, filename)
+        self.save_checkpoint(self.model, self.optimizer, self.scheduler, self.scaler, epoch, path)
 
     def train(self):
         print(f"[{self.prefix}] 🏁 Starting Loop")
@@ -288,13 +309,9 @@ class MCDDPMTrainer(BaseTrainer):
                 avg_met = self.validate(epoch)
                 tqdm.write(f"Ep {epoch} | Train: {loss:.4f} | Val MAE HU: {avg_met.get('mae_hu', 0):.1f} | SSIM: {avg_met.get('ssim', 0):.4f}")
 
+            self._save_checkpoint_wandb(epoch, is_last=True)
             if epoch % self.cfg.model_save_interval == 0:
-                save_dir = wandb.run.dir if self.cfg.wandb and wandb.run else self.cfg.log_dir
-                self.save_checkpoint(self.model, self.optimizer, self.scheduler, self.scaler, epoch, os.path.join(save_dir, f"{self.run_name}_epoch{epoch:05d}.pt"))
-
-        # Final checkpoint
-        save_dir = wandb.run.dir if self.cfg.wandb and wandb.run else self.cfg.log_dir
-        self.save_checkpoint(self.model, self.optimizer, self.scheduler, self.scaler, self.cfg.total_epochs, os.path.join(save_dir, f"{self.run_name}_epoch{self.cfg.total_epochs:05d}.pt"))
+                self._save_checkpoint_wandb(epoch)
 
         if self.cfg.wandb:
             wandb.finish()

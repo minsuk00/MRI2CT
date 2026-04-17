@@ -12,6 +12,7 @@ torch._dynamo.config.cache_size_limit = 64
 warnings.filterwarnings("ignore", category=UserWarning, module="monai.utils.module")
 warnings.filterwarnings("ignore", message=".*SubjectsLoader in PyTorch >= 2.3.*")
 warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensional indexing.*")
+# os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from mc_ddpm_baseline.trainer import MCDDPMTrainer
@@ -26,7 +27,7 @@ EXPERIMENT_CONFIG = [
         "steps_per_epoch": 100, # 1000
         "total_epochs": 500,
         "val_interval": 1,
-        "model_save_interval": 1,
+        "model_save_interval": 200,
         "lr": 2e-5,
         "weight_decay": 1e-4,
         "sanity_check": False,
@@ -36,7 +37,7 @@ EXPERIMENT_CONFIG = [
         # Diffusion params
         "diffusion_steps": 1000,
         "learn_sigma": True,
-        "timestep_respacing": [50],
+        "timestep_respacing": [10],
         "sigma_small": False,
         "noise_schedule": "linear",
         "use_kl": False,
@@ -78,10 +79,20 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, help="WandB run name prefix")
     parser.add_argument("--split_file", type=str, help="Path to split mapping file (e.g., splits/original_splits.txt)")
     parser.add_argument("--resume_id", type=str, help="WandB run ID to resume")
+    parser.add_argument("--val_interval", type=int, help="Validation interval (epochs)")
+    parser.add_argument("--model_save_interval", type=int, help="Checkpoint save interval (epochs)")
+    parser.add_argument("--full_val", type=str, choices=["True", "False"], help="Validate on full val set or 1 per region")
+    parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation")
+    parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags")
     args = parser.parse_args()
 
     for i, exp in enumerate(EXPERIMENT_CONFIG):
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")
+        if args.tags is not None:
+            exp.setdefault("wandb_tags", [])
+            exp["wandb_tags"] = exp["wandb_tags"] + [t.strip(' "') for t in args.tags.split(",") if t.strip()]
+        if args.use_cutout is not None:
+            exp["use_cutout"] = args.use_cutout == "True"
         if args.epochs is not None:
             exp["total_epochs"] = args.epochs
         if args.steps_per_epoch is not None:
@@ -96,6 +107,12 @@ if __name__ == "__main__":
             exp["split_file"] = args.split_file
         if args.resume_id is not None:
             exp["resume_wandb_id"] = args.resume_id
+        if args.val_interval is not None:
+            exp["val_interval"] = args.val_interval
+        if args.model_save_interval is not None:
+            exp["model_save_interval"] = args.model_save_interval
+        if args.full_val is not None:
+            exp["full_val"] = args.full_val == "True"
         conf = copy.deepcopy(DEFAULT_CONFIG)
         conf.update(exp)
         trainer = MCDDPMTrainer(conf)
