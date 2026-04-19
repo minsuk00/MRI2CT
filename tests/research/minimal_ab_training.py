@@ -17,7 +17,10 @@ parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
 parser.add_argument("--log_interval", type=int, default=500, help="Steps between logging images")
 parser.add_argument("--use_body_mask", action="store_true", help="Zero out non-body regions in MRI before feature extraction")
 parser.add_argument("--feat_norm", type=str, default=None, choices=["minmax", "instance"], help="Normalize anatomix features before translator: minmax (global) or instance (per-channel)")
+parser.add_argument("--subdir", type=str, default="default", help="Output subdirectory under tests/research/")
 args = parser.parse_args()
+output_dir = os.path.join("tests/research", args.subdir)
+os.makedirs(output_dir, exist_ok=True)
 
 sys.path.append("/home/minsukc/MRI2CT")
 from anatomix.model.network import Unet
@@ -79,7 +82,7 @@ for sub in TRAIN_SUBJECTS:
     mr_t = anatomix_normalize(torch.from_numpy(mr).float())
     ct_t = normalize_ct(torch.from_numpy(ct).float())
     if args.use_body_mask:
-        mask = torch.from_numpy(nib.load(os.path.join(data_root, sub, "mask.nii.gz")).get_fdata()).float()
+        mask = torch.from_numpy(nib.load(os.path.join(data_root, sub, "mask.nii")).get_fdata()).float()
         mr_t = mr_t * mask
     train_data.append({"mr": mr_t, "ct": ct_t})
 
@@ -92,8 +95,8 @@ def sample_batch(data_list, batch_size, patch_size):
         x = random.randint(0, mr.shape[0] - patch_size)
         y = random.randint(0, mr.shape[1] - patch_size)
         z = random.randint(0, mr.shape[2] - patch_size)
-        mr_batch.append(mr[x: x + patch_size, y: y + patch_size, z: z + patch_size].unsqueeze(0))
-        ct_batch.append(ct[x: x + patch_size, y: y + patch_size, z: z + patch_size].unsqueeze(0))
+        mr_batch.append(mr[x : x + patch_size, y : y + patch_size, z : z + patch_size].unsqueeze(0))
+        ct_batch.append(ct[x : x + patch_size, y : y + patch_size, z : z + patch_size].unsqueeze(0))
     return torch.stack(mr_batch), torch.stack(ct_batch)
 
 
@@ -152,7 +155,7 @@ ct_test = ct_test_nib.get_fdata()
 mr_test_t = anatomix_normalize(torch.from_numpy(mr_test).float())
 ct_test_t = normalize_ct(torch.from_numpy(ct_test).float())
 if args.use_body_mask:
-    mask_test = torch.from_numpy(nib.load(os.path.join(data_root, test_subject, "mask.nii.gz")).get_fdata()).float()
+    mask_test = torch.from_numpy(nib.load(os.path.join(data_root, test_subject, "mask.nii")).get_fdata()).float()
     mr_test_t = mr_test_t * mask_test
 
 
@@ -180,9 +183,9 @@ def evaluate_and_plot(step, save_nifti=False):
     if save_nifti:
         mask_tag = "masked" if args.use_body_mask else "unmasked"
         print(f"Saving NIfTI volumes for step {step}...")
-        nib.save(nib.Nifti1Image(mr_test_t.numpy(), mr_test_nib.affine), f"tests/research/ab_mr_input_{mask_tag}.nii.gz")
-        nib.save(nib.Nifti1Image(pv1_full_hu, mr_test_nib.affine), "tests/research/ab_v1_full.nii.gz")
-        nib.save(nib.Nifti1Image(pv12_full_hu, mr_test_nib.affine), "tests/research/ab_v12_full.nii.gz")
+        nib.save(nib.Nifti1Image(mr_test_t.numpy(), mr_test_nib.affine), os.path.join(output_dir, f"ab_mr_input_{mask_tag}.nii.gz"))
+        nib.save(nib.Nifti1Image(pv1_full_hu, mr_test_nib.affine), os.path.join(output_dir, "ab_v1_full.nii.gz"))
+        nib.save(nib.Nifti1Image(pv12_full_hu, mr_test_nib.affine), os.path.join(output_dir, "ab_v12_full.nii.gz"))
         print("Saved NIfTI volumes.")
 
     # Generate full slice visualization
@@ -211,7 +214,7 @@ def evaluate_and_plot(step, save_nifti=False):
         ax.axis("off")
 
     plt.tight_layout()
-    plot_path = f"tests/research/ab_full_slice_results_step_{step}.png"
+    plot_path = os.path.join(output_dir, f"ab_full_slice_results_step_{step}.png")
     plt.savefig(plot_path)
     plt.close()
     print(f"Saved visual proof to {plot_path}")
