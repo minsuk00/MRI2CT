@@ -2,6 +2,7 @@
 #SBATCH --account=jjparkcv98
 #SBATCH --partition=spgpu
 #SBATCH --gres=gpu:a40:1
+#SBATCH --gpu_cmode=shared
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
@@ -19,12 +20,12 @@ DICE_BONE_W=0.3
 AUGMENT="True"
 WEIGHTED_SAMPLER="True"
 NORM="batch"  # "batch", "instance", or "none"
-USE_CUTOUT="True"
+USE_CUTOUT="False"
 CUTOUT_ALPHA=1.0
 EPOCHS=1000
 STEPS_PER_EPOCH=500
 NUM_WORKERS=4
-RESUME_ID="dkaw3fix"  # Leave empty if not resuming
+RESUME_ID=""  # Leave empty if not resuming
 TAGS="thorax" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---

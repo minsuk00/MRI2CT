@@ -2,6 +2,7 @@
 #SBATCH --account=jjparkcv98
 #SBATCH --partition=spgpu
 #SBATCH --gres=gpu:a40:1
+#SBATCH --gpu_cmode=shared
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
@@ -20,7 +21,7 @@ CUTOUT_ALPHA=1.0
 DICE_W=0.1
 DICE_BONE_W=0.3
 PASS_MRI="True"
-FEAT_INST_NORM="False"
+FEAT_INST_NORM="True"
 INPUT_DROPOUT=0.5
 USE_ZERO_MASK="False"
 WEIGHTED_SAMPLER="True"
@@ -31,8 +32,8 @@ AMIX_WEIGHTS="v1"
 EPOCHS=1000
 STEPS_PER_EPOCH=500
 NUM_WORKERS=4
-RESUME_ID="5fotv4ai" # Leave empty if not resuming
-TAGS="thorax,v1" # Comma-separated extra WandB tags (e.g. "high bone dice,instance norm")
+RESUME_ID="" # Leave empty if not resuming
+TAGS="thorax,v1,feat_inst_norm" # Comma-separated extra WandB tags (e.g. "high bone dice,instance norm")
 
 
 # --- Self-Submission Logic ---
