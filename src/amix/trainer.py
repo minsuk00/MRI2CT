@@ -319,6 +319,11 @@ class Trainer(BaseTrainer):
             if getattr(self.cfg, "feat_instance_norm", False):
                 features = torch.nn.functional.instance_norm(features)
 
+            # A2) Optional feature scale-down
+            feat_scale = getattr(self.cfg, "feat_scale_down", 1)
+            if feat_scale != 1:
+                features = features / feat_scale
+
             # B) Zero-masking for background noise suppression
             if getattr(self.cfg, "use_zero_mask", False):
                 mask = (mri > 0.01).to(mri.dtype)
@@ -569,6 +574,11 @@ class Trainer(BaseTrainer):
                 # 2. Instance Norm
                 if getattr(self.cfg, "feat_instance_norm", False):
                     f = torch.nn.functional.instance_norm(f)
+
+                # 2b. Feature scale-down
+                feat_scale = getattr(self.cfg, "feat_scale_down", 1)
+                if feat_scale != 1:
+                    f = f / feat_scale
 
                 # 3. Zero-masking for background noise suppression
                 if getattr(self.cfg, "use_zero_mask", False):

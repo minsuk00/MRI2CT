@@ -98,6 +98,8 @@ if __name__ == "__main__":
     parser.add_argument("--cutout_alpha", type=float, help="Beta(alpha, alpha) parameter controlling cutout box size distribution")
     parser.add_argument("--mask_body_input", type=str, choices=["True", "False"], help="Zero out MRI voxels outside body mask before sampling (True/False)")
     parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
+    parser.add_argument("--compile_mode", type=str, help="torch.compile mode: 'full', 'model', or 'none'")
+    parser.add_argument("--feat_scale_down", type=float, help="Divide features by this value (e.g. 100)")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -161,6 +163,10 @@ if __name__ == "__main__":
         # Dice Validation Override
         if args.validate_dice is not None:
             exp["validate_dice"] = args.validate_dice == "True"
+        if args.compile_mode is not None:
+            exp["compile_mode"] = None if args.compile_mode.lower() == "none" else args.compile_mode
+        if args.feat_scale_down is not None:
+            exp["feat_scale_down"] = args.feat_scale_down
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")
