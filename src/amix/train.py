@@ -100,6 +100,8 @@ if __name__ == "__main__":
     parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
     parser.add_argument("--compile_mode", type=str, help="torch.compile mode: 'full', 'model', or 'none'")
     parser.add_argument("--feat_scale_down", type=float, help="Divide features by this value (e.g. 100)")
+    parser.add_argument("--use_float16", type=str, choices=["True", "False"], help="Enable float16 storage for RAM optimization (True/False)")
+    parser.add_argument("--val_interval", type=int, help="Run validation every N epochs")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -167,6 +169,10 @@ if __name__ == "__main__":
             exp["compile_mode"] = None if args.compile_mode.lower() == "none" else args.compile_mode
         if args.feat_scale_down is not None:
             exp["feat_scale_down"] = args.feat_scale_down
+        if args.use_float16 is not None:
+            exp["use_float16_storage"] = args.use_float16 == "True"
+        if args.val_interval is not None:
+            exp["val_interval"] = args.val_interval
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")

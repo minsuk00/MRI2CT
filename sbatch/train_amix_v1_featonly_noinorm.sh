@@ -32,7 +32,7 @@ AMIX_WEIGHTS="v1"
 EPOCHS=1000
 STEPS_PER_EPOCH=500
 NUM_WORKERS=4
-RESUME_ID="" # Leave empty if not resuming
+RESUME_ID="jugf12f8" # Leave empty if not resuming
 TAGS="thorax,v1,featonly,noinorm" # Comma-separated extra WandB tags
 
 

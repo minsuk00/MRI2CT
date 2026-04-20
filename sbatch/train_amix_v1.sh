@@ -32,7 +32,7 @@ AMIX_WEIGHTS="v1"
 EPOCHS=1000
 STEPS_PER_EPOCH=500
 NUM_WORKERS=4
-RESUME_ID="" # Leave empty if not resuming
+RESUME_ID="0h5h22l5" # Leave empty if not resuming
 TAGS="thorax,v1,feat_inst_norm" # Comma-separated extra WandB tags (e.g. "high bone dice,instance norm")
 
 
