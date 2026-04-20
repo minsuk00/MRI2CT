@@ -283,8 +283,8 @@ class MCDDPMTrainer(BaseTrainer):
         return avg_met
 
     def _save_checkpoint_wandb(self, epoch, is_last=False):
-        if self.cfg.wandb and wandb.run and wandb.run.dir:
-            save_dir = wandb.run.dir
+        if self.cfg.wandb and self.local_run_dir:
+            save_dir = self.local_run_dir
         else:
             save_dir = os.path.join(self.gpfs_root, "results", "models", "mcddpm")
         os.makedirs(save_dir, exist_ok=True)

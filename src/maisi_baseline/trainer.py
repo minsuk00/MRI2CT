@@ -568,7 +568,7 @@ class MAISITrainer(BaseTrainer):
             wandb.finish()
 
     def _save_maisi_checkpoint(self, epoch, is_last=False):
-        save_dir = wandb.run.dir if self.cfg.wandb and wandb.run and wandb.run.dir else os.path.join(self.gpfs_root, "results", "models", "maisi")
+        save_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.gpfs_root, "results", "models", "maisi")
         filename = "checkpoint_last.pt" if is_last else f"maisi_epoch{epoch:05d}.pt"
         self.save_checkpoint(
             self.controlnet, self.optimizer, self.scheduler, self.scaler,

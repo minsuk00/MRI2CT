@@ -124,6 +124,9 @@ class BaselineTrainer(BaseTrainer):
 
         self._load_resume(self.model, self.optimizer, self.scheduler, self.scaler)
 
+        if getattr(self.cfg, "val_drr", False):
+            self._precompute_gt_drrs()
+
     def _setup_data(self, seed=None):
         if seed is not None:
             # Seed-based worker rotation for correct data coverage
@@ -505,7 +508,10 @@ class BaselineTrainer(BaseTrainer):
 
             # Save Volumes (Optional - only visualized to save time)
             if self.cfg.save_val_volumes and i in self.val_viz_indices:
-                save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
+                if self.cfg.wandb and self.local_run_dir:
+                    save_dir = os.path.join(self.local_run_dir, "predictions", f"epoch_{epoch}")
+                else:
+                    save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
                 os.makedirs(save_dir, exist_ok=True)
                 pred_np = pred_unpad.float().cpu().numpy().squeeze()
                 pred_hu = (pred_np * 2048.0) - 1024.0
@@ -529,6 +535,9 @@ class BaselineTrainer(BaseTrainer):
                     viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if k in met}
                     viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if body_met and k in body_met} or None
                     visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
+
+                if self.cfg.val_drr and save_path and subj_id in self.gt_drrs:
+                    self._log_drr_comparison(subj_id, save_path)
 
             del mri, ct, pred, pred_unpad, ct_unpad, mri_unpad
 
@@ -606,8 +615,8 @@ class BaselineTrainer(BaseTrainer):
             wandb.finish()
 
     def save_checkpoint(self, epoch, is_last=False):
-        if self.cfg.wandb and wandb.run and wandb.run.dir:
-            save_dir = wandb.run.dir
+        if self.cfg.wandb and self.local_run_dir:
+            save_dir = self.local_run_dir
         else:
             save_dir = os.path.join(self.gpfs_root, "results", "models", "baseline")
 

@@ -62,6 +62,9 @@ class Trainer(BaseTrainer):
 
         self._load_resume()
 
+        if getattr(self.cfg, "val_drr", False):
+            self._precompute_gt_drrs()
+
     def _setup_data(self, seed=None):
         if seed is not None:
             # Re-seed to ensure different shuffling after worker restart
@@ -91,7 +94,7 @@ class Trainer(BaseTrainer):
         # Main aligned with baseline: Disable safety padding by default
         use_safety = False
 
-        # from common.data import Float16Storage
+        from common.data import Float16Storage
 
         preprocess = DataPreprocessing(
             patch_size=self.cfg.patch_size,
@@ -106,7 +109,9 @@ class Trainer(BaseTrainer):
             transform_list.append(get_augmentations())
 
         # Cast to float16 at the VERY END for RAM storage optimization
-        # transform_list.append(Float16Storage())
+        if getattr(self.cfg, "use_float16_storage", False):
+            print("[Trainer] Enabling Float16 Storage for RAM optimization")
+            transform_list.append(Float16Storage())
 
         transforms = tio.Compose(transform_list)
 
@@ -139,7 +144,12 @@ class Trainer(BaseTrainer):
             self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False) or getattr(self.cfg, "mask_body_input", False)
         )
         val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult, mask_body_input=getattr(self.cfg, "mask_body_input", False))
-        val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess)
+        
+        val_transform_list = [val_preprocess]
+        if getattr(self.cfg, "use_float16_storage", False):
+            val_transform_list.append(Float16Storage())
+            
+        val_ds = tio.SubjectsDataset(val_objs, transform=tio.Compose(val_transform_list))
         self.val_loader = tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
         # Stratified Validation Sampling (2 per region)
@@ -383,7 +393,7 @@ class Trainer(BaseTrainer):
 
     def save_checkpoint(self, epoch, is_last=False):
         filename = "checkpoint_last.pt" if is_last else f"{self.cfg.model_type}_epoch{epoch:05d}.pt"
-        save_dir = wandb.run.dir if self.cfg.wandb else os.path.join(self.gpfs_root, "results", "models")
+        save_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.gpfs_root, "results", "models")
         path = os.path.join(save_dir, filename)
 
         extra_state = {}
@@ -666,7 +676,10 @@ class Trainer(BaseTrainer):
                 save_path = None
                 # Optimization: Only save volumes if visualized
                 if self.cfg.save_val_volumes:
-                    save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
+                    if self.cfg.wandb and self.local_run_dir:
+                        save_dir = os.path.join(self.local_run_dir, "predictions", f"epoch_{epoch}")
+                    else:
+                        save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
                     os.makedirs(save_dir, exist_ok=True)
 
                     # Denormalize [0, 1] -> [-1024, 1024]
@@ -690,6 +703,9 @@ class Trainer(BaseTrainer):
                     viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if k in met}
                     viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if body_met and k in body_met} or None
                     visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
+
+                if self.cfg.val_drr and save_path and subj_id in self.gt_drrs:
+                    self._log_drr_comparison(subj_id, save_path)
 
             del mri, ct, pred, pred_unpad, ct_unpad, mri_unpad
             # if "feats" in locals():

@@ -138,6 +138,8 @@ class SegTrainer:
         # State Tracking
         self.start_epoch = 0
         self.global_step = 0
+        self.local_run_dir = None  # set in _setup_wandb once run ID is known
+        self.session_dir = None    # per-resume subdir: <local_run_dir>/sessions/<run_name>/
 
         self._setup_wandb()
         self._setup_data()
@@ -171,6 +173,15 @@ class SegTrainer:
                 resume="allow" if not self.cfg.get("diverge_wandb_branch", False) else None,
             )
             tqdm.write(f"[SegTrainer] 📡 WandB Initialized. Run ID: {wandb.run.id}")
+            existing = glob.glob(os.path.join(self.cfg["log_dir"], "runs", f"*_{wandb.run.id}"))
+            if existing:
+                self.local_run_dir = existing[0]
+            else:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                self.local_run_dir = os.path.join(self.cfg["log_dir"], "runs", f"{timestamp}_{wandb.run.id}")
+            os.makedirs(self.local_run_dir, exist_ok=True)
+            self.session_dir = os.path.join(self.local_run_dir, "sessions", run_name)
+            os.makedirs(self.session_dir, exist_ok=True)
             # Log Code Parity
             wandb.run.log_code(".")
 
@@ -180,20 +191,24 @@ class SegTrainer:
             return
 
         tqdm.write(f"[RESUME] 🕵️ Searching for Run ID: {resume_id}")
-        run_folders = glob.glob(os.path.join(self.cfg["log_dir"], "wandb", f"run-*-{resume_id}"))
-        if not run_folders:
+        # New-style: <timestamp>_<run_id> dir (preferred)
+        new_style = glob.glob(os.path.join(self.cfg["log_dir"], "runs", f"*_{resume_id}"))
+        # Old-style: timestamped wandb run folders (backward compat)
+        old_run_folders = glob.glob(os.path.join(self.cfg["log_dir"], "wandb", f"run-*-{resume_id}"))
+
+        search_dirs = []
+        if new_style:
+            search_dirs.append(new_style[0])
+        search_dirs.extend(os.path.join(f, "files") for f in old_run_folders)
+
+        if not search_dirs:
             tqdm.write(f"[RESUME] ❌ Run folder not found for ID: {resume_id}")
             return
 
         all_ckpts = []
-        for f in run_folders:
-            # Check standard models folder and wandb files folder
-            ckpts = glob.glob(os.path.join(f, "files", "*.pth"))
+        for f in search_dirs:
+            ckpts = glob.glob(os.path.join(f, "*.pth"))
             all_ckpts.extend(ckpts)
-
-        # Also check project models dir if not in wandb
-        proj_models = glob.glob(os.path.join(self.cfg["log_dir"], "models", "*.pth"))
-        all_ckpts.extend(proj_models)
 
         if not all_ckpts:
             tqdm.write("[RESUME] ⚠️ No checkpoints found.")
@@ -663,7 +678,7 @@ class SegTrainer:
         return avg_val_loss
 
     def save_checkpoint(self, epoch, best=False):
-        save_dir = wandb.run.dir if self.cfg["wandb"] else os.path.join(self.cfg["log_dir"], "models")
+        save_dir = self.local_run_dir if (self.cfg["wandb"] and self.local_run_dir) else os.path.join(self.cfg["log_dir"], "models")
         os.makedirs(save_dir, exist_ok=True)
         filename = "seg_baby_unet_best.pth" if best else f"seg_baby_unet_epoch_{epoch}.pth"
         save_path = os.path.join(save_dir, filename)
