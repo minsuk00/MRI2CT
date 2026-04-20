@@ -35,6 +35,8 @@ class BaseTrainer:
         # Consistent run name
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
         self.run_name = f"{timestamp}_{self.cfg.run_name_prefix}" if hasattr(self.cfg, "run_name_prefix") else f"{timestamp}_Train"
+        self.local_run_dir = None  # set in _setup_wandb once run ID is known
+        self.session_dir = None    # per-resume subdir: <local_run_dir>/sessions/<run_name>/
 
         # Modular Augmentations
         self.cutout_transform = None
@@ -90,26 +92,44 @@ class BaseTrainer:
             id=wandb_id,
             resume="allow" if not self.cfg.diverge_wandb_branch else None,
         )
-        # Save code state and final config for reproducibility
+        # Stable local dir — <timestamp>_<run_id> on first create, found via glob on resume
+        if wandb.run:
+            existing = glob(os.path.join(self.cfg.log_dir, "runs", f"*_{wandb.run.id}"))
+            if existing:
+                self.local_run_dir = existing[0]
+            else:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                self.local_run_dir = os.path.join(self.cfg.log_dir, "runs", f"{timestamp}_{wandb.run.id}")
+            os.makedirs(self.local_run_dir, exist_ok=True)
+            self.session_dir = os.path.join(self.local_run_dir, "sessions", self.run_name)
+            os.makedirs(self.session_dir, exist_ok=True)
+
+        # Save code state and session-specific config
         if wandb.run:
             wandb.run.log_code(".")
             import yaml
 
-            config_path = os.path.join(wandb.run.dir, "config_final.yaml")
+            config_path = os.path.join(self.session_dir, "config_final.yaml")
             with open(config_path, "w") as f:
                 yaml.dump(vars(self.cfg), f, default_flow_style=False, sort_keys=True)
-            wandb.save(config_path, base_path=wandb.run.dir)
+            wandb.save(config_path, base_path=self.local_run_dir)
+
+            # Sync SLURM log live if running inside a SLURM job
+            slurm_job_id = os.environ.get("SLURM_JOB_ID")
+            if slurm_job_id:
+                slurm_logs = glob(os.path.join(os.path.dirname(__file__), "../../slurm_logs", f"*_{slurm_job_id}.log"))
+                if slurm_logs:
+                    wandb.save(slurm_logs[0], base_path=self.local_run_dir, policy="live")
 
     def _log_model_summary(self, model_dict):
         """Standardized model summary logging across all trainers."""
         if not self.cfg.wandb or not wandb.run:
             return
 
-        summary_path = os.path.join(wandb.run.dir, "model_summary.txt")
+        summary_path = os.path.join(self.local_run_dir, "model_summary.txt")
         tot, train = log_model_summary(model_dict, summary_path)
 
-        # Save to WandB and update config with exact counts
-        wandb.save(summary_path, base_path=wandb.run.dir)
+        wandb.save(summary_path, base_path=self.local_run_dir)
         wandb.config.update({"total_params": tot, "trainable_params": train}, allow_val_change=True)
         return tot, train
 
@@ -118,12 +138,19 @@ class BaseTrainer:
             return
 
         print(f"[RESUME] 🕵️ Searching for Run ID: {self.cfg.resume_wandb_id}")
-        run_folders = glob(os.path.join(self.cfg.log_dir, "wandb", f"run-*-{self.cfg.resume_wandb_id}"))
-        if not run_folders:
+        # New-style: <timestamp>_<run_id> dir (preferred)
+        new_style = glob(os.path.join(self.cfg.log_dir, "runs", f"*_{self.cfg.resume_wandb_id}"))
+        # Old-style: timestamped wandb run folders (backward compat)
+        old_run_folders = glob(os.path.join(self.cfg.log_dir, "wandb", f"run-*-{self.cfg.resume_wandb_id}"))
+
+        files_dirs = []
+        if new_style:
+            files_dirs.append(new_style[0])
+        files_dirs.extend(os.path.join(rf, "files") for rf in old_run_folders)
+
+        if not files_dirs:
             print(f"[RESUME] ❌ Run folder not found for ID: {self.cfg.resume_wandb_id}")
             return
-
-        files_dirs = [os.path.join(rf, "files") for rf in run_folders]
 
         if self.cfg.resume_epoch is not None:
             # Load a specific epoch snapshot
@@ -388,3 +415,51 @@ class BaseTrainer:
         if self.cfg.wandb:
             wandb.log({"train/patch_viz": wandb.Image(fig, caption=caption)}, step=step)
         plt.close(fig)
+
+    def _precompute_gt_drrs(self):
+        """Render GT CT DRRs once at init for all viz subjects. Cached in self.gt_drrs."""
+        from evaluate.drr import render_drr
+
+        self.gt_drrs = {}
+        self.drr_thetas = None
+        viz_subj_ids = [self.val_subjects[i] for i in sorted(self.val_viz_indices)]
+        print(f"[{self.prefix}] Pre-computing GT DRRs for {len(viz_subj_ids)} subjects...")
+        for subj_id in viz_subj_ids:
+            gt_path = get_subject_paths(self.cfg.root_dir, subj_id)["ct"]
+            img, thetas = render_drr(
+                gt_path, self.device,
+                num_angles=self.cfg.val_drr_angles,
+                height=self.cfg.val_drr_res,
+                width=self.cfg.val_drr_res,
+            )
+            self.gt_drrs[subj_id] = img[:, 0].cpu().numpy()  # [N, H, W]
+            if self.drr_thetas is None:
+                self.drr_thetas = thetas
+            del img
+            torch.cuda.empty_cache()
+        print(f"[{self.prefix}] GT DRRs cached for: {list(self.gt_drrs.keys())}")
+
+    @torch.inference_mode()
+    def _log_drr_comparison(self, subj_id, save_path):
+        """Render sCT DRR from save_path, compare with cached GT DRR, log to WandB."""
+        from evaluate.drr import make_drr_figure, render_drr
+
+        try:
+            img_pred, _ = render_drr(
+                save_path, self.device,
+                num_angles=self.cfg.val_drr_angles,
+                height=self.cfg.val_drr_res,
+                width=self.cfg.val_drr_res,
+            )
+            pred_np = img_pred[:, 0].cpu().numpy()
+            del img_pred
+            torch.cuda.empty_cache()  # free subject + img_pred before CPU-only figure work
+            from evaluate.drr import DELX, ORIENTATION, SDD, TRANSLATION
+            res = self.cfg.val_drr_res
+            cam_info = f"SDD={SDD}mm  delx=dely={DELX}mm  res={res}×{res}  translation={TRANSLATION}mm  orientation={ORIENTATION}"
+            caption = f"pred: {save_path}\n{cam_info}"
+            fig = make_drr_figure(self.gt_drrs[subj_id], pred_np, self.drr_thetas, title=f"DRR: {subj_id}", caption=caption)
+            wandb.log({f"val_drr/{subj_id}": wandb.Image(fig)}, step=self.global_step)
+            plt.close(fig)
+        except Exception as e:
+            print(f"[{self.prefix}] [WARNING] DRR comparison failed for {subj_id}: {e}")

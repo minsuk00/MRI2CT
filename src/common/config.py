@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "res_mult": 32,
     "analyze_shapes": True,
     "enable_profiling": False,
+    "use_float16_storage": False,
     # Training
     "lr": 3e-4,
     "scheduler_type": "cosine",  # "plateau", "cosine", None
@@ -85,4 +86,8 @@ DEFAULT_CONFIG = {
     # Validation Saving
     "save_val_volumes": True,
     "full_val": True,
+    # DRR Validation
+    "val_drr": True,
+    "val_drr_angles": 4,
+    "val_drr_res": 256,
 }

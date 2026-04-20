@@ -1,3 +1,4 @@
+import copy
 import os
 from glob import glob
 
@@ -18,6 +19,10 @@ class DataPreprocessing(tio.Transform):
         self.mask_body_input = mask_body_input
 
     def apply_transform(self, subject):
+        # Deep clone to prevent in-place modification of subjects in the dataset list,
+        # which causes RAM accumulation over epochs as volumes stay loaded.
+        subject = copy.deepcopy(subject)
+
         if self.enforce_ras:
             subject = tio.ToCanonical()(subject)
 
@@ -68,16 +73,16 @@ class DataPreprocessing(tio.Transform):
         return subject
 
 
-# class Float16Storage(tio.Transform):
-#     """
-#     RAM optimization: Casts MRI and CT to float16.
-#     MUST be the last transform in the pipeline to avoid SimpleITK errors.
-#     """
+class Float16Storage(tio.Transform):
+    """
+    RAM optimization: Casts MRI and CT to float16.
+    MUST be the last transform in the pipeline to avoid SimpleITK errors.
+    """
 
-#     def apply_transform(self, subject):
-#         subject["mri"].set_data(subject["mri"].data.to(torch.float16))
-#         subject["ct"].set_data(subject["ct"].data.to(torch.float16))
-#         return subject
+    def apply_transform(self, subject):
+        subject["mri"].set_data(subject["mri"].data.to(torch.float16))
+        subject["ct"].set_data(subject["ct"].data.to(torch.float16))
+        return subject
 
 
 def get_augmentations():

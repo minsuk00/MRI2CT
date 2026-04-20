@@ -20,3 +20,9 @@ pyproject.toml
 _archive/
 .gemini/
 gha-creds-*.json
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.log
+*.csv
