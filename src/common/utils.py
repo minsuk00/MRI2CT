@@ -202,8 +202,17 @@ def anatomix_normalize(tensor, percentile_range=None, clip_range=None):
     # 2. MRI path: Percentile Normalization (Instance-level)
     if percentile_range is not None:
         min_percentile, max_percentile = percentile_range
-        v_min = torch.quantile(tensor, min_percentile / 100.0)
-        v_max = torch.quantile(tensor, max_percentile / 100.0)
+
+        # Subsample for quantile calculation if tensor is large to avoid RuntimeError
+        if tensor.numel() > 16_000_000:
+            flat = tensor.flatten()
+            indices = torch.randint(0, flat.numel(), (1_000_000,))
+            sample = flat[indices]
+        else:
+            sample = tensor
+
+        v_min = torch.quantile(sample, min_percentile / 100.0)
+        v_max = torch.quantile(sample, max_percentile / 100.0)
         tensor = torch.clamp(tensor, v_min, v_max)
 
         denom = v_max - v_min
@@ -284,24 +293,21 @@ def compute_metrics(pred, target, data_range=1.0):
 
 
 def compute_metrics_body(pred, target, mask):
-    """Like compute_metrics but restricted to body voxels (from mask.nii.gz).
-    - MAE, PSNR: computed on masked voxels only
-    - SSIM: full volume with background zeroed in both (no penalty for matching zeros)
+    """Like compute_metrics but with background zeroed out in both pred and target.
+    All metrics (MAE, PSNR, SSIM) are computed on the full volume after zeroing.
     Returns: {mae, mae_hu, psnr, ssim}
     """
-    mask_bool = mask.bool()
+    mask_float = mask.float()
+    pred_m = pred * mask_float
+    targ_m = target * mask_float
 
-    pred_m = pred * mask_bool.float()
-    targ_m = target * mask_bool.float()
     try:
         ssim_val = fused_ssim3d(pred_m.float().contiguous(), targ_m.float().contiguous(), train=False).item()
     except Exception:
         ssim_val = fused_ssim3d(pred_m.cpu().float().contiguous(), targ_m.cpu().float().contiguous(), train=False).item()
 
-    pred_v = pred[mask_bool]
-    targ_v = target[mask_bool]
-    mae_val = torch.mean(torch.abs(pred_v - targ_v)).item()
-    mse = torch.mean((pred_v - targ_v) ** 2).clamp(min=1e-10)
+    mae_val = torch.mean(torch.abs(pred_m - targ_m)).item()
+    mse = torch.mean((pred_m - targ_m) ** 2).clamp(min=1e-10)
     psnr = (10 * torch.log10(torch.tensor(1.0) / mse)).item()
 
     return {"mae": mae_val, "mae_hu": mae_val * 2048.0, "psnr": psnr, "ssim": ssim_val}

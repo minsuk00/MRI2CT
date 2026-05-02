@@ -16,15 +16,15 @@ DEFAULT_CONFIG = {
     "cutout_prob": 0.5,
     "cutout_alpha": 1.0,
     # System
-    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5mm_registered_flat",
+    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD/1.5mm_registered_flat_masked",
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
-    "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/predictions/1.5x1.5x1.5mm_registered",
+    "prediction_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD/predictions/1.5x1.5x1.5mm_registered",
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "wandb": True,
     "project_name": "mri2ct",
     # Data
-    "split_file": "splits/original_splits.txt",
+    "split_file": "splits/center_wise_split.txt",
     "stage_data": True,
     "augment": True,
     "patch_size": 128,
@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
     "analyze_shapes": True,
     "enable_profiling": False,
     "use_float16_storage": False,
+    "enforce_ras": True,
+    "mri_norm": "minmax",  # "minmax" or "percentile" (0.0–99.5, same as MAISI)
     # Training
     "lr": 3e-4,
     "scheduler_type": "cosine",  # "plateau", "cosine", None
@@ -61,12 +63,12 @@ DEFAULT_CONFIG = {
     "batch_size": 4,
     "final_activation": "sigmoid",
     "use_weighted_sampler": True,
-    "mask_body_input": False,
     "pass_mri_to_translator": False,
     "use_zero_mask": False,
     "n_classes": 12,  # 11 Organs + Brain
     # Sliding Window & Viz Options
-    "val_sw_batch_size": 4,
+    "val_patch_size": 256,
+    "val_sw_batch_size": 2,
     "val_sw_overlap": 0.25,
     "validate_dice": False,
     "val_body_mask": True,  # If True, also log val_body/ metrics computed on body voxels only
@@ -85,6 +87,7 @@ DEFAULT_CONFIG = {
     "diverge_wandb_branch": False,
     # Validation Saving
     "save_val_volumes": True,
+    "val_save_interval": 100,  # Save epoch-stamped predictions every N epochs (0 = disabled)
     "full_val": True,
     # DRR Validation
     "val_drr": True,

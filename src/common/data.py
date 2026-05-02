@@ -9,14 +9,13 @@ from common.utils import anatomix_normalize
 
 
 class DataPreprocessing(tio.Transform):
-    def __init__(self, patch_size=96, enable_safety_padding=False, res_mult=32, use_weighted_sampler=False, enforce_ras=False, mask_body_input=False, **kwargs):
+    def __init__(self, patch_size=96, res_mult=32, use_weighted_sampler=False, enforce_ras=False, mri_norm="minmax", **kwargs):
         super().__init__(**kwargs)
         self.patch_size = patch_size
-        self.enable_safety_padding = enable_safety_padding
         self.res_mult = res_mult
         self.use_weighted_sampler = use_weighted_sampler
         self.enforce_ras = enforce_ras
-        self.mask_body_input = mask_body_input
+        self.mri_norm = mri_norm
 
     def apply_transform(self, subject):
         # Deep clone to prevent in-place modification of subjects in the dataset list,
@@ -27,10 +26,11 @@ class DataPreprocessing(tio.Transform):
             subject = tio.ToCanonical()(subject)
 
         subject["ct"].set_data(anatomix_normalize(subject["ct"].data, clip_range=(-1024, 1024)))
-        subject["mri"].set_data(anatomix_normalize(subject["mri"].data))
+        mri_pct = (0.0, 99.5) if self.mri_norm == "percentile" else None
+        subject["mri"].set_data(anatomix_normalize(subject["mri"].data, percentile_range=mri_pct))
 
         subject["original_shape"] = torch.tensor(subject["ct"].spatial_shape)
-        pad_offset = 0
+        subject["pad_offset"] = torch.tensor(0)
 
         # Keys that must be transformed spatially
         spatial_keys = ["ct", "mri"]
@@ -38,13 +38,6 @@ class DataPreprocessing(tio.Transform):
             spatial_keys.append("prob_map")
         if "seg" in subject:
             spatial_keys.append("seg")
-
-        if self.enable_safety_padding:
-            pad_val = self.patch_size // 2
-            subject = tio.Pad(pad_val, padding_mode=0, include=spatial_keys)(subject)
-            pad_offset = pad_val
-
-        subject["pad_offset"] = torch.tensor(pad_offset)
         current_shape = subject["ct"].spatial_shape
         padding_params = []
         for dim in current_shape:
@@ -57,12 +50,6 @@ class DataPreprocessing(tio.Transform):
         if self.use_weighted_sampler and "prob_map" not in subject:
             prob = (subject["ct"].data > 0.01).to(torch.uint8)
             subject.add_image(tio.LabelMap(tensor=prob, affine=subject["mri"].affine), "prob_map")
-
-        if self.mask_body_input:
-            if "prob_map" not in subject:
-                raise RuntimeError(f"mask_body_input=True but subject '{subject.get('name', '?')}' has no prob_map. Enable use_weighted_sampler (or val_body_mask) to load mask.nii.gz.")
-            body_mask = subject["prob_map"].data.float()
-            subject["mri"].set_data(subject["mri"].data * body_mask)
 
         # Final RAM optimization: Ensure masks are uint8 (1 byte)
         if "prob_map" in subject:

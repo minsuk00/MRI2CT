@@ -94,7 +94,7 @@ class BaseTrainer:
         )
         # Stable local dir — <timestamp>_<run_id> on first create, found via glob on resume
         if wandb.run:
-            existing = glob(os.path.join(self.cfg.log_dir, "runs", f"*_{wandb.run.id}"))
+            existing = sorted(glob(os.path.join(self.cfg.log_dir, "runs", f"*_{wandb.run.id}")), reverse=True)
             if existing:
                 self.local_run_dir = existing[0]
             else:
@@ -114,12 +114,19 @@ class BaseTrainer:
                 yaml.dump(vars(self.cfg), f, default_flow_style=False, sort_keys=True)
             wandb.save(config_path, base_path=self.local_run_dir)
 
-            # Sync SLURM log live if running inside a SLURM job
+            # Symlink SLURM log into session_dir and sync live to WandB
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
             if slurm_job_id:
-                slurm_logs = glob(os.path.join(os.path.dirname(__file__), "../../slurm_logs", f"*_{slurm_job_id}.log"))
+                # Search for logs that start with the job ID (standard) or end with it (some custom formats)
+                slurm_logs = glob(os.path.join(os.path.dirname(__file__), "../../slurm_logs", f"{slurm_job_id}_*.log"))
+                if not slurm_logs:
+                    slurm_logs = glob(os.path.join(os.path.dirname(__file__), "../../slurm_logs", f"*_{slurm_job_id}.log"))
+                
                 if slurm_logs:
-                    wandb.save(slurm_logs[0], base_path=self.local_run_dir, policy="live")
+                    link_path = os.path.join(self.session_dir, "slurm.log")
+                    if not os.path.exists(link_path):
+                        os.symlink(os.path.abspath(slurm_logs[0]), link_path)
+                    wandb.save(link_path, base_path=self.local_run_dir, policy="live")
 
     def _log_model_summary(self, model_dict):
         """Standardized model summary logging across all trainers."""
@@ -139,9 +146,9 @@ class BaseTrainer:
 
         print(f"[RESUME] 🕵️ Searching for Run ID: {self.cfg.resume_wandb_id}")
         # New-style: <timestamp>_<run_id> dir (preferred)
-        new_style = glob(os.path.join(self.cfg.log_dir, "runs", f"*_{self.cfg.resume_wandb_id}"))
-        # Old-style: timestamped wandb run folders (backward compat)
-        old_run_folders = glob(os.path.join(self.cfg.log_dir, "wandb", f"run-*-{self.cfg.resume_wandb_id}"))
+        new_style = sorted(glob(os.path.join(self.cfg.log_dir, "runs", f"*_{self.cfg.resume_wandb_id}")), reverse=True)
+        # Old-style: timestamped wandb run folders (backward compat), newest first
+        old_run_folders = sorted(glob(os.path.join(self.cfg.log_dir, "wandb", f"run-*-{self.cfg.resume_wandb_id}")), reverse=True)
 
         files_dirs = []
         if new_style:
@@ -164,13 +171,24 @@ class BaseTrainer:
                 print(f"[RESUME] ❌ No checkpoint found for epoch {self.cfg.resume_epoch}.")
                 return
         else:
-            # Default: prefer checkpoint_last.pt, fall back to highest epoch-numbered file
+            # Default: look for checkpoint_last.pt across ALL candidate folders
             target_ckpt = None
+            candidates = []
             for fd in files_dirs:
                 last = os.path.join(fd, "checkpoint_last.pt")
                 if os.path.exists(last):
-                    target_ckpt = last
-                    break
+                    candidates.append(last)
+            
+            if candidates:
+                # Pick the one with the highest epoch stored inside
+                def get_ckpt_epoch(p):
+                    try:
+                        c = torch.load(p, map_location='cpu', weights_only=False)
+                        return c.get('epoch', -1)
+                    except:
+                        return -1
+                target_ckpt = max(candidates, key=get_ckpt_epoch)
+            
             if target_ckpt is None:
                 # Fallback for runs that predate checkpoint_last.pt
                 all_ckpts = []
@@ -303,7 +321,7 @@ class BaseTrainer:
             subj_id = self.val_subjects[0]
             paths = get_subject_paths(self.cfg.root_dir, subj_id)
             subj = tio.Subject(mri=tio.ScalarImage(paths["mri"]), ct=tio.ScalarImage(paths["ct"]))
-            prep = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult)
+            prep = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult, enforce_ras=getattr(self.cfg, "enforce_ras", False))
             subj = prep(subj)
             aug = get_augmentations()(subj)
             hist_str = " | ".join([t.name for t in aug.history])
@@ -321,6 +339,60 @@ class BaseTrainer:
             plt.close(fig)
         except Exception as e:
             print(f"[{self.prefix}] [WARNING] Aug Viz failed: {e}")
+
+    def _log_val_metrics(self, val_metrics, exclude=None, extra=None, subject_ids=None):
+        """Compute mean over val subjects and log to WandB. Returns avg_met."""
+        exclude = exclude or set()
+        avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
+        min_met = {k: np.min(v)  for k, v in val_metrics.items() if not k.startswith("body_")}
+        max_met = {k: np.max(v)  for k, v in val_metrics.items() if not k.startswith("body_")}
+        avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
+        min_body = {k[5:]: np.min(v)  for k, v in val_metrics.items() if k.startswith("body_")}
+        max_body = {k[5:]: np.max(v)  for k, v in val_metrics.items() if k.startswith("body_")}
+
+        if extra:
+            avg_met.update(extra)
+
+        if self.cfg.wandb:
+            wandb.log(
+                {f"val/{k}": v for k, v in avg_met.items() if k not in exclude},
+                # | {f"val/{k}_min": v for k, v in min_met.items() if k not in exclude}
+                # | {f"val/{k}_max": v for k, v in max_met.items() if k not in exclude},
+                step=self.global_step,
+            )
+            if avg_body:
+                wandb.log(
+                    {f"val_body/{k}": v for k, v in avg_body.items()},
+                    # | {f"val_body/{k}_min": v for k, v in min_body.items()}
+                    # | {f"val_body/{k}_max": v for k, v in max_body.items()},
+                    step=self.global_step,
+                )
+
+        if subject_ids is not None and "mae_hu" in val_metrics:
+            self._save_val_ranking(subject_ids, val_metrics)
+
+        return avg_met
+
+    def _save_val_ranking(self, subject_ids, val_metrics):
+        """Write per-subject val metrics sorted by MAE (best→worst). Overwrites each val run."""
+        mae_vals = val_metrics["mae_hu"]
+        extra_keys = [k for k in ("ssim", "psnr", "dice_score_all", "dice_score_bone") if k in val_metrics]
+        rows = sorted(zip(subject_ids, mae_vals, *[val_metrics[k] for k in extra_keys]), key=lambda x: x[1])
+
+        if self.local_run_dir:
+            path = os.path.join(self.local_run_dir, "val_rankings.txt")
+        else:
+            path = os.path.join(self.cfg.prediction_dir, self.run_name, "val_rankings.txt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        header_extra = "".join(f"  {k:<16}" for k in extra_keys)
+        with open(path, "w") as f:
+            f.write(f"# Val ranking by MAE | Step {self.global_step}\n")
+            f.write(f"{'rank':<6}{'subject_id':<20}{'mae_hu':<12}{header_extra}\n")
+            for rank, row in enumerate(rows, 1):
+                sid, mae = row[0], row[1]
+                extra_vals = "".join(f"  {v:<16.4f}" for v in row[2:])
+                f.write(f"{rank:<6}{sid:<20}{mae:<12.2f}{extra_vals}\n")
 
     def _compute_val_metrics(self, pred_unpad, ct_unpad, mask_unpad=None):
         """Returns (standard_met, body_met_or_None). Log under val/ and val_body/ respectively."""
