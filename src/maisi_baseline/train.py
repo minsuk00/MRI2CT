@@ -14,29 +14,33 @@ from maisi_baseline.trainer import MAISITrainer
 # PATHS & PRE-TRAINED WEIGHTS
 # ==========================================
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "maisi-mr-to-ct", "models", "autoencoder_v1.pt")
-DIFFUSION_PATH = os.path.join(PROJECT_ROOT, "maisi-mr-to-ct", "models", "diff_unet_3d_rflow-ct.pt")
-NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "maisi-mr-to-ct", "configs", "config_network.json")
+AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "autoencoder_v1.pt")
+DIFFUSION_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "diff_unet_3d_rflow-ct.pt")
+NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "NV-Generate-CTMR", "configs", "config_network_rflow.json")
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 MAISI_CONFIG = {
-    "split_file": "splits/original_splits.txt",
+    "split_file": "splits/center_wise_split.txt",
     "stage_data": True,
     "batch_size": 1,
     "accum_steps": 1,  # Match effective batch size of other models (4)
     "lr": 5e-4,
     "total_epochs": 1000,
     "steps_per_epoch": 1000,
-    "val_interval": 2,
+    "val_interval": 5,
+    "full_val": True,
     "model_save_interval": 200,
-    "use_weighted_sampler": True,
+    "val_save_interval": 50,
     "resume_wandb_id": None,
     "resume_epoch": None,
     "diverge_wandb_branch": False,
     "validate_dice": False,
     "dataloader_num_workers": 4,
+    "enable_profiling": True,
+    "vae_compile": True,
+    "compile_mode": None,
     # ----------------------
     # Experiment Basics
     "project_name": "mri2ct",
@@ -48,8 +52,6 @@ MAISI_CONFIG = {
     "wandb_note": "MAISI Baseline ControlNet (On-the-fly VAE).",
     "preencoded_latents_dir": None,  # If set, pre-encode all CT volumes once and cache latents here
     # Data
-    "patch_size": 128,  # Must be divisible by 4 (VAE requirement)
-    "res_mult": 16,  # Standard alignment
     "augment": True,  # Enable standard augmentations
     # Validation
     "val_sw_batch_size": 1,
@@ -78,7 +80,9 @@ def main():
     parser.add_argument("--resume_wandb_id", type=str, help="WandB Run ID to resume from")
     parser.add_argument("--preencoded_latents_dir", type=str, help="Directory to cache pre-encoded CT latents")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
-    parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation (True/False)")
+    parser.add_argument("--compile_mode", type=str, help="torch.compile mode: 'full', 'model', or 'None'")
+    parser.add_argument("--vae_compile", type=str, choices=["True", "False"], help="Enable/disable VAE compilation")
+    parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
 
     args = parser.parse_args()
 
@@ -124,11 +128,15 @@ def main():
         MAISI_CONFIG["resume_wandb_id"] = args.resume_wandb_id
     if args.preencoded_latents_dir:
         MAISI_CONFIG["preencoded_latents_dir"] = args.preencoded_latents_dir
-    if args.use_cutout is not None:
-        MAISI_CONFIG["use_cutout"] = args.use_cutout == "True"
+    if args.compile_mode:
+        MAISI_CONFIG["compile_mode"] = None if args.compile_mode.lower() == "none" else args.compile_mode
+    if args.vae_compile:
+        MAISI_CONFIG["vae_compile"] = args.vae_compile == "True"
     if args.tags:
         MAISI_CONFIG.setdefault("wandb_tags", [])
         MAISI_CONFIG["wandb_tags"] = MAISI_CONFIG["wandb_tags"] + [t.strip(' "') for t in args.tags.split(",") if t.strip()]
+    if args.stage_data:
+        MAISI_CONFIG["stage_data"] = args.stage_data == "True"
 
     try:
         trainer = MAISITrainer(MAISI_CONFIG)

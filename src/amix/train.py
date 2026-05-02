@@ -58,10 +58,11 @@ EXPERIMENT_CONFIG = [
         # "compile_mode": "None",
         "lr": 3e-4,
         "scheduler_min_lr": 0.0,
+        "anatomix_weights": "v1_3",  # "v1_2" or "v1_3"
         "wandb_tags": ["amix"],
         "wandb_note": "long_run_anatomix_v2_baby_unet_teacher",
         "patch_size": 128,
-        "val_sw_batch_size": 8,
+        "val_sw_batch_size": 1,  # 256^3 val patches: reduce 8x vs 128^3
         "val_sw_overlap": 0.25,
         "feat_instance_norm": False,
         "input_dropout_p": 0.0,
@@ -88,7 +89,7 @@ if __name__ == "__main__":
     parser.add_argument("--finetune_depth", type=int, help="Number of final layers/modules to finetune (-1 for all)")
     parser.add_argument("--lr_feat", type=float, help="Learning rate for feature extractor")
     parser.add_argument("--input_dropout_p", type=float, help="Input dropout probability")
-    parser.add_argument("--amix_weights", type=str, choices=["v1", "v1_2", "v1_3"], help="Anatomix weights version (v1, v1_2, v1_3)")
+    parser.add_argument("--amix_weights", type=str, choices=["v1", "v1_2", "v1_3", "v1_4"], help="Anatomix weights version (v1, v1_2, v1_3, v1_4)")
     parser.add_argument("--feat_norm", type=str, choices=["instance", "batch"], help="Norm layer for feat extractor (instance, batch)")
     parser.add_argument("--epochs", type=int, help="Total epochs to train")
     parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
@@ -96,12 +97,13 @@ if __name__ == "__main__":
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
     parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation (True/False)")
     parser.add_argument("--cutout_alpha", type=float, help="Beta(alpha, alpha) parameter controlling cutout box size distribution")
-    parser.add_argument("--mask_body_input", type=str, choices=["True", "False"], help="Zero out MRI voxels outside body mask before sampling (True/False)")
     parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
     parser.add_argument("--compile_mode", type=str, help="torch.compile mode: 'full', 'model', or 'none'")
     parser.add_argument("--feat_scale_down", type=float, help="Divide features by this value (e.g. 100)")
     parser.add_argument("--use_float16", type=str, choices=["True", "False"], help="Enable float16 storage for RAM optimization (True/False)")
     parser.add_argument("--val_interval", type=int, help="Run validation every N epochs")
+    parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
+    parser.add_argument("--mri_norm", type=str, choices=["minmax", "percentile"], help="MRI normalization: 'minmax' (default) or 'percentile' (0–99.5, same as MAISI)")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -159,9 +161,6 @@ if __name__ == "__main__":
             exp["use_cutout"] = args.use_cutout == "True"
         if args.cutout_alpha is not None:
             exp["cutout_alpha"] = args.cutout_alpha
-        if args.mask_body_input is not None:
-            exp["mask_body_input"] = args.mask_body_input == "True"
-
         # Dice Validation Override
         if args.validate_dice is not None:
             exp["validate_dice"] = args.validate_dice == "True"
@@ -173,6 +172,10 @@ if __name__ == "__main__":
             exp["use_float16_storage"] = args.use_float16 == "True"
         if args.val_interval is not None:
             exp["val_interval"] = args.val_interval
+        if args.stage_data is not None:
+            exp["stage_data"] = args.stage_data == "True"
+        if args.mri_norm is not None:
+            exp["mri_norm"] = args.mri_norm
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")

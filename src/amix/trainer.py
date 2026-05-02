@@ -91,17 +91,14 @@ class Trainer(BaseTrainer):
         # Load seg if Dice weight > 0 or Dice validation is enabled
         load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
         train_objs = build_tio_subjects(self.cfg.root_dir, self.train_subjects, use_weighted_sampler=self.cfg.use_weighted_sampler, load_seg=load_seg)
-        # Main aligned with baseline: Disable safety padding by default
-        use_safety = False
-
         from common.data import Float16Storage
 
         preprocess = DataPreprocessing(
             patch_size=self.cfg.patch_size,
-            enable_safety_padding=use_safety,
             res_mult=self.cfg.res_mult,
             use_weighted_sampler=self.cfg.use_weighted_sampler,
-            mask_body_input=getattr(self.cfg, "mask_body_input", False),
+            enforce_ras=getattr(self.cfg, "enforce_ras", False),
+            mri_norm=getattr(self.cfg, "mri_norm", "minmax"),
         )
 
         transform_list = [preprocess]
@@ -140,20 +137,17 @@ class Trainer(BaseTrainer):
         # Load seg for validation if we are using Dice loss (to measure semantic consistency)
         # NOTE: use_weighted_sampler here only loads mask.nii.gz as prob_map in the batch —
         # it does NOT do weighted patch sampling (that's training-only via Queue).
-        val_objs = build_tio_subjects(
-            self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False) or getattr(self.cfg, "mask_body_input", False)
-        )
-        val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult, mask_body_input=getattr(self.cfg, "mask_body_input", False))
-        
+        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False))
+        val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult, enforce_ras=getattr(self.cfg, "enforce_ras", False), mri_norm=getattr(self.cfg, "mri_norm", "minmax"))
+
         val_transform_list = [val_preprocess]
         if getattr(self.cfg, "use_float16_storage", False):
             val_transform_list.append(Float16Storage())
-            
+
         val_ds = tio.SubjectsDataset(val_objs, transform=tio.Compose(val_transform_list))
         self.val_loader = tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
         # Stratified Validation Sampling (2 per region)
-        total_val = len(self.val_subjects)
         rng = random.Random(self.cfg.seed)
 
         region_to_indices = defaultdict(list)
@@ -194,6 +188,14 @@ class Trainer(BaseTrainer):
                 ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_v1_2.pth"
             else:  # v1_3
                 ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_real_v1_3.pth"
+        elif self.cfg.anatomix_weights == "v1_4":
+            self.cfg.res_mult = 16
+            # v1_4: same depth as v1 (ndowns=4) but 2x channels (ngf=32), trained with BatchNorm
+            self.feat_extractor = Unet(3, 1, 16, 4, 32, norm="batch", interp="nearest", pooling="Max").to(self.device)
+            if self.cfg.compile_mode != "full":
+                print("[DEBUG] 🚀 Compiling Anatomix Feature Extractor...")
+                self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
+            ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_BN_v1_4.pth"
         else:
             raise ValueError(f"Invalid anatomix_weights: {self.cfg.anatomix_weights}")
 
@@ -202,13 +204,8 @@ class Trainer(BaseTrainer):
             state_dict = clean_state_dict(torch.load(ckpt, map_location=self.device))
             # Load into the underlying module if compiled
             target = getattr(self.feat_extractor, "_orig_mod", self.feat_extractor)
-            feat_norm = getattr(self.cfg, "feat_norm", "instance")
-            strict = feat_norm == "instance"  # non-instance norm changes bias+norm params, so load loosely
-            missing, unexpected = target.load_state_dict(state_dict, strict=strict)
-            if not strict:
-                print(f"[DEBUG] Loaded Anatomix weights (strict=False, feat_norm={feat_norm}): {len(missing)} missing, {len(unexpected)} unexpected keys")
-            else:
-                print(f"[DEBUG] Loaded Anatomix weights from {ckpt}")
+            target.load_state_dict(state_dict, strict=True)
+            print(f"[DEBUG] Loaded Anatomix weights from {ckpt}")
         else:
             print(f"[WARNING] ⚠️ Anatomix weights NOT FOUND at {ckpt}")
 
@@ -566,6 +563,7 @@ class Trainer(BaseTrainer):
         self.model.eval()
         self.feat_extractor.eval()
         val_metrics = defaultdict(list)
+        val_ps = getattr(self.cfg, "val_patch_size", self.cfg.patch_size)
 
         # 1. Validation Loop
         for i, batch in enumerate(tqdm(self.val_loader, desc="Validating", leave=False)):
@@ -574,8 +572,6 @@ class Trainer(BaseTrainer):
             seg = batch["seg"][tio.DATA].to(self.device) if "seg" in batch else None
             orig_shape = batch["original_shape"][0].tolist()
             subj_id = batch["subj_id"][0]
-            pad_offset = int(batch["pad_offset"][0]) if "pad_offset" in batch else 0
-
             # Always use Sliding Window for Full Volumes to prevent OOM
             def combined_forward(x):
                 # 1. Features
@@ -611,7 +607,7 @@ class Trainer(BaseTrainer):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred = sliding_window_inference(
                     inputs=mri,
-                    roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size),
+                    roi_size=(val_ps, val_ps, val_ps),
                     sw_batch_size=self.cfg.val_sw_batch_size,
                     predictor=combined_forward,
                     overlap=self.cfg.val_sw_overlap,
@@ -619,13 +615,13 @@ class Trainer(BaseTrainer):
                 )
 
             # Metrics
-            pred_unpad = unpad(pred, orig_shape, pad_offset)
-            ct_unpad = unpad(ct, orig_shape, pad_offset)
-            mri_unpad = unpad(mri, orig_shape, pad_offset)
+            pred_unpad = unpad(pred, orig_shape)
+            ct_unpad = unpad(ct, orig_shape)
+            mri_unpad = unpad(mri, orig_shape)
 
             mask_unpad = None
             if getattr(self.cfg, "val_body_mask", False) and "prob_map" in batch:
-                mask_unpad = unpad(batch["prob_map"][tio.DATA].to(self.device), orig_shape, pad_offset)
+                mask_unpad = unpad(batch["prob_map"][tio.DATA].to(self.device), orig_shape)
 
             met, body_met = self._compute_val_metrics(pred_unpad, ct_unpad, mask_unpad)
 
@@ -636,7 +632,7 @@ class Trainer(BaseTrainer):
                     # Always use sliding window for teacher on full volumes to prevent OOM
                     pred_probs = sliding_window_inference(
                         inputs=pred,
-                        roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size),
+                        roi_size=(val_ps, val_ps, val_ps),
                         sw_batch_size=self.cfg.val_sw_batch_size,
                         predictor=self.teacher_model,
                         overlap=self.cfg.val_sw_overlap,
@@ -653,8 +649,8 @@ class Trainer(BaseTrainer):
             if body_met is not None and pred_probs is not None and seg is not None:
                 from common.loss import get_class_dice
 
-                pred_probs_unpad = unpad(pred_probs, orig_shape, pad_offset)
-                seg_unpad = unpad(seg, orig_shape, pad_offset)
+                pred_probs_unpad = unpad(pred_probs, orig_shape)
+                seg_unpad = unpad(seg, orig_shape)
                 bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
                 class_dices, bone_dice = get_class_dice(pred_probs_unpad, seg_unpad, mask=mask_unpad, bone_idx=bone_idx)
                 excl_bg = getattr(self.cfg, "dice_exclude_background", True)
@@ -671,38 +667,40 @@ class Trainer(BaseTrainer):
                 for k, v in body_met.items():
                     val_metrics[f"body_{k}"].append(v)
 
-            # Viz & Save
+            # Save predictions for ALL subjects (overwrite "last" each validation run)
+            save_path = None
+            if self.cfg.save_val_volumes:
+                base_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.cfg.prediction_dir, self.run_name)
+
+                pred_np = pred_unpad.float().cpu().numpy().squeeze()
+                pred_hu = (pred_np * 2048.0) - 1024.0
+
+                affine = batch["ct"]["affine"][0]
+                if hasattr(affine, "cpu"):
+                    affine = affine.cpu().numpy()
+                else:
+                    affine = np.array(affine)
+
+                nii = nib.Nifti1Image(pred_hu, affine)
+
+                last_dir = os.path.join(base_dir, "predictions", "last")
+                os.makedirs(last_dir, exist_ok=True)
+                save_path = os.path.join(last_dir, f"pred_{subj_id}.nii.gz")
+                nib.save(nii, save_path)
+
+                if self.cfg.val_save_interval > 0 and epoch % self.cfg.val_save_interval == 0:
+                    epoch_dir = os.path.join(base_dir, "predictions", f"epoch_{epoch}")
+                    os.makedirs(epoch_dir, exist_ok=True)
+                    nib.save(nii, os.path.join(epoch_dir, f"pred_{subj_id}.nii.gz"))
+
+            # Viz & DRR (only for selected subjects)
             if i in self.val_viz_indices:
-                save_path = None
-                # Optimization: Only save volumes if visualized
-                if self.cfg.save_val_volumes:
-                    if self.cfg.wandb and self.local_run_dir:
-                        save_dir = os.path.join(self.local_run_dir, "predictions", f"epoch_{epoch}")
-                    else:
-                        save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
-                    os.makedirs(save_dir, exist_ok=True)
-
-                    # Denormalize [0, 1] -> [-1024, 1024]
-                    pred_np = pred_unpad.float().cpu().numpy().squeeze()
-                    pred_hu = (pred_np * 2048.0) - 1024.0
-
-                    # Safe affine extraction (handles both Tensors and numpy arrays)
-                    affine = batch["ct"]["affine"][0]
-                    if hasattr(affine, "cpu"):
-                        affine = affine.cpu().numpy()
-                    else:
-                        affine = np.array(affine)
-
-                    nii = nib.Nifti1Image(pred_hu, affine)
-                    save_path = os.path.join(save_dir, f"pred_{subj_id}.nii.gz")
-                    nib.save(nii, save_path)
-
                 if self.cfg.wandb:
-                    from common.utils import visualize_lite
-
                     viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if k in met}
                     viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if body_met and k in body_met} or None
-                    visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
+                    visualize_lite(
+                        pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body
+                    )
 
                 if self.cfg.val_drr and save_path and subj_id in self.gt_drrs:
                     self._log_drr_comparison(subj_id, save_path)
@@ -716,13 +714,8 @@ class Trainer(BaseTrainer):
             self._log_aug_viz(self.global_step)
 
         # 3. Log
-        avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
-        avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
-        if self.cfg.wandb:
-            _val_exclude = {"mae", "loss_ssim", "loss_dice", "grad_diff"}
-            wandb.log({f"val/{k}": v for k, v in avg_met.items() if k not in _val_exclude}, step=self.global_step)
-            if avg_body:
-                wandb.log({f"val_body/{k}": v for k, v in avg_body.items()}, step=self.global_step)
+        _val_exclude = {"mae", "loss_ssim", "loss_dice", "grad_diff"}
+        avg_met = self._log_val_metrics(val_metrics, exclude=_val_exclude, subject_ids=self.val_subjects)
 
         gc.collect()
         torch.cuda.empty_cache()

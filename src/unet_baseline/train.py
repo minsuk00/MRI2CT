@@ -42,13 +42,13 @@ from common.utils import cleanup_gpu, count_parameters, get_ram_info, send_notif
 # CONFIGURATION
 # ==========================================
 BASELINE_CONFIG = {
-    "split_file": "splits/original_splits.txt",
+    "split_file": "splits/center_wise_split.txt",
     "stage_data": True,
     "batch_size": 4,
     "lr": 3e-4,
     "total_epochs": 1000,
     "steps_per_epoch": 1000,
-    "val_interval": 2,
+    "val_interval": 5,
     "model_save_interval": 200,
     "use_weighted_sampler": True,
     "resume_wandb_id": None,
@@ -92,7 +92,7 @@ BASELINE_CONFIG = {
     # Resuming
     "override_lr": False,  # If True, uses 'lr' from config instead of saved state
     # Validation
-    "val_sw_batch_size": 8,
+    "val_sw_batch_size": 1,  # 256^3 val patches: reduce 8x vs 128^3
     "val_sw_overlap": 0.25,
     "save_val_volumes": True,
     # Mode
@@ -141,7 +141,7 @@ class BaselineTrainer(BaseTrainer):
 
         # Train Queue
         train_objs = build_tio_subjects(self.cfg.root_dir, self.train_subjects, use_weighted_sampler=self.cfg.use_weighted_sampler, load_seg=load_seg)
-        preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult, use_weighted_sampler=self.cfg.use_weighted_sampler)
+        preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult, use_weighted_sampler=self.cfg.use_weighted_sampler, enforce_ras=getattr(self.cfg, "enforce_ras", False))
         transforms = tio.Compose([preprocess, get_augmentations()]) if self.cfg.augment else preprocess
         train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
 
@@ -169,7 +169,7 @@ class BaselineTrainer(BaseTrainer):
         # NOTE: use_weighted_sampler here only loads mask.nii.gz as prob_map in the batch —
         # it does NOT do weighted patch sampling (that's training-only via Queue).
         val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False))
-        val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, enable_safety_padding=False, res_mult=self.cfg.res_mult)
+        val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult, enforce_ras=getattr(self.cfg, "enforce_ras", False))
         val_ds = tio.SubjectsDataset(val_objs, transform=val_preprocess)
         # Use SubjectsLoader to avoid warnings and ensure correct collation
         self.val_loader = tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
@@ -425,6 +425,7 @@ class BaselineTrainer(BaseTrainer):
 
         self.model.eval()
         val_metrics = defaultdict(list)
+        val_ps = getattr(self.cfg, "val_patch_size", self.cfg.patch_size)
 
         for i, batch in enumerate(tqdm(self.val_loader, desc="Validating", leave=False)):
             mri = batch["mri"][tio.DATA].to(self.device)
@@ -433,20 +434,11 @@ class BaselineTrainer(BaseTrainer):
             orig_shape = batch["original_shape"][0].tolist()
             subj_id = batch["subj_id"][0]
 
-            # Safe pad_offset extraction
-            po = batch.get("pad_offset", 0)
-            if torch.is_tensor(po):
-                pad_offset = int(po[0])
-            elif isinstance(po, (list, tuple)):
-                pad_offset = int(po[0])
-            else:
-                pad_offset = int(po)
-
             # Inference
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pred = sliding_window_inference(
                     inputs=mri,
-                    roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size),
+                    roi_size=(val_ps, val_ps, val_ps),
                     sw_batch_size=self.cfg.val_sw_batch_size,
                     predictor=self.model,
                     overlap=self.cfg.val_sw_overlap,
@@ -454,13 +446,13 @@ class BaselineTrainer(BaseTrainer):
                 )
 
             # Metrics
-            pred_unpad = unpad(pred, orig_shape, pad_offset)
-            ct_unpad = unpad(ct, orig_shape, pad_offset)
-            mri_unpad = unpad(mri, orig_shape, pad_offset)
+            pred_unpad = unpad(pred, orig_shape)
+            ct_unpad = unpad(ct, orig_shape)
+            mri_unpad = unpad(mri, orig_shape)
 
             mask_unpad = None
             if getattr(self.cfg, "val_body_mask", False) and "prob_map" in batch:
-                mask_unpad = unpad(batch["prob_map"][tio.DATA].to(self.device), orig_shape, pad_offset)
+                mask_unpad = unpad(batch["prob_map"][tio.DATA].to(self.device), orig_shape)
 
             met, body_met = self._compute_val_metrics(pred_unpad, ct_unpad, mask_unpad)
 
@@ -471,7 +463,7 @@ class BaselineTrainer(BaseTrainer):
                     # Always use sliding window for teacher on full volumes to prevent OOM
                     pred_probs = sliding_window_inference(
                         inputs=pred,
-                        roi_size=(self.cfg.patch_size, self.cfg.patch_size, self.cfg.patch_size),
+                        roi_size=(val_ps, val_ps, val_ps),
                         sw_batch_size=self.cfg.val_sw_batch_size,
                         predictor=self.teacher_model,
                         overlap=self.cfg.val_sw_overlap,
@@ -488,8 +480,8 @@ class BaselineTrainer(BaseTrainer):
             if body_met is not None and pred_probs is not None and seg is not None:
                 from common.loss import get_class_dice
 
-                pred_probs_unpad = unpad(pred_probs, orig_shape, pad_offset)
-                seg_unpad = unpad(seg, orig_shape, pad_offset)
+                pred_probs_unpad = unpad(pred_probs, orig_shape)
+                seg_unpad = unpad(seg, orig_shape)
                 bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
                 class_dices, bone_dice = get_class_dice(pred_probs_unpad, seg_unpad, mask=mask_unpad, bone_idx=bone_idx)
                 excl_bg = getattr(self.cfg, "dice_exclude_background", True)
@@ -506,17 +498,14 @@ class BaselineTrainer(BaseTrainer):
                 for k, v in body_met.items():
                     val_metrics[f"body_{k}"].append(v)
 
-            # Save Volumes (Optional - only visualized to save time)
-            if self.cfg.save_val_volumes and i in self.val_viz_indices:
-                if self.cfg.wandb and self.local_run_dir:
-                    save_dir = os.path.join(self.local_run_dir, "predictions", f"epoch_{epoch}")
-                else:
-                    save_dir = os.path.join(self.cfg.prediction_dir, self.run_name, f"epoch_{epoch}")
-                os.makedirs(save_dir, exist_ok=True)
+            # Save predictions for ALL subjects (overwrite "last" each validation run)
+            save_path = None
+            if self.cfg.save_val_volumes:
+                base_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.cfg.prediction_dir, self.run_name)
+
                 pred_np = pred_unpad.float().cpu().numpy().squeeze()
                 pred_hu = (pred_np * 2048.0) - 1024.0
 
-                # Safe affine extraction (handles both Tensors and numpy arrays)
                 affine = batch["ct"]["affine"][0]
                 if hasattr(affine, "cpu"):
                     affine = affine.cpu().numpy()
@@ -524,17 +513,23 @@ class BaselineTrainer(BaseTrainer):
                     affine = np.array(affine)
 
                 nii = nib.Nifti1Image(pred_hu, affine)
-                save_path = os.path.join(save_dir, f"pred_{subj_id}.nii.gz")
-                nib.save(nii, save_path)
-            else:
-                save_path = None
 
-            # Viz
+                last_dir = os.path.join(base_dir, "predictions", "last")
+                os.makedirs(last_dir, exist_ok=True)
+                save_path = os.path.join(last_dir, f"pred_{subj_id}.nii.gz")
+                nib.save(nii, save_path)
+
+                if self.cfg.val_save_interval > 0 and epoch % self.cfg.val_save_interval == 0:
+                    epoch_dir = os.path.join(base_dir, "predictions", f"epoch_{epoch}")
+                    os.makedirs(epoch_dir, exist_ok=True)
+                    nib.save(nii, os.path.join(epoch_dir, f"pred_{subj_id}.nii.gz"))
+
+            # Viz & DRR (only for selected subjects)
             if i in self.val_viz_indices:
                 if self.cfg.wandb:
                     viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if k in met}
                     viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if body_met and k in body_met} or None
-                    visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, offset=pad_offset, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
+                    visualize_lite(pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
 
                 if self.cfg.val_drr and save_path and subj_id in self.gt_drrs:
                     self._log_drr_comparison(subj_id, save_path)
@@ -545,13 +540,8 @@ class BaselineTrainer(BaseTrainer):
         if self.cfg.wandb and self.cfg.augment:
             self._log_aug_viz(self.global_step)
 
-        avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
-        avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
-        if self.cfg.wandb:
-            _val_exclude = {"mae", "loss_ssim", "loss_dice", "grad_diff"}
-            wandb.log({f"val/{k}": v for k, v in avg_met.items() if k not in _val_exclude}, step=self.global_step)
-            if avg_body:
-                wandb.log({f"val_body/{k}": v for k, v in avg_body.items()}, step=self.global_step)
+        _val_exclude = {"mae", "loss_ssim", "loss_dice", "grad_diff"}
+        avg_met = self._log_val_metrics(val_metrics, exclude=_val_exclude, subject_ids=self.val_subjects)
 
         return avg_met
 
@@ -650,6 +640,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation (True/False)")
     parser.add_argument("--cutout_alpha", type=float, help="Beta(alpha, alpha) parameter controlling cutout box size distribution")
     parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
+    parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
+    parser.add_argument("--val_interval", type=int, help="Run validation every N epochs")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -690,6 +682,10 @@ if __name__ == "__main__":
     if args.tags is not None:
         BASELINE_CONFIG.setdefault("wandb_tags", [])
         BASELINE_CONFIG["wandb_tags"] = BASELINE_CONFIG["wandb_tags"] + [t.strip(' "') for t in args.tags.split(",") if t.strip()]
+    if args.stage_data is not None:
+        BASELINE_CONFIG["stage_data"] = args.stage_data == "True"
+    if args.val_interval is not None:
+        BASELINE_CONFIG["val_interval"] = args.val_interval
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

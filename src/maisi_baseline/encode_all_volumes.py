@@ -29,15 +29,15 @@ from maisi_baseline.trainer import MAISITrainer
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DATA_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5mm_registered_flat"
-AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "maisi-mr-to-ct", "models", "autoencoder_v1.pt")
-NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "maisi-mr-to-ct", "configs", "config_network.json")
+AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "autoencoder_v1.pt")
+NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "NV-Generate-CTMR", "configs", "config_network_rflow.json")
 
 
 def encode_sliding_window(ct_tensor, autoencoder, scale_factor, device, sw_batch_size=1, overlap=0.4):
     ct_hu = (ct_tensor * 2048.0) - 1024.0
     ct_norm = torch.clamp((ct_hu + 1000.0) / 2000.0, 0.0, 1.0)
     inferer = SlidingWindowInferer(
-        roi_size=[64, 64, 64],
+        roi_size=[256, 256, 256],
         sw_batch_size=sw_batch_size,
         overlap=overlap,
         mode="gaussian",
@@ -76,7 +76,7 @@ def main():
         p.requires_grad = False
 
     # Load scale factor from diffusion unet checkpoint
-    diff_path = os.path.join(PROJECT_ROOT, "maisi-mr-to-ct", "models", "diff_unet_3d_rflow-ct.pt")
+    diff_path = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "diff_unet_3d_rflow-ct.pt")
     diff_ckpt = torch.load(diff_path, map_location=device, weights_only=False)
     if "scale_factor" in diff_ckpt:
         scale_factor = diff_ckpt["scale_factor"]
