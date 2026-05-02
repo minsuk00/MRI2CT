@@ -151,7 +151,7 @@ def _load_subject_batch(root_dir, subj_id, patch_size, res_mult, body_mask):
         ct_path = os.path.join(root_dir, subj_id, "ct.nii")
     affine = nib.load(ct_path).affine
 
-    preprocess = DataPreprocessing(patch_size=patch_size, enable_safety_padding=False, res_mult=res_mult, use_weighted_sampler=body_mask)
+    preprocess = DataPreprocessing(patch_size=patch_size, res_mult=res_mult, use_weighted_sampler=body_mask)
     ds = tio.SubjectsDataset(subj_objs, transform=preprocess)
     loader = tio.SubjectsLoader(ds, batch_size=1, shuffle=False, num_workers=0)
     batch = next(iter(loader))

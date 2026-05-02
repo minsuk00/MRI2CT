@@ -148,7 +148,7 @@ def main():
         dummy_ct = tio.ScalarImage(tensor=torch.zeros_like(mri_img.data), affine=affine)
         subj = tio.Subject(mri=mri_img, ct=dummy_ct)
 
-        preprocess = DataPreprocessing(patch_size=args.patch_size, enable_safety_padding=False, res_mult=32)
+        preprocess = DataPreprocessing(patch_size=args.patch_size, res_mult=32)
         subj_prep = preprocess(subj)
 
         mri_tensor = subj_prep["mri"][tio.DATA].unsqueeze(0).to(device)

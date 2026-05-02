@@ -200,7 +200,7 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
     translator.eval()
 
     subjects_with_mask = _check_masks(root_dir, val_subjects) if body_mask else set()
-    preprocess = DataPreprocessing(patch_size=patch_size, enable_safety_padding=False, res_mult=res_mult, use_weighted_sampler=body_mask)
+    preprocess = DataPreprocessing(patch_size=patch_size, res_mult=res_mult, use_weighted_sampler=body_mask)
     val_loader = _build_val_loader(root_dir, val_subjects, preprocess, load_mask=body_mask, load_seg=teacher_model is not None)
 
     val_metrics = defaultdict(list)
@@ -302,7 +302,7 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
             print(f"  [UNet] Warning: validate_dice=True but teacher_weights_path not found ({teacher_weights}). Skipping dice.")
 
     subjects_with_mask = _check_masks(root_dir, val_subjects) if body_mask else set()
-    preprocess = DataPreprocessing(patch_size=patch_size, enable_safety_padding=False, res_mult=res_mult, use_weighted_sampler=body_mask)
+    preprocess = DataPreprocessing(patch_size=patch_size, res_mult=res_mult, use_weighted_sampler=body_mask)
     val_loader = _build_val_loader(root_dir, val_subjects, preprocess, load_mask=body_mask, load_seg=teacher_model is not None)
 
     val_metrics = defaultdict(list)
@@ -419,7 +419,6 @@ def validate_mcddpm(ckpt_path: str, val_subjects: list, device: torch.device, ro
     patch_size_scalar = max(patch_size) if isinstance(patch_size, (list, tuple)) else patch_size
     preprocess = DataPreprocessing(
         patch_size=patch_size_scalar,
-        enable_safety_padding=False,
         res_mult=1,
         enforce_ras=False,
         use_weighted_sampler=body_mask,

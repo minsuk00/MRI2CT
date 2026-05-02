@@ -24,7 +24,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Subjects for each region
 REGIONS = {
     # "Head": "1HNA001",
-    # "Thorax": "1THA001",
+    "Thorax": "1THB011",
     "Abdomen": "1ABA005",
     "Pelvis": "1PA001",
 }
@@ -50,6 +50,9 @@ def load_anatomix_model(version, device):
             ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_v1_2.pth"
         else:  # v1.3
             ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_real_v1_3.pth"
+    elif version == "v1.4":
+        model = Unet(3, 1, 16, 4, 32, norm="batch", interp="nearest", pooling="Max").to(device)
+        ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_BN_v1_4.pth"
     else:
         raise ValueError(f"Unknown version: {version}")
 
@@ -116,7 +119,7 @@ def get_bone_similarity(feats, seed_coord):
 
 
 def run_comparison():
-    models = {"v1.0": load_anatomix_model("v1.0", DEVICE), "v1.2": load_anatomix_model("v1.2", DEVICE), "v1.3": load_anatomix_model("v1.3", DEVICE)}
+    models = {ver: load_anatomix_model(ver, DEVICE) for ver in ["v1.0", "v1.2", "v1.3", "v1.4"]}
 
     for region_name, subj_id in REGIONS.items():
         print(f"\nProcessing {region_name} ({subj_id})...")

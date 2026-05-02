@@ -23,7 +23,7 @@ PRED_DIR = "/home/minsukc/MRI2CT/wandb/runs/_y0c2wryv/predictions/epoch_260"
 FAST = False  # True = 3mm fast mode
 # ------------------------
 
-DATA_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined"
+DATA_ROOT = "/home/minsukc/MRI2CT/dataset/1.5mm_registered_flat_masked"
 DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
 
 
@@ -91,6 +91,7 @@ def _organ_bar_chart(ax, means, stds, title, n_subjects, overall_mean, group_map
 
     if group_map:
         from matplotlib.patches import Patch
+
         legend_handles = [Patch(color=c, label=g) for g, c in GROUP_COLORS.items() if g != "test"]
         legend_handles.insert(0, plt.Line2D([0], [0], color="red", linestyle="--", label=f"mean={overall_mean:.3f}"))
         ax.legend(handles=legend_handles, fontsize=7, loc="upper right")
@@ -122,6 +123,7 @@ def plot_results(df, pred_dir):
 
     # 2. Group-mean summary bar chart (flat mean per group over all subj x organ pairs)
     organ_groups = pd.Series({organ: group_map.get(organ, "test") for organ in organ_df.columns})
+
     def flat_std(odf):
         vals = odf.values.flatten()
         return float(np.nanstd(vals))
@@ -161,8 +163,110 @@ def plot_results(df, pred_dir):
         print(f"   Saved: {out_region}")
 
 
+def plot_seg_overlay(pred_dir, data_root, n_slices=6):
+    """
+    For each subject, one figure with:
+      Row 0     : plain GT CT (anatomy reference)
+      Row 1–N   : one row per structural group, overlay filtered to that group's label IDs
+                  GT-only=red, pred-only=cyan, overlap=yellow
+    """
+    gt_res_dir = "."
+    pred_seg_files = sorted(glob.glob(os.path.join(pred_dir, "*_pred_totalseg.nii.gz")))
+    if not pred_seg_files:
+        print(f"❌ No *_pred_totalseg.nii.gz found in {pred_dir}")
+        return
+
+    # Build group → label_ids from structures.csv (preserving display order)
+    sdf = pd.read_csv(STRUCTURES_CSV)
+    group_order = list(dict.fromkeys(sdf["group"]))  # insertion order, drop "test"
+    group_order = [g for g in group_order if g != "test"]
+    group_labels = {g: sdf.loc[sdf["group"] == g, "id"].tolist() for g in group_order}
+
+    COLORS = {
+        "gt": np.array([1.0, 0.1, 0.1]),
+        "pred": np.array([0.0, 0.85, 1.0]),
+        "overlap": np.array([1.0, 0.95, 0.0]),
+    }
+    ALPHA = 0.65
+    n_rows = 1 + len(group_order)  # GT row + one per group
+
+    for pred_seg_path in pred_seg_files:
+        subj_id = os.path.basename(pred_seg_path).replace("_pred_totalseg.nii.gz", "")
+        subj_dir = os.path.join(data_root, gt_res_dir, subj_id)
+
+        gt_ct_path = next((os.path.join(subj_dir, f) for f in ["ct.nii.gz", "ct.nii"] if os.path.exists(os.path.join(subj_dir, f))), None)
+        gt_seg_path = os.path.join(subj_dir, "ct_totalseg.nii.gz")
+        if gt_ct_path is None or not os.path.exists(gt_seg_path):
+            print(f"⚠️ Skipping {subj_id}: missing GT files in {subj_dir}")
+            continue
+
+        gt_ct = nib.load(gt_ct_path).get_fdata()
+        gt_seg = nib.load(gt_seg_path).get_fdata().astype(int)
+        pred_seg = nib.load(pred_seg_path).get_fdata().astype(int)
+
+        pred_ct_path = os.path.join(pred_dir, f"pred_{subj_id}.nii.gz")
+        pred_ct = nib.load(pred_ct_path).get_fdata() if os.path.exists(pred_ct_path) else None
+
+        D = gt_ct.shape[2]
+        slice_indices = np.linspace(0.1 * D, 0.9 * D, n_slices, dtype=int)
+
+        n_rows_subj = n_rows + (1 if pred_ct is not None else 0)  # +1 for pred CT row
+        fig, axes = plt.subplots(n_rows_subj, n_slices, figsize=(3.5 * n_slices, 3.5 * n_rows_subj))
+        fig.subplots_adjust(top=0.96, left=0.1, right=0.99, bottom=0.02, hspace=0.05, wspace=0.05)
+        fig.suptitle(f"{subj_id}  |  GT-only=red  Pred-only=cyan  Overlap=yellow", fontsize=12, y=0.99)
+
+        for col, z in enumerate(slice_indices):
+            ct_slice = gt_ct[:, :, z]
+            ct_norm = np.clip(ct_slice, -1024, 1024)
+            ct_norm = (ct_norm - ct_norm.min()) / (ct_norm.max() - ct_norm.min() + 1e-8)
+            bg = np.stack([ct_norm, ct_norm, ct_norm], axis=-1)
+
+            # Row 0: plain GT CT
+            axes[0, col].imshow(bg.transpose(1, 0, 2), origin="lower")
+            axes[0, col].set_title(f"z={z}", fontsize=8)
+            axes[0, col].axis("off")
+
+            # Row 1: plain Pred CT (if available)
+            row_offset = 1
+            if pred_ct is not None:
+                pc_slice = pred_ct[:, :, z]
+                pc_norm = np.clip(pc_slice, -1024, 1024)
+                pc_norm = (pc_norm - pc_norm.min()) / (pc_norm.max() - pc_norm.min() + 1e-8)
+                axes[1, col].imshow(np.stack([pc_norm, pc_norm, pc_norm], axis=-1).transpose(1, 0, 2), origin="lower")
+                axes[1, col].axis("off")
+                row_offset = 2
+
+            # Remaining rows: one per group
+            for ri, grp in enumerate(group_order):
+                ids = group_labels[grp]
+                gt_mask = np.isin(gt_seg[:, :, z], ids)
+                pred_mask = np.isin(pred_seg[:, :, z], ids)
+                gt_only = gt_mask & ~pred_mask
+                pred_only = pred_mask & ~gt_mask
+                overlap = gt_mask & pred_mask
+
+                ov = bg.copy()
+                for mask, color in [(gt_only, COLORS["gt"]), (pred_only, COLORS["pred"]), (overlap, COLORS["overlap"])]:
+                    ov[mask] = (1 - ALPHA) * bg[mask] + ALPHA * color
+
+                axes[row_offset + ri, col].imshow(ov.transpose(1, 0, 2), origin="lower")
+                axes[row_offset + ri, col].axis("off")
+
+        # Row labels: set AFTER axis("off") so they aren't suppressed
+        top_adj, bot_adj = 0.96, 0.02
+        row_names = ["GT CT"] + (["Pred CT"] if pred_ct is not None else []) + group_order
+        for ri, name in enumerate(row_names):
+            y = top_adj - (ri + 0.5) / n_rows_subj * (top_adj - bot_adj)
+            fig.text(0.01, y, name, fontsize=11, fontweight="bold", ha="left", va="center")
+
+        out_path = os.path.join(pred_dir, f"seg_overlay_{subj_id}.png")
+        plt.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"   Saved: {out_path}")
+
+
 def run_functional_eval(pred_dir, data_root, device="gpu", fast=False):
-    gt_res_dir = "1.5mm_registered_flat"
+    gt_res_dir = "."
 
     output_csv = os.path.join(pred_dir, "functional_eval_1.5mm.csv")
 
@@ -179,7 +283,7 @@ def run_functional_eval(pred_dir, data_root, device="gpu", fast=False):
 
     print("🚀 Starting Functional Evaluation")
     print(f"   Directory: {pred_dir}")
-    print("   Target GT Res: 1.5mm_registered_flat\n")
+    print(f"   Target GT Res: {DATA_ROOT}\n")
 
     all_results = []
 
@@ -255,6 +359,7 @@ def run_functional_eval(pred_dir, data_root, device="gpu", fast=False):
         print(df.groupby("region")["avg_dice"].mean().to_string())
         print("\n📊 Generating visualizations...")
         plot_results(df, pred_dir)
+        plot_seg_overlay(pred_dir, data_root)
     else:
         print("❌ No evaluation results generated.")
 
@@ -263,6 +368,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MRI2CT Functional Evaluation")
     parser.add_argument("path", type=str, nargs="?", default=PRED_DIR, help="Path to predictions (default: PRED_DIR)")
     parser.add_argument("--fast", action="store_true", default=FAST, help="Run TotalSegmentator in fast mode (3mm)")
+    parser.add_argument("--overlay-only", action="store_true", help="Skip segmentation/dice; just generate overlay PNGs from existing *_pred_totalseg.nii.gz")
 
     args = parser.parse_args()
-    run_functional_eval(args.path, DATA_ROOT, device=DEVICE, fast=args.fast)
+    if args.overlay_only:
+        plot_seg_overlay(args.path, DATA_ROOT)
+    else:
+        run_functional_eval(args.path, DATA_ROOT, device=DEVICE, fast=args.fast)
