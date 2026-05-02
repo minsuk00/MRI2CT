@@ -19,8 +19,8 @@ This project, `MRI2CT`, aims to synthesize CT images from MRI scans using deep l
 *   **`anatomix/`**: A local Python package containing model definitions (e.g., `Unet`) and pre-trained weights.
     *   `model/network.py`: Likely contains the `Unet` class definition used in `train.py`.
     *   `model-weights/`: Stores pre-trained weights for the feature extractor.
-*   **`data/`**: Directory housing the medical imaging data. (deprecated. data is now stored in another directory: /gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/)
-*   **`_deprecated/`**: Contains old notebooks and scripts. Useful for reference but obsolete.
+*   **`data/`**: Directory housing the medical imaging data. (Primary GT data: `/home/minsukc/MRI2CT/dataset/1.5mm_registered_flat_masked`)
+*   **`_deprecated/`**: Contains old notebooks and scripts. Useful for reference but obsolete. Old data paths: `/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/`
 
 ## Key Components
 
@@ -66,7 +66,8 @@ Ensure `root_dir` in `DEFAULT_CONFIG` points to the correct data location.
 
 ## 🗺️ RESEARCH MAP & PATHS
 - **Codebase (HOME):** Primary directory for edits.
-- **Data (SCRATCH):** `/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm`. (Read-only).
+- **Data (Primary):** `/home/minsukc/MRI2CT/dataset/1.5mm_registered_flat_masked`
+- **Data (Deprecated Scratch):** `/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/3.0x3.0x3.0mm`.
 - **Environment:** Conda env `mri2ct`.
 - The code is running on a school GPU server.
 

@@ -14,7 +14,7 @@
 
 # --- Configuration Area ---
 PREFIX="unet"
-SPLIT_FILE="splits/thorax_center_wise_split.txt"
+SPLIT_FILE="splits/center_wise_split.txt"
 DICE_W=0.1
 DICE_BONE_W=0.3
 AUGMENT="True"
@@ -22,10 +22,11 @@ WEIGHTED_SAMPLER="True"
 NORM="batch"  # "batch", "instance", or "none"
 USE_CUTOUT="False"
 CUTOUT_ALPHA=1.0
-EPOCHS=1000
-STEPS_PER_EPOCH=500
+EPOCHS=800
+STEPS_PER_EPOCH=1000
+VAL_INTERVAL=5
 NUM_WORKERS=4
-RESUME_ID="djkada35"  # Leave empty if not resuming
+RESUME_ID="i7beiuac"  # Leave empty if not resuming
 TAGS="thorax" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
@@ -56,7 +57,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/unet_baseline/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --use_cutout $USE_CUTOUT --cutout_alpha $CUTOUT_ALPHA --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --use_cutout $USE_CUTOUT --cutout_alpha $CUTOUT_ALPHA --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi

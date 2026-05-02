@@ -3,11 +3,10 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-sbatch "$SCRIPT_DIR/train_amix_v1.sh"
-sbatch "$SCRIPT_DIR/train_amix_v1_featonly.sh"
-sbatch "$SCRIPT_DIR/train_amix_v1_featonly_noinorm.sh"
+sbatch "$SCRIPT_DIR/train_maisi.sh"
 sbatch "$SCRIPT_DIR/train_unet.sh"
-sbatch "$SCRIPT_DIR/train_amix_v1_featscale.sh"
-sbatch "$SCRIPT_DIR/train_amix_v1_noinc.sh"
-
-
+sbatch "$SCRIPT_DIR/train_amix_v1_4.sh"
+sbatch "$SCRIPT_DIR/train_amix_v1_3.sh"
+sbatch "$SCRIPT_DIR/train_amix_v1.sh"
+sbatch "$SCRIPT_DIR/train_amix_v1_2.sh"
+sbatch "$SCRIPT_DIR/train_amix_v1_3_pctmri.sh"
