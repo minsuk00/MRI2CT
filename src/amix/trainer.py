@@ -1,4 +1,3 @@
-import datetime
 import gc
 import os
 import random
@@ -9,9 +8,8 @@ from collections import defaultdict
 import nibabel as nib
 import numpy as np
 import torch
-import torchio as tio
 from anatomix.model.network import Unet
-from anatomix.segmentation.segmentation_utils import load_model_v1_2
+from monai.data import DataLoader, Dataset, PersistentDataset
 from monai.inferers import sliding_window_inference
 
 # from sklearn.decomposition import PCA
@@ -23,12 +21,19 @@ import wandb
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "CADS")))
 
 from common.config import Config
-from common.data import DataPreprocessing, build_tio_subjects, get_augmentations, get_region_key, get_subject_paths
-from common.trainer_base import BaseTrainer
+from common.data import (
+    build_data_dicts,
+    default_monai_cache_dir,
+    get_cached_transforms,
+    get_gpu_transforms,
+    get_random_crop,
+    get_subject_paths,
+    gpu_augment_batch,
+)
+from common.trainer_base import BaseTrainer, StepTimer
 from common.utils import (
     clean_state_dict,
     count_parameters,
-    get_ram_info,
     log_model_summary,
     set_seed,
     unpad,
@@ -45,7 +50,6 @@ class Trainer(BaseTrainer):
         # Setup
         self._setup_models()
         self._find_subjects()
-        self._stage_data_local()
         self._setup_data()
         self._setup_opt()
         self._setup_wandb()
@@ -65,13 +69,7 @@ class Trainer(BaseTrainer):
         if getattr(self.cfg, "val_drr", False):
             self._precompute_gt_drrs()
 
-    def _setup_data(self, seed=None):
-        if seed is not None:
-            # Re-seed to ensure different shuffling after worker restart
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-
+    def _setup_data(self):
         # 1. Subjects already found in _find_subjects()
         if self.cfg.analyze_shapes:
             shapes = []
@@ -87,84 +85,54 @@ class Trainer(BaseTrainer):
                 avg_shape = np.mean(shapes, axis=0).astype(int)
                 print(f"📊 Mean Volume Shape: {tuple(int(x) for x in avg_shape)}")
 
-        # 5. Train Loader (Queue)
-        # Load seg if Dice weight > 0 or Dice validation is enabled
+        # MONAI pipeline: cached deterministic transforms (CPU, PersistentDataset)
+        # + per-step random GPU transforms applied in train_epoch via gpu_augment_batch.
         load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
-        train_objs = build_tio_subjects(self.cfg.root_dir, self.train_subjects, use_weighted_sampler=self.cfg.use_weighted_sampler, load_seg=load_seg)
-        from common.data import Float16Storage
+        cache_dir = default_monai_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"[Trainer] 💾 MONAI cache dir: {cache_dir}")
 
-        preprocess = DataPreprocessing(
+        cached_xform = get_cached_transforms(
             patch_size=self.cfg.patch_size,
             res_mult=self.cfg.res_mult,
-            use_weighted_sampler=self.cfg.use_weighted_sampler,
             enforce_ras=getattr(self.cfg, "enforce_ras", False),
             mri_norm=getattr(self.cfg, "mri_norm", "minmax"),
+            load_seg=load_seg,
+            use_float16_storage=getattr(self.cfg, "use_float16_storage", False),
         )
 
-        transform_list = [preprocess]
-        if self.cfg.augment:
-            transform_list.append(get_augmentations())
-
-        # Cast to float16 at the VERY END for RAM storage optimization
-        if getattr(self.cfg, "use_float16_storage", False):
-            print("[Trainer] Enabling Float16 Storage for RAM optimization")
-            transform_list.append(Float16Storage())
-
-        transforms = tio.Compose(transform_list)
-
-        train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
-
-        if self.cfg.use_weighted_sampler:
-            print("[DEBUG] ⚖️ Initializing Weighted Sampler (using body_mask.nii.gz)")
-            sampler = tio.WeightedSampler(patch_size=self.cfg.patch_size, probability_map="prob_map")
-        else:
-            sampler = tio.UniformSampler(patch_size=self.cfg.patch_size)
-
-        queue = tio.Queue(
-            subjects_dataset=train_ds,
-            samples_per_volume=self.cfg.patches_per_volume,
-            max_length=max(self.cfg.patches_per_volume, self.cfg.data_queue_max_length),
-            sampler=sampler,
+        # Train: cached full volumes -> CPU random crop (workers) -> default collate (uniform patches) -> GPU aug.
+        train_dicts = build_data_dicts(self.cfg.root_dir, self.train_subjects, load_seg=load_seg)
+        base_train = PersistentDataset(data=train_dicts, transform=cached_xform, cache_dir=cache_dir)
+        train_random_crop = get_random_crop(
+            patch_size=self.cfg.patch_size,
+            use_weighted_sampler=self.cfg.use_weighted_sampler,
+            has_seg=load_seg,
+            num_samples=self.cfg.patches_per_volume,
+        )
+        train_ds = Dataset(data=base_train, transform=train_random_crop)
+        self.train_loader = DataLoader(
+            train_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
             num_workers=self.cfg.data_queue_num_workers,
-            shuffle_patches=True,
-            shuffle_subjects=True,
+            persistent_workers=False,
+            pin_memory=False,
         )
-        self.train_loader = tio.SubjectsLoader(queue, batch_size=self.cfg.batch_size, num_workers=0)
-
         self.train_iter = self._inf_gen(self.train_loader)
 
-        # 6. Val Loader (Full Volume)
-        # Load seg for validation if we are using Dice loss (to measure semantic consistency)
-        # NOTE: use_weighted_sampler here only loads mask.nii.gz as prob_map in the batch —
-        # it does NOT do weighted patch sampling (that's training-only via Queue).
-        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False))
-        val_preprocess = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult, enforce_ras=getattr(self.cfg, "enforce_ras", False), mri_norm=getattr(self.cfg, "mri_norm", "minmax"))
+        self.gpu_transforms = get_gpu_transforms(
+            augment=self.cfg.augment,
+            has_seg=load_seg,
+        )
 
-        val_transform_list = [val_preprocess]
-        if getattr(self.cfg, "use_float16_storage", False):
-            val_transform_list.append(Float16Storage())
+        # Val: same cached transforms, no augmentation (full volumes via sliding-window inference).
+        self.val_loader = self._build_val_loader(cached_xform, load_seg, cache_dir)
 
-        val_ds = tio.SubjectsDataset(val_objs, transform=tio.Compose(val_transform_list))
-        self.val_loader = tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
-
-        # Stratified Validation Sampling (2 per region)
-        rng = random.Random(self.cfg.seed)
-
-        region_to_indices = defaultdict(list)
-        for idx, subj_id in enumerate(self.val_subjects):
-            region = get_region_key(subj_id)
-            region_to_indices[region].append(idx)
-
-        viz_indices = []
+        # Stratified Validation Sampling (viz_limit per region)
+        self.val_viz_indices, region_to_indices = self._stratify_val_indices(self.cfg.viz_limit)
         for region, indices in region_to_indices.items():
-            num_to_pick = min(len(indices), self.cfg.viz_limit)
-            viz_indices.extend(rng.sample(indices, num_to_pick))
-
-        self.val_viz_indices = set(viz_indices)
-
-        # print(f"[DEBUG] 🖼️  Stratified Val Viz Indices: {self.val_viz_indices}")
-        for region, indices in region_to_indices.items():
-            picked = [i for i in viz_indices if i in indices]
+            picked = [i for i in indices if i in self.val_viz_indices]
             print(f"   - {region:10}: picked {len(picked)}/{len(indices)} (indices: {picked})")
 
     def _setup_models(self):
@@ -235,7 +203,10 @@ class Trainer(BaseTrainer):
                         modules[i].train()
                         self._feat_train_modules.append(modules[i])
                 else:
-                    print(f"[WARNING] Feature extractor does not have .model attribute. Cannot unfreeze by depth.")
+                    raise RuntimeError(
+                        f"finetune_feat_extractor=True with depth={depth} requires the feature extractor "
+                        f"to expose a `.model` attribute (nn.Sequential of stages). Got: {type(target_model).__name__}."
+                    )
             else:
                 # Fallback for depth=0 or unset
                 for p in self.feat_extractor.parameters():
@@ -282,28 +253,7 @@ class Trainer(BaseTrainer):
         # 3. Teacher Model (Baby U-Net) for Dice Loss / Validation
         self.teacher_model = None
         if getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False):
-            print("[DEBUG] 👨‍🏫 Initializing Baby U-Net Teacher for Dice Loss / Validation...")
-            try:
-                # Load Baby U-Net (12 classes: 11 organs + Brain)
-                self.teacher_model = load_model_v1_2(pretrained_ckpt=self.cfg.teacher_weights_path, n_classes=self.cfg.n_classes - 1, device=self.device, compile_model=False)
-
-                # Freeze Teacher
-                self.teacher_model.to(device=self.device, dtype=torch.bfloat16)
-                self.teacher_model.eval()
-                for p in self.teacher_model.parameters():
-                    p.requires_grad = False
-
-                if should_compile_models:
-                    print("[DEBUG] 🚀 Compiling Teacher with mode: default")
-                    self.teacher_model = torch.compile(self.teacher_model, mode="default")
-
-                tot, train = count_parameters(self.teacher_model)
-                print(f"[Model] Teacher Params: Total={tot:,} | Trainable={train:,} | Dtype=BFloat16")
-                print("[DEBUG] ✅ Teacher initialized.")
-            except Exception as e:
-                print(f"[ERROR] ❌ Failed to init Teacher Model: {e}")
-                if self.cfg.dice_w > 0:
-                    raise e
+            self.teacher_model = self._setup_teacher_model(compile_model=should_compile_models)
 
         # 4. Step Compilation
         if self.cfg.compile_mode == "full":
@@ -331,11 +281,6 @@ class Trainer(BaseTrainer):
             if feat_scale != 1:
                 features = features / feat_scale
 
-            # B) Zero-masking for background noise suppression
-            if getattr(self.cfg, "use_zero_mask", False):
-                mask = (mri > 0.01).to(mri.dtype)
-                features = features * mask
-
             if getattr(self.cfg, "pass_mri_to_translator", False):
                 translator_input = torch.cat([features, mri], dim=1)
 
@@ -357,7 +302,7 @@ class Trainer(BaseTrainer):
 
             loss = loss / self.cfg.accum_steps
 
-        self.scaler.scale(loss).backward()
+        loss.backward()
         return pred, loss, comps, pred_probs
 
     def _setup_opt(self):
@@ -383,15 +328,14 @@ class Trainer(BaseTrainer):
             print("[DEBUG] 🛑 Scheduler DISABLED. Using fixed LR.")
             self.scheduler = None
 
-        self._setup_loss_and_scaler()
+        self._setup_loss()
 
     def _load_resume(self):
-        super()._load_resume(self.model, self.optimizer, self.scheduler, self.scaler, extra_modules={"feat_extractor": self.feat_extractor})
+        super()._load_resume(self.model, self.optimizer, self.scheduler, extra_modules={"feat_extractor": self.feat_extractor})
 
     def save_checkpoint(self, epoch, is_last=False):
         filename = "checkpoint_last.pt" if is_last else f"{self.cfg.model_type}_epoch{epoch:05d}.pt"
-        save_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.gpfs_root, "results", "models")
-        path = os.path.join(save_dir, filename)
+        path = os.path.join(self._default_save_dir(), filename)
 
         extra_state = {}
         if self.cfg.finetune_feat_extractor:
@@ -399,7 +343,7 @@ class Trainer(BaseTrainer):
             target_feat = getattr(self.feat_extractor, "_orig_mod", self.feat_extractor)
             extra_state["feat_extractor_state_dict"] = target_feat.state_dict()
 
-        super().save_checkpoint(self.model, self.optimizer, self.scheduler, self.scaler, epoch, path, extra_state=extra_state)
+        super().save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, path, extra_state=extra_state)
 
     # ==========================================
     # CORE LOGIC
@@ -422,62 +366,52 @@ class Trainer(BaseTrainer):
 
         pbar = tqdm(range(self.cfg.steps_per_epoch), desc=f"Train Ep {epoch}", leave=False, dynamic_ncols=True)
 
+        monitor_every = max(1, getattr(self.cfg, "monitor_interval", 10))
+
         for step_idx in pbar:
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
 
-            if self.cfg.enable_profiling:
-                step_t_data = 0.0
-                step_t_fwd = 0.0
-                step_t_bwd = 0.0
-                t_step_start = time.time()
+            log_this_step = self.cfg.wandb and getattr(self.cfg, "monitor_resources", False) and step_idx % monitor_every == 0
 
-            for _ in range(self.cfg.accum_steps):
-                if self.cfg.enable_profiling:
-                    t0 = time.time()
-                batch = next(self.train_iter)
-                if self.cfg.enable_profiling:
-                    t1 = time.time()
-                    step_t_data += t1 - t0
+            with StepTimer(log_this_step) as timer:
+                for _ in range(self.cfg.accum_steps):
+                    with timer.cpu("data"):
+                        batch = next(self.train_iter)
+                    with timer.gpu("augment"):
+                        # Move-to-device + batched GPU augment via batchaug (one fused grid_sample for spatial ops).
+                        batch = gpu_augment_batch(batch, self.gpu_transforms, self.device)
 
-                # Extract tensors (torchio uses [tio.DATA])
-                mri = batch["mri"][tio.DATA].to(self.device, non_blocking=True)
-                ct = batch["ct"][tio.DATA].to(self.device, non_blocking=True)
-                seg = batch["seg"][tio.DATA].to(self.device, non_blocking=True) if "seg" in batch else None
+                    mri = batch["mri"]
+                    ct = batch["ct"]
+                    seg = batch["seg"] if "seg" in batch else None
 
-                # Modular Synchronized CutOut (via BaseTrainer)
-                mri, ct, seg = self.apply_cutout(mri, ct, seg=seg)
+                    # Modular Synchronized CutOut (via BaseTrainer)
+                    mri, ct, seg = self.apply_cutout(mri, ct, seg=seg)
 
-                if self.cfg.enable_profiling:
-                    torch.cuda.synchronize()
-                    t2 = time.time()
+                    with timer.gpu("compute"):
+                        # Call the training step (compiled or eager)
+                        # Note: self.train_step handles mixed precision context internally
+                        pred, loss, comps, pred_probs = self.train_step(mri, ct, seg)
 
-                # Call the training step (compiled or eager)
-                # Note: self.train_step handles mixed precision context internally
-                pred, loss, comps, pred_probs = self.train_step(mri, ct, seg)
+                    step_loss += loss.item()
 
-                if self.cfg.enable_profiling:
-                    torch.cuda.synchronize()
-                    t3 = time.time()
-                    step_t_fwd += t3 - t2
-                    step_t_bwd += 0  # Backward is inside train_step
+                    # Log patch (using the returned predictions)
+                    if self.cfg.wandb and step_idx == 0:
+                        subj_id = batch["subj_id"][0] if "subj_id" in batch else None
+                        self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg=seg, pred_probs=pred_probs, subj_id=subj_id)
 
-                step_loss += loss.item()
+                    for k, v in comps.items():
+                        # Handle both tensors (from compiled step) and scalars
+                        val = v.item() if hasattr(v, "item") else v
+                        comp_accum[k] = comp_accum.get(k, 0.0) + (val / self.cfg.accum_steps)
 
-                # Log patch (using the returned predictions)
-                if self.cfg.wandb and step_idx == 0:
-                    subj_id = batch["subj_id"][0] if "subj_id" in batch else None
-                    self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg=seg, pred_probs=pred_probs, subj_id=subj_id)
+                    if pred_probs is not None:
+                        del pred_probs
 
-                for k, v in comps.items():
-                    # Handle both tensors (from compiled step) and scalars
-                    val = v.item() if hasattr(v, "item") else v
-                    comp_accum[k] = comp_accum.get(k, 0.0) + (val / self.cfg.accum_steps)
-
-            self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(list(self.model.parameters()) + (list(self.feat_extractor.parameters()) if self.cfg.finetune_feat_extractor else []), max_norm=1.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                with timer.gpu("optimizer"):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(list(self.model.parameters()) + (list(self.feat_extractor.parameters()) if self.cfg.finetune_feat_extractor else []), max_norm=1.0)
+                    self.optimizer.step()
 
             # Step scheduler per iteration for cosine
             if self.scheduler is not None and self.cfg.scheduler_type == "cosine":
@@ -488,27 +422,22 @@ class Trainer(BaseTrainer):
             total_grad += grad_norm.item()
 
             self.global_step += 1
-            self.samples_seen += self.cfg.batch_size * self.cfg.accum_steps
+            self.samples_seen += self.cfg.batch_size * self.cfg.patches_per_volume * self.cfg.accum_steps
 
             pbar_dict = {"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"}
 
             current_lr = self.optimizer.param_groups[0]["lr"]
-            if self.cfg.enable_profiling:
-                t_step_end = time.time()
-                step_t_total = t_step_end - t_step_start
-                avg_batch_data = (step_t_data / self.cfg.accum_steps) * 1000
-                avg_batch_fwd = (step_t_fwd / self.cfg.accum_steps) * 1000
-                pbar_dict.update({"dt": f"{avg_batch_data:.1f}ms", "fwd": f"{avg_batch_fwd:.1f}ms", "tot": f"{step_t_total:.2f}s", "lr": f"{current_lr:.2e}"})
+            pbar_dict["lr"] = f"{current_lr:.2e}"
 
-                if self.cfg.wandb:
-                    wandb.log(
-                        {
-                            "info/time_data_ms": avg_batch_data,
-                            "info/time_forward_ms": avg_batch_fwd,
-                            "info/time_step_total_s": step_t_total,
-                        },
-                        step=self.global_step,
-                    )
+            if log_this_step:
+                samples_per_step = self.cfg.batch_size * self.cfg.patches_per_volume * self.cfg.accum_steps
+                timings = timer.timings_ms()
+                self._log_monitoring(timings, throughput=samples_per_step / timer.elapsed_s())
+                pbar_dict.update({
+                    "dt": f"{timings['data']:.0f}ms",
+                    "cmp": f"{timings['compute']:.0f}ms",
+                    "tot": f"{timings['step_total'] / 1000:.2f}s",
+                })
 
             pbar.set_postfix(pbar_dict)
 
@@ -527,32 +456,6 @@ class Trainer(BaseTrainer):
                 }
                 wandb.log(log_dict, step=self.global_step)
 
-            # ---------------------------------------------------------
-            # RAM 모니터링 (Optional)
-            # ---------------------------------------------------------
-            if self.cfg.wandb and self.cfg.enable_profiling and step_idx % 200 == 0:
-                ram_info = get_ram_info()
-
-                queue = self.train_loader.dataset
-                curr_patches = len(queue.patches_list)
-
-                wandb.log(
-                    {
-                        "perf/ram_system_percent": ram_info["percent"],
-                        "perf/ram_app_total_gb": ram_info["total_gb"],
-                        "perf/ram_main_rss_gb": ram_info["main_rss_gb"],
-                        "perf/num_workers": ram_info["num_children"],
-                        "perf/queue_curr_patches": curr_patches,
-                    },
-                    step=self.global_step,
-                )
-
-                if ram_info["percent"] > 90:
-                    tqdm.write(f"[WARNING] ⚠️ RAM usage critical: {ram_info['percent']:.1f}% (Total: {ram_info['total_gb']:.2f} GB)")
-                    gc.collect()
-                    torch.cuda.empty_cache()
-            # ---------------------------------------------------------
-
         return total_loss / self.cfg.steps_per_epoch, {k: v / self.cfg.steps_per_epoch for k, v in comp_accum.items()}, total_grad / self.cfg.steps_per_epoch
 
     @torch.inference_mode()
@@ -567,9 +470,9 @@ class Trainer(BaseTrainer):
 
         # 1. Validation Loop
         for i, batch in enumerate(tqdm(self.val_loader, desc="Validating", leave=False)):
-            mri = batch["mri"][tio.DATA].to(self.device)
-            ct = batch["ct"][tio.DATA].to(self.device)
-            seg = batch["seg"][tio.DATA].to(self.device) if "seg" in batch else None
+            mri = batch["mri"].to(self.device)
+            ct = batch["ct"].to(self.device)
+            seg = batch["seg"].to(self.device) if "seg" in batch else None
             orig_shape = batch["original_shape"][0].tolist()
             subj_id = batch["subj_id"][0]
             # Always use Sliding Window for Full Volumes to prevent OOM
@@ -586,17 +489,11 @@ class Trainer(BaseTrainer):
                 if feat_scale != 1:
                     f = f / feat_scale
 
-                # 3. Zero-masking for background noise suppression
-                if getattr(self.cfg, "use_zero_mask", False):
-                    # anatomy=1, air=0
-                    mask = (x > 0.01).to(x.dtype)
-                    f = f * mask
-
-                # 4. Concatenation
+                # 3. Concatenation
                 if getattr(self.cfg, "pass_mri_to_translator", False):
                     f = torch.cat([f, x], dim=1)
 
-                    # 5. Input Dropout (Conditional on pass_mri)
+                    # 4. Input Dropout (Conditional on pass_mri)
                     drop_p = getattr(self.cfg, "input_dropout_p", 0.0)
                     if drop_p > 0:
                         f = torch.nn.functional.dropout3d(f, p=drop_p, training=False)
@@ -619,44 +516,26 @@ class Trainer(BaseTrainer):
             ct_unpad = unpad(ct, orig_shape)
             mri_unpad = unpad(mri, orig_shape)
 
-            mask_unpad = None
-            if getattr(self.cfg, "val_body_mask", False) and "prob_map" in batch:
-                mask_unpad = unpad(batch["prob_map"][tio.DATA].to(self.device), orig_shape)
+            mask_unpad = self._get_body_mask_unpad(batch, orig_shape)
 
             met, body_met = self._compute_val_metrics(pred_unpad, ct_unpad, mask_unpad)
 
             # Validation Dice & Probabilities
             pred_probs = None
             if getattr(self.cfg, "validate_dice", False) and self.teacher_model is not None and seg is not None:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    # Always use sliding window for teacher on full volumes to prevent OOM
-                    pred_probs = sliding_window_inference(
-                        inputs=pred,
-                        roi_size=(val_ps, val_ps, val_ps),
-                        sw_batch_size=self.cfg.val_sw_batch_size,
-                        predictor=self.teacher_model,
-                        overlap=self.cfg.val_sw_overlap,
-                        device=self.device,
-                    )
+                pred_probs = self._run_teacher_sw(pred, val_ps)
 
-            # Loss (Composite) - Now includes Dice if pred_probs is available
-            l_val, l_comps = self.loss_fn(pred, ct, pred_probs=pred_probs, target_mask=seg)
+            # Loss (Composite) - Now includes Dice if pred_probs is available.
+            # Cast pred (bf16 from autocast SW inference) and ct (fp16 from cached storage) to fp32:
+            # nn.L1Loss on mixed bf16/fp16 inputs would otherwise rely on implicit type promotion.
+            l_val, l_comps = self.loss_fn(pred.float(), ct.float(), pred_probs=pred_probs, target_mask=seg)
             met["loss"] = l_val.item()
             for k, v in l_comps.items():
                 met[k] = v.item() if hasattr(v, "item") else v
 
             # Body-masked dice (only when val_body_mask=True and teacher available)
             if body_met is not None and pred_probs is not None and seg is not None:
-                from common.loss import get_class_dice
-
-                pred_probs_unpad = unpad(pred_probs, orig_shape)
-                seg_unpad = unpad(seg, orig_shape)
-                bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
-                class_dices, bone_dice = get_class_dice(pred_probs_unpad, seg_unpad, mask=mask_unpad, bone_idx=bone_idx)
-                excl_bg = getattr(self.cfg, "dice_exclude_background", True)
-                body_met["dice_score_all"] = (class_dices[1:].mean() if excl_bg else class_dices.mean()).item()
-                if bone_dice is not None:
-                    body_met["dice_score_bone"] = bone_dice.item()
+                self._compute_dice_metrics(pred_probs, seg, orig_shape, mask_unpad=mask_unpad, target_met=body_met)
 
             if pred_probs is not None:
                 del pred_probs  # Fix memory leak
@@ -667,37 +546,13 @@ class Trainer(BaseTrainer):
                 for k, v in body_met.items():
                     val_metrics[f"body_{k}"].append(v)
 
-            # Save predictions for ALL subjects (overwrite "last" each validation run)
-            save_path = None
-            if self.cfg.save_val_volumes:
-                base_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.cfg.prediction_dir, self.run_name)
-
-                pred_np = pred_unpad.float().cpu().numpy().squeeze()
-                pred_hu = (pred_np * 2048.0) - 1024.0
-
-                affine = batch["ct"]["affine"][0]
-                if hasattr(affine, "cpu"):
-                    affine = affine.cpu().numpy()
-                else:
-                    affine = np.array(affine)
-
-                nii = nib.Nifti1Image(pred_hu, affine)
-
-                last_dir = os.path.join(base_dir, "predictions", "last")
-                os.makedirs(last_dir, exist_ok=True)
-                save_path = os.path.join(last_dir, f"pred_{subj_id}.nii.gz")
-                nib.save(nii, save_path)
-
-                if self.cfg.val_save_interval > 0 and epoch % self.cfg.val_save_interval == 0:
-                    epoch_dir = os.path.join(base_dir, "predictions", f"epoch_{epoch}")
-                    os.makedirs(epoch_dir, exist_ok=True)
-                    nib.save(nii, os.path.join(epoch_dir, f"pred_{subj_id}.nii.gz"))
+            # Save predictions (overwrite "last" each val run; epoch_<N> snapshot every val_save_interval)
+            save_path = self._save_val_pred(pred_unpad, batch, subj_id, epoch)
 
             # Viz & DRR (only for selected subjects)
             if i in self.val_viz_indices:
                 if self.cfg.wandb:
-                    viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if k in met}
-                    viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if body_met and k in body_met} or None
+                    viz_metrics, viz_body = self._select_viz_metrics(met, body_met)
                     visualize_lite(
                         pred_unpad, ct_unpad, mri_unpad, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body
                     )
@@ -714,8 +569,7 @@ class Trainer(BaseTrainer):
             self._log_aug_viz(self.global_step)
 
         # 3. Log
-        _val_exclude = {"mae", "loss_ssim", "loss_dice", "grad_diff"}
-        avg_met = self._log_val_metrics(val_metrics, exclude=_val_exclude, subject_ids=self.val_subjects)
+        avg_met = self._log_val_metrics(val_metrics, subject_ids=self.val_subjects)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -754,14 +608,14 @@ class Trainer(BaseTrainer):
             cumulative_time = (time.time() - self.global_start_time) + self.elapsed_time_at_resume
 
             if self.cfg.wandb:
-                current_lr = self.optimizer.param_groups[0]["lr"]
+                # info/lr is logged in the per-200-steps block above; skip here to avoid
+                # overwriting mid-epoch values at the epoch-boundary global_step.
                 log = {
                     "train/total": loss,
                     "info/grad_norm": gn,
                     "info/epoch_duration": ep_duration,
                     "info/val_duration": val_duration,
                     "info/cumulative_time": cumulative_time,
-                    "info/lr": current_lr,
                     "info/global_step": self.global_step,
                     "info/epoch": epoch,
                     "info/samples_seen": self.samples_seen,
@@ -781,6 +635,5 @@ class Trainer(BaseTrainer):
             torch.cuda.empty_cache()
         if self.cfg.wandb:
             wandb.log({"info/samples_seen_total": self.samples_seen})  # Log total samples at the end
-        if self.cfg.wandb:
             wandb.finish()
         print(f"✅ Training Complete. Total Time: {time.time() - self.global_start_time:.1f}s")

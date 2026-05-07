@@ -23,13 +23,13 @@ NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "NV-Generate-CTMR", "configs", 
 # ==========================================
 MAISI_CONFIG = {
     "split_file": "splits/center_wise_split.txt",
-    "stage_data": True,
+    "stage_data": False,
     "batch_size": 1,
     "accum_steps": 1,  # Match effective batch size of other models (4)
     "lr": 5e-4,
     "total_epochs": 1000,
     "steps_per_epoch": 1000,
-    "val_interval": 5,
+    "val_interval": 10,
     "full_val": True,
     "model_save_interval": 200,
     "val_save_interval": 50,
@@ -50,7 +50,6 @@ MAISI_CONFIG = {
     "wandb": True,
     "wandb_tags": ["maisi"],
     "wandb_note": "MAISI Baseline ControlNet (On-the-fly VAE).",
-    "preencoded_latents_dir": None,  # If set, pre-encode all CT volumes once and cache latents here
     # Data
     "augment": True,  # Enable standard augmentations
     # Validation
@@ -78,7 +77,6 @@ def main():
     parser.add_argument("--model_save_interval", type=int, help="Model save interval")
     parser.add_argument("--wandb", type=str, choices=["True", "False"], help="Enable/disable wandb")
     parser.add_argument("--resume_wandb_id", type=str, help="WandB Run ID to resume from")
-    parser.add_argument("--preencoded_latents_dir", type=str, help="Directory to cache pre-encoded CT latents")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
     parser.add_argument("--compile_mode", type=str, help="torch.compile mode: 'full', 'model', or 'None'")
     parser.add_argument("--vae_compile", type=str, choices=["True", "False"], help="Enable/disable VAE compilation")
@@ -126,8 +124,6 @@ def main():
         MAISI_CONFIG["wandb"] = args.wandb == "True"
     if args.resume_wandb_id:
         MAISI_CONFIG["resume_wandb_id"] = args.resume_wandb_id
-    if args.preencoded_latents_dir:
-        MAISI_CONFIG["preencoded_latents_dir"] = args.preencoded_latents_dir
     if args.compile_mode:
         MAISI_CONFIG["compile_mode"] = None if args.compile_mode.lower() == "none" else args.compile_mode
     if args.vae_compile:

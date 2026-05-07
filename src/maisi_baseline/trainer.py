@@ -2,25 +2,20 @@ import copy
 import gc
 import json
 import os
-import random
-
-# Add project root to path
 import sys
 import time
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
-import nibabel as nib
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchio as tio
 from monai.bundle import ConfigParser
+from monai.data import DataLoader, PersistentDataset
 from monai.inferers import SlidingWindowInferer, sliding_window_inference
 from monai.networks.schedulers import RFlowScheduler
 from monai.networks.schedulers.ddpm import DDPMPredictionType
 from monai.networks.utils import copy_model_state
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import wandb
@@ -28,9 +23,15 @@ import wandb
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from common.config import Config
-from common.data import DataPreprocessing, build_tio_subjects, get_augmentations, get_region_key
-from common.trainer_base import BaseTrainer
-from common.utils import anatomix_normalize, count_parameters, unpad, visualize_lite
+from common.data import (
+    build_data_dicts,
+    default_monai_cache_dir,
+    get_cached_transforms,
+    get_gpu_transforms,
+    gpu_augment_batch,
+)
+from common.trainer_base import BaseTrainer, StepTimer
+from common.utils import count_parameters, unpad, visualize_lite
 
 
 class MAISITrainer(BaseTrainer):
@@ -45,12 +46,7 @@ class MAISITrainer(BaseTrainer):
 
         # 2. Setup Components
         self._find_subjects()
-        self._stage_data_local()
         self._setup_models()
-        if getattr(self.cfg, "preencoded_latents_dir", None):
-            self.cfg.augment = False
-            print(f"[{self.prefix}] 💾 Pre-encoded latents enabled. Augmentation disabled.")
-            self._pre_encode_all()
         self._setup_data()
         self._setup_opt()
         self._setup_wandb()
@@ -59,8 +55,7 @@ class MAISITrainer(BaseTrainer):
         models_to_log = {"ControlNet (Trainable)": self.controlnet, "UNet (Frozen)": self.unet, "Autoencoder (Frozen)": self.autoencoder}
         self._log_model_summary(models_to_log)
 
-        extra_modules = {"unet": self.unet, "autoencoder": self.autoencoder}
-        self._load_resume(self.controlnet, self.optimizer, self.scheduler, self.scaler, extra_modules=extra_modules)
+        self._load_resume(self.controlnet, self.optimizer, self.scheduler)
 
     def _setup_models(self):
         print(f"[{self.prefix}] 🏗️ Building MAISI Models")
@@ -125,77 +120,9 @@ class MAISITrainer(BaseTrainer):
         # 5. Teacher Model for Dice Validation
         self.teacher_model = None
         if getattr(self.cfg, "validate_dice", False):
-            print(f"[{self.prefix}] 👨‍🏫 Initializing Teacher for Dice Validation...")
-            try:
-                from anatomix.segmentation.segmentation_utils import load_model_v1_2
-                self.teacher_model = load_model_v1_2(pretrained_ckpt=self.cfg.teacher_weights_path, n_classes=self.cfg.n_classes - 1, device=self.device, compile_model=False)
-                self.teacher_model.to(device=self.device, dtype=torch.bfloat16)
-                self.teacher_model.eval()
-                for p in self.teacher_model.parameters():
-                    p.requires_grad = False
-                print(f"[{self.prefix}] ✅ Teacher initialized.")
-            except Exception as e:
-                print(f"[{self.prefix}] ❌ Failed to init Teacher: {e}")
+            self.teacher_model = self._setup_teacher_model(compile_model=False)
 
-    @staticmethod
-    def _resample_subject(subject):
-        """Normalize and pad subject to nearest multiple of 32 for VAE compatibility."""
-        subject = tio.ToCanonical()(subject)
-        subject["original_spacing"] = torch.from_numpy(np.array(subject["ct"].spacing)).float()
-        subject["original_spatial_shape"] = torch.tensor(subject["ct"].spatial_shape)
-
-        # STRICT MAISI NORMALIZATION
-        subject["ct"].set_data(anatomix_normalize(subject["ct"].data, clip_range=(-1000, 1000)))
-        subject["mri"].set_data(anatomix_normalize(subject["mri"].data, percentile_range=(0.0, 99.5)))
-
-        spatial_keys = ["ct", "mri"]
-        if "prob_map" in subject:
-            spatial_keys.append("prob_map")
-        if "seg" in subject:
-            spatial_keys.append("seg")
-
-        current_shape = subject["ct"].spatial_shape
-        padding_params = []
-        for dim in current_shape:
-            target = max(32, (int(dim) + 31) // 32 * 32)
-            padding_params.extend([0, int(target - dim)])
-
-        if any(p > 0 for p in padding_params):
-            subject = tio.Pad(padding_params, padding_mode=0, include=spatial_keys)(subject)
-
-        return subject
-
-    def _pre_encode_all(self):
-        """Pre-encode all train+val CT volumes to VAE latent space and cache to disk."""
-        cache_dir = self.cfg.preencoded_latents_dir
-        os.makedirs(cache_dir, exist_ok=True)
-
-        all_subjects = list(dict.fromkeys(self.train_subjects + self.val_subjects))
-        to_encode = [s for s in all_subjects if not os.path.exists(os.path.join(cache_dir, f"{s}_ct_latent.pt"))]
-        print(f"[{self.prefix}] Pre-encoding: {len(to_encode)} to encode, {len(all_subjects) - len(to_encode)} already cached.")
-
-        if not to_encode:
-            return
-
-        subj_objs = build_tio_subjects(self.cfg.root_dir, to_encode, use_weighted_sampler=False, load_seg=False)
-        for subj_obj in tqdm(subj_objs, desc="Pre-encoding CT latents"):
-            sid = subj_obj["subj_id"]
-            subj_obj = MAISITrainer._resample_subject(subj_obj)
-            ct = subj_obj["ct"].data.unsqueeze(0).to(self.device)
-            ct_emb = self._encode_sliding_window(ct) * self.scale_factor
-            torch.save(ct_emb.cpu(), os.path.join(cache_dir, f"{sid}_ct_latent.pt"))
-            del ct, ct_emb
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        print(f"[{self.prefix}] Pre-encoding complete.")
-
-    def _setup_data(self, seed=None):
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-
+    def _setup_data(self):
         # Safeguard: Disable augmentation and enforce 1 step/epoch if running on a single subject (SSO)
         if len(self.train_subjects) == 1:
             if self.cfg.augment:
@@ -205,47 +132,51 @@ class MAISITrainer(BaseTrainer):
                 print(f"[{self.prefix}] ℹ️ SSO Mode detected: Setting steps_per_epoch=1.")
                 self.cfg.steps_per_epoch = 1
 
-        # Full Volume Training Data Pipeline
-        train_objs = build_tio_subjects(self.cfg.root_dir, self.train_subjects, use_weighted_sampler=False, load_seg=False)
+        # MONAI pipeline (full-volume MAISI: cached preproc + GPU aug, NO crop).
+        # MAISI norm presets: ct_range=(-1000, 1000), mri_norm="percentile" (0–99.5).
+        # res_mult=32 to satisfy the VAE's 8x downsampling × 4 patch alignment.
+        load_seg = getattr(self.cfg, "validate_dice", False)
+        cache_dir = default_monai_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"[{self.prefix}] 💾 MONAI cache dir: {cache_dir}")
 
-        transforms = tio.Compose([MAISITrainer._resample_subject, get_augmentations()]) if self.cfg.augment else tio.Compose([MAISITrainer._resample_subject])
-        train_ds = tio.SubjectsDataset(train_objs, transform=transforms)
+        cached_xform = get_cached_transforms(
+            patch_size=self.cfg.patch_size,
+            res_mult=32,
+            enforce_ras=True,
+            mri_norm="percentile",
+            ct_range=(-1000, 1000),
+            load_seg=load_seg,
+        )
 
-        self.train_loader = DataLoader(train_ds, batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.dataloader_num_workers, collate_fn=lambda x: x)
+        # Train: full padded volumes; batch_size=1 → no collation pad needed.
+        train_dicts = build_data_dicts(self.cfg.root_dir, self.train_subjects, load_seg=False)
+        train_ds = PersistentDataset(data=train_dicts, transform=cached_xform, cache_dir=cache_dir)
+        self.train_loader = DataLoader(
+            train_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.dataloader_num_workers,
+            persistent_workers=False,
+            pin_memory=False,
+        )
         self.train_iter = self._inf_gen(self.train_loader)
 
-        # Val Loader
-        # NOTE: use_weighted_sampler here only loads mask.nii.gz as prob_map in the subject —
-        # it does NOT do weighted patch sampling (that's training-only via Queue).
-        load_seg = getattr(self.cfg, "validate_dice", False)
-        val_objs = build_tio_subjects(self.cfg.root_dir, self.val_subjects, load_seg=load_seg, use_weighted_sampler=getattr(self.cfg, "val_body_mask", False))
-        val_ds = tio.SubjectsDataset(val_objs, transform=MAISITrainer._resample_subject)
-        self.val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda x: x)
+        # Full-volume aug (no crop): Affine/Flip/BiasField/Gamma/Noise/Scale.
+        self.gpu_transforms = get_gpu_transforms(augment=self.cfg.augment, has_seg=False)
+
+        # Val: same cached preproc, batch_size=1, no aug.
+        self.val_loader = self._build_val_loader(cached_xform, load_seg, cache_dir)
 
         # Stratified Validation Sampling
-        rng = random.Random(self.cfg.seed)
-        region_to_indices = defaultdict(list)
-        for idx, subj_id in enumerate(self.val_subjects):
-            region = get_region_key(subj_id)
-            region_to_indices[region].append(idx)
-
-        # Determine indices to run metrics on
         if self.cfg.full_val:
             self.val_indices_to_run = set(range(len(self.val_subjects)))
-            # For visualization (pick 2 per region)
-            viz_indices = []
-            for region, indices in region_to_indices.items():
-                sampled = rng.sample(indices, min(self.cfg.viz_limit, len(indices)))
-                viz_indices.extend(sampled)
-            self.val_viz_indices = set(viz_indices)
+            self.val_viz_indices, _ = self._stratify_val_indices(self.cfg.viz_limit)
         else:
-            # Reduced validation: only 1 per region
-            reduced_indices = []
-            for region, indices in region_to_indices.items():
-                sampled = rng.sample(indices, 1)
-                reduced_indices.extend(sampled)
-            self.val_indices_to_run = set(reduced_indices)
-            self.val_viz_indices = set(reduced_indices)  # Visualize all run volumes if reduced
+            # Reduced validation: 1 per region; visualize all of them.
+            reduced, _ = self._stratify_val_indices(1)
+            self.val_indices_to_run = reduced
+            self.val_viz_indices = reduced
 
         print(f"[{self.prefix}] 📊 Validation strategy: full_val={self.cfg.full_val}, running on {len(self.val_indices_to_run)}/{len(self.val_subjects)} volumes.")
 
@@ -258,7 +189,30 @@ class MAISITrainer(BaseTrainer):
 
         # Original uses PolynomialLR with power 2.0
         self.scheduler = torch.optim.lr_scheduler.PolynomialLR(self.optimizer, total_iters=total_steps, power=2.0)
-        self.scaler = torch.amp.GradScaler("cuda")
+
+    def _sample_noise_and_timesteps(self, ct_emb):
+        """Sample noise + timesteps and produce a corrupted latent (no autocast wrap)."""
+        noise = torch.randn_like(ct_emb)
+        if hasattr(self.noise_scheduler, "sample_timesteps"):
+            timesteps = self.noise_scheduler.sample_timesteps(ct_emb)
+        else:
+            timesteps = torch.randint(0, self.noise_scheduler.num_train_timesteps, (ct_emb.shape[0],), device=ct_emb.device).long()
+        noisy_latent = self.noise_scheduler.add_noise(original_samples=ct_emb, noise=noise, timesteps=timesteps)
+        return noise, timesteps, noisy_latent
+
+    def _controlnet_unet_forward(self, noisy_latent, mr, spacing, timesteps):
+        """Run ControlNet (cond on MR) + frozen UNet to produce model_output. Caller controls autocast."""
+        class_labels = torch.ones(noisy_latent.shape[0], dtype=torch.long, device=self.device)
+        down_res, mid_res = self.controlnet(x=noisy_latent, timesteps=timesteps, controlnet_cond=mr, class_labels=class_labels)
+        model_output = self.unet(
+            x=noisy_latent,
+            timesteps=timesteps,
+            spacing_tensor=spacing,
+            class_labels=class_labels,
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        )
+        return model_output, down_res, mid_res
 
     def _get_diffusion_target(self, ct_emb, noise, timesteps):
         """Compute the diffusion training target based on the noise scheduler type."""
@@ -276,8 +230,8 @@ class MAISITrainer(BaseTrainer):
     @torch.no_grad()
     def _encode_sliding_window(self, ct_tensor):
         """Encodes full volume CT [-1000, 1000] HU into VAE Latent using sliding window."""
-        ct_hu = (ct_tensor * 2000.0) - 1000.0
-        ct_norm = torch.clamp((ct_hu + 1000.0) / 2000.0, 0.0, 1.0)
+        # ct_tensor is already in [0,1] mapping to [-1000,1000] HU from the cached pipeline.
+        ct_norm = ct_tensor.clamp(0.0, 1.0)
 
         # ROI [384, 352, 256]
         # Final optimized ROI for A40: Covers ~85% of subjects in 1 patch.
@@ -302,7 +256,7 @@ class MAISITrainer(BaseTrainer):
             print(f"[{self.prefix}] 🪟 Encoding Sliding Window: {vol_shape} -> {n_patches} patches (Overlap={overlap})")
 
         t_sw_start = time.time()
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             latent = inferer(ct_norm.to(self.device), self.autoencoder.encode_stage_2_inputs)
         t_sw_dur = time.time() - t_sw_start
 
@@ -340,7 +294,7 @@ class MAISITrainer(BaseTrainer):
             print(f"[{self.prefix}] 🪟 Decoding Sliding Window: {vol_shape} -> {n_patches} patches (Overlap={overlap})")
 
         t_sw_start = time.time()
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             recon = inferer(z, self.autoencoder.decode_stage_2_outputs)
         t_sw_dur = time.time() - t_sw_start
 
@@ -361,11 +315,12 @@ class MAISITrainer(BaseTrainer):
         if any(s > limit for s, limit in zip(latent.shape[2:], [96, 88, 64])):
             recon = self._decode_sliding_window(latent)
         else:
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 recon = self.autoencoder.decode_stage_2_outputs(latent)
 
         recon = torch.clamp(recon, 0.0, 1.0)
-        return recon.to(self.device)
+        # Cast to fp32 so downstream consumers (numpy viz, metrics) don't trip on bf16.
+        return recon.float().to(self.device)
 
     @torch.no_grad()
     def _sample(self, mr, spacing, num_steps=10):
@@ -385,7 +340,7 @@ class MAISITrainer(BaseTrainer):
         all_timesteps = self.noise_scheduler.timesteps.to(self.device)
         all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=self.device)))
 
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             for t, next_t in zip(all_timesteps, all_next_timesteps):
                 t_tensor = torch.tensor([t], device=self.device).float()
                 # Modality 1 corresponds to CT (refer to modality_mapping.json)
@@ -407,97 +362,69 @@ class MAISITrainer(BaseTrainer):
         steps = self.cfg.steps_per_epoch
         pbar = tqdm(range(steps), desc=f"Ep {epoch}", leave=False, dynamic_ncols=True)
 
-        prof = self.cfg.enable_profiling
-
-        def _t():
-            if prof:
-                torch.cuda.synchronize()
-            return time.time()
+        monitor_every = max(1, getattr(self.cfg, "monitor_interval", 10))
 
         for step_idx in pbar:
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
-            step_t_load = 0.0
-            step_t_encode = 0.0
-            step_t_noise = 0.0
-            step_t_predict = 0.0
-            step_t_backward = 0.0
 
-            for _ in range(self.cfg.accum_steps):
-                t0 = _t()
-                batch_list = next(self.train_iter)
-                step_t_load += _t() - t0
+            log_this_step = self.cfg.wandb and getattr(self.cfg, "monitor_resources", False) and step_idx % monitor_every == 0
 
-                # Manually batch the list of torchio subjects
-                mri_list = [subj["mri"]["data"] for subj in batch_list]
-                ct_list = [subj["ct"]["data"] for subj in batch_list]
+            with StepTimer(log_this_step) as timer:
+                for accum_idx in range(self.cfg.accum_steps):
+                    with timer.cpu("data"):
+                        batch = next(self.train_iter)
+                        # `ct_spacing` is recorded into the cached pipeline as a plain tensor
+                        # (PersistentDataset's weights_only=True save strips MetaTensor.affine).
+                        spacing = batch["ct_spacing"].float().to(self.device) * 100.0
 
-                # Ensure dimensions match before stacking
-                mr = torch.stack(mri_list).to(self.device)
-                ct = torch.stack(ct_list).to(self.device)
+                    with timer.gpu("augment"):
+                        # Apply batched GPU aug via batchaug to full padded volumes (no crop, B=1).
+                        batch = gpu_augment_batch(batch, self.gpu_transforms, self.device)
 
-                # Modular Synchronized CutOut (via BaseTrainer)
-                # Note: Maisi uses stack of single-channel tensors: (B, 1, D, H, W)
-                mr, ct, _ = self.apply_cutout(mr, ct)
+                    mr = batch["mri"]
+                    ct = batch["ct"]
 
-                # STRICT PARITY: The original author does NOT adjust the spacing tensor after resizing the image
-                spacing = torch.stack([subj["original_spacing"] for subj in batch_list]).to(self.device) * 100.0
+                    # Modular Synchronized CutOut (via BaseTrainer)
+                    # Note: Maisi uses stack of single-channel tensors: (B, 1, D, H, W)
+                    mr, ct, _ = self.apply_cutout(mr, ct)
 
-                # 1. Encode CT to latent (load from cache or encode on-the-fly)
-                t0 = _t()
-                if getattr(self.cfg, "preencoded_latents_dir", None):
-                    ct_emb = torch.cat(
-                        [torch.load(os.path.join(self.cfg.preencoded_latents_dir, f"{subj['subj_id']}_ct_latent.pt"), map_location=self.device, weights_only=False) for subj in batch_list], dim=0
-                    )
-                else:
-                    ct_emb = self._encode_sliding_window(ct) * self.scale_factor
-                step_t_encode += _t() - t0
+                    with timer.gpu("encode"):
+                        # 1. Encode CT to latent on-the-fly via sliding window
+                        ct_emb = self._encode_sliding_window(ct) * self.scale_factor
 
-                with torch.amp.autocast("cuda"):
-                    # 2. Diffusion forward: sample timestep and corrupt latent
-                    t0 = _t()
-                    noise = torch.randn_like(ct_emb).to(self.device)
-                    if hasattr(self.noise_scheduler, "sample_timesteps"):
-                        timesteps = self.noise_scheduler.sample_timesteps(ct_emb)
-                    else:
-                        timesteps = torch.randint(0, self.noise_scheduler.num_train_timesteps, (ct_emb.shape[0],), device=ct_emb.device).long()
-                    noisy_latent = self.noise_scheduler.add_noise(original_samples=ct_emb, noise=noise, timesteps=timesteps)
-                    step_t_noise += _t() - t0
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        # 2. Diffusion forward: sample timestep and corrupt latent
+                        noise, timesteps, noisy_latent = self._sample_noise_and_timesteps(ct_emb)
 
-                    # 3. Predict velocity (ControlNet conditions the frozen UNet)
-                    t0 = _t()
-                    class_labels = torch.ones(noisy_latent.shape[0], dtype=torch.long, device=self.device)
-                    down_res, mid_res = self.controlnet(x=noisy_latent, timesteps=timesteps, controlnet_cond=mr, class_labels=class_labels)
-                    model_output = self.unet(
-                        x=noisy_latent, timesteps=timesteps, spacing_tensor=spacing, class_labels=class_labels, down_block_additional_residuals=down_res, mid_block_additional_residual=mid_res
-                    )
-                    step_t_predict += _t() - t0
+                        # 3. Predict velocity (ControlNet conditions the frozen UNet)
+                        with timer.gpu("predict"):
+                            model_output, down_res, mid_res = self._controlnet_unet_forward(noisy_latent, mr, spacing, timesteps)
 
-                    target = self._get_diffusion_target(ct_emb, noise, timesteps)
-                    loss = F.l1_loss(model_output.float(), target.float())
-                    loss = loss / self.cfg.accum_steps
+                        target = self._get_diffusion_target(ct_emb, noise, timesteps)
+                        loss = F.l1_loss(model_output.float(), target.float())
+                        loss = loss / self.cfg.accum_steps
 
-                t0 = _t()
-                self.scaler.scale(loss).backward()
-                step_t_backward += _t() - t0
-                step_loss += loss.item()
+                    with timer.gpu("backward"):
+                        loss.backward()
+                    step_loss += loss.item()
 
-                if step_idx == 0 and self.cfg.wandb:
-                    subj_id = batch_list[0]["subj_id"] if hasattr(batch_list[0], "subj_id") else getattr(batch_list[0], "name", None)
+                    if step_idx == 0 and accum_idx == 0 and self.cfg.wandb:
+                        subj_id = batch["subj_id"][0] if "subj_id" in batch else None
 
-                    # FREE MEMORY for visualization decode
-                    # model_output, down_res, mid_res are the largest consumers
-                    del model_output, down_res, mid_res, noisy_latent, target, noise
-                    torch.cuda.empty_cache()
+                        # FREE MEMORY for visualization decode
+                        # model_output, down_res, mid_res are the largest consumers
+                        del model_output, down_res, mid_res, noisy_latent, target, noise
+                        torch.cuda.empty_cache()
 
-                    decoded_ct_norm = self._decode(ct_emb[0:1])
-                    decoded_ct = (decoded_ct_norm * 2000.0 - 1000.0 + 1024.0) / 2048.0
-                    self._log_training_patch(mr, ct, decoded_ct, self.global_step, step_idx, subj_id=subj_id)
+                        # decoded output is in [0,1] mapping to [-1000,1000] HU — same space as `ct`,
+                        # so display them with identical normalization for honest side-by-side viz.
+                        decoded_ct = self._decode(ct_emb[0:1])
+                        self._log_training_patch(mr, ct, decoded_ct, self.global_step, step_idx, subj_id=subj_id)
 
-            self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.controlnet.parameters(), 1.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                with timer.gpu("optimizer"):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.controlnet.parameters(), 1.0)
+                    self.optimizer.step()
             self.scheduler.step()
 
             total_loss += step_loss
@@ -505,24 +432,21 @@ class MAISITrainer(BaseTrainer):
             self.global_step += 1
             self.samples_seen += self.cfg.batch_size * self.cfg.accum_steps
 
+            if log_this_step:
+                self._log_monitoring(
+                    timer.timings_ms(),
+                    throughput=(self.cfg.batch_size * self.cfg.accum_steps) / timer.elapsed_s(),
+                )
+
             if self.cfg.wandb and self.global_step % 5 == 0:
-                log_dict = {
-                    "train/loss": step_loss,
-                    "train/grad_norm": grad_norm.item(),
-                    "info/lr": self.optimizer.param_groups[0]["lr"],
-                }
-                if prof:
-                    s = self.cfg.accum_steps
-                    log_dict.update(
-                        {
-                            "profiling/load_ms": step_t_load / s * 1000,
-                            "profiling/encode_ms": step_t_encode / s * 1000,
-                            "profiling/noise_ms": step_t_noise / s * 1000,
-                            "profiling/predict_ms": step_t_predict / s * 1000,
-                            "profiling/backward_ms": step_t_backward / s * 1000,
-                        }
-                    )
-                wandb.log(log_dict, step=self.global_step)
+                wandb.log(
+                    {
+                        "train/loss": step_loss,
+                        "train/grad_norm": grad_norm.item(),
+                        "info/lr": self.optimizer.param_groups[0]["lr"],
+                    },
+                    step=self.global_step,
+                )
 
             pbar.set_postfix({"loss": f"{step_loss:.4f}", "gn": f"{grad_norm.item():.2f}"})
 
@@ -542,18 +466,17 @@ class MAISITrainer(BaseTrainer):
 
         val_ps = getattr(self.cfg, "val_patch_size", self.cfg.patch_size)
 
-        for i, batch_list in enumerate(tqdm(self.val_loader, desc="Validating", leave=False)):
+        for i, batch in enumerate(tqdm(self.val_loader, desc="Validating", leave=False)):
             if i not in self.val_indices_to_run:
                 continue
 
-            # Since batch_size=1, batch_list has 1 element
-            subj = batch_list[0]
-            mr = subj["mri"]["data"].unsqueeze(0).to(self.device)
-            ct = subj["ct"]["data"].unsqueeze(0).to(self.device)
-            # STRICT PARITY: The original author does NOT adjust the spacing tensor after resizing the image
-            spacing = subj["original_spacing"].unsqueeze(0).to(self.device) * 100.0
-            orig_shape = subj["original_spatial_shape"].tolist()
-            subj_id = subj["subj_id"] if hasattr(subj, "subj_id") else getattr(subj, "name", "unknown")
+            mr = batch["mri"].to(self.device)
+            ct = batch["ct"].to(self.device)
+            # `ct_spacing` is recorded into the cached pipeline as a plain tensor
+            # (PersistentDataset's weights_only=True save strips MetaTensor.affine).
+            spacing = batch["ct_spacing"].float().to(self.device) * 100.0
+            orig_shape = batch["original_shape"][0].tolist()
+            subj_id = batch["subj_id"][0]
 
             # Generate synthetic CT latent
             if prof:
@@ -581,22 +504,10 @@ class MAISITrainer(BaseTrainer):
             pred_hu = (pred_ct_norm * 2000.0) - 1000.0
 
             # Proxy diffusion loss (on resampled latent space)
-            if getattr(self.cfg, "preencoded_latents_dir", None):
-                ct_emb = torch.load(os.path.join(self.cfg.preencoded_latents_dir, f"{subj_id}_ct_latent.pt"), map_location=self.device, weights_only=False)
-            else:
-                ct_emb = self._encode_sliding_window(ct) * self.scale_factor
-            noise = torch.randn_like(ct_emb)
-            if hasattr(self.noise_scheduler, "sample_timesteps"):
-                timesteps = self.noise_scheduler.sample_timesteps(ct_emb)
-            else:
-                timesteps = torch.randint(0, self.noise_scheduler.num_train_timesteps, (ct_emb.shape[0],), device=ct_emb.device).long()
-            noisy_latent = self.noise_scheduler.add_noise(original_samples=ct_emb, noise=noise, timesteps=timesteps)
-            with torch.amp.autocast("cuda"):
-                class_labels = torch.ones(noisy_latent.shape[0], dtype=torch.long, device=self.device)
-                down_res, mid_res = self.controlnet(x=noisy_latent, timesteps=timesteps, controlnet_cond=mr, class_labels=class_labels)
-                model_output = self.unet(
-                    x=noisy_latent, timesteps=timesteps, spacing_tensor=spacing, class_labels=class_labels, down_block_additional_residuals=down_res, mid_block_additional_residual=mid_res
-                )
+            ct_emb = self._encode_sliding_window(ct) * self.scale_factor
+            noise, timesteps, noisy_latent = self._sample_noise_and_timesteps(ct_emb)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                model_output, _, _ = self._controlnet_unet_forward(noisy_latent, mr, spacing, timesteps)
 
             val_target = self._get_diffusion_target(ct_emb, noise, timesteps)
             val_metrics["loss"].append(F.l1_loss(model_output.float(), val_target.float()).item())
@@ -610,52 +521,32 @@ class MAISITrainer(BaseTrainer):
             gt_unpad = unpad(gt_matched.float(), orig_shape)
             pred_hu_unpad = unpad(pred_hu.float(), orig_shape)
             gt_hu_unpad = unpad(gt_hu.float(), orig_shape)
+            mr_unpad = unpad(mr.float(), orig_shape)
 
-            # compute_metrics expects (B, C, D, H, W). Use range 1.0 since data is normalized [0, 1]
-            # prob_map (if loaded) stays at original resolution — same as orig_shape, no interpolation needed
-            mask_unpad = None
-            if getattr(self.cfg, "val_body_mask", False) and "prob_map" in subj:
-                mask_unpad = unpad(subj["prob_map"]["data"].unsqueeze(0).to(self.device), orig_shape)
+            # compute_metrics expects (B, C, D, H, W). Use range 1.0 since data is normalized [0, 1].
+            # body_mask (if val_body_mask) is at the same padded resolution as ct, so unpad with orig_shape.
+            mask_unpad = self._get_body_mask_unpad(batch, orig_shape)
 
-            met, body_met = self._compute_val_metrics(pred_unpad, gt_unpad, mask_unpad)
+            # MAISI CT was clipped to [-1000, 1000] HU → 2000-HU range (vs amix/unet's 2048).
+            met, body_met = self._compute_val_metrics(pred_unpad, gt_unpad, mask_unpad, hu_range=2000)
 
-            # NVIDIA MAISI MAE HU Metric Logic (masked HU — separate from body mask)
+            # NVIDIA MAISI's air-excluded MAE HU (gt_hu > -900). Logged under a distinct
+            # name so it does NOT overwrite the standard `mae_hu` (which IS apples-to-apples
+            # comparable with amix/unet). Skip when the volume is all-air (no body voxels) —
+            # otherwise a synthetic 0 enters the mean and drags it down.
             hu_mask = gt_hu_unpad > -900
             if hu_mask.any():
-                mae_hu = torch.mean(torch.abs(pred_hu_unpad[hu_mask] - gt_hu_unpad[hu_mask])).item()
-            else:
-                mae_hu = 0.0
-
-            met["mae_hu"] = mae_hu
+                met["mae_hu_air_excluded"] = torch.mean(torch.abs(pred_hu_unpad[hu_mask] - gt_hu_unpad[hu_mask])).item()
 
             # Validation Dice
-            if getattr(self.cfg, "validate_dice", False) and self.teacher_model is not None and "seg" in subj:
-                from common.loss import get_class_dice
-                seg = subj["seg"]["data"].unsqueeze(0).to(self.device)
+            if getattr(self.cfg, "validate_dice", False) and self.teacher_model is not None and "seg" in batch:
+                seg = batch["seg"].to(self.device)
                 seg_unpad = unpad(seg, orig_shape)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    pred_probs = sliding_window_inference(
-                        inputs=pred_unpad,
-                        roi_size=(val_ps, val_ps, val_ps),
-                        sw_batch_size=self.cfg.val_sw_batch_size,
-                        predictor=self.teacher_model,
-                        overlap=self.cfg.val_sw_overlap,
-                        device=self.device,
-                    )
-                excl_bg = getattr(self.cfg, "dice_exclude_background", True)
-                bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
-
-                class_dices, bone_dice = get_class_dice(pred_probs, seg_unpad, mask=None, bone_idx=bone_idx)
-                met["dice_score_all"] = (class_dices[1:].mean() if excl_bg else class_dices.mean()).item()
-                if bone_dice is not None:
-                    met["dice_score_bone"] = bone_dice.item()
-
+                pred_probs = self._run_teacher_sw(pred_unpad, val_ps)
+                # Whole-volume dice (already at orig_shape, no further unpadding needed)
+                self._compute_dice_metrics(pred_probs, seg_unpad, orig_shape=None, mask_unpad=None, target_met=met)
                 if body_met is not None:
-                    class_dices_body, bone_dice_body = get_class_dice(pred_probs, seg_unpad, mask=mask_unpad, bone_idx=bone_idx)
-                    body_met["dice_score_all"] = (class_dices_body[1:].mean() if excl_bg else class_dices_body.mean()).item()
-                    if bone_dice_body is not None:
-                        body_met["dice_score_bone"] = bone_dice_body.item()
-
+                    self._compute_dice_metrics(pred_probs, seg_unpad, orig_shape=None, mask_unpad=mask_unpad, target_met=body_met)
                 del pred_probs, seg, seg_unpad
 
             for k, v in met.items():
@@ -665,38 +556,17 @@ class MAISITrainer(BaseTrainer):
                     val_metrics[f"body_{k}"].append(v)
             val_subject_ids.append(subj_id)
 
-            # Save predictions for ALL subjects (overwrite "last" each validation run)
-            save_path = None
-            if getattr(self.cfg, "save_val_volumes", True):
-                base_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.cfg.prediction_dir, self.run_name)
+            # Save predictions (overwrite "last" each val run; epoch_<N> snapshot every val_save_interval)
+            save_path = self._save_val_pred(pred_hu_unpad, batch, subj_id, epoch, already_hu=True)
 
-                pred_np = pred_hu_unpad.float().cpu().numpy().squeeze()
-                affine = subj["ct"]["affine"]
-                if hasattr(affine, "cpu"):
-                    affine = affine.cpu().numpy()
-                else:
-                    affine = np.array(affine)
-                nii = nib.Nifti1Image(pred_np, affine)
-
-                last_dir = os.path.join(base_dir, "predictions", "last")
-                os.makedirs(last_dir, exist_ok=True)
-                save_path = os.path.join(last_dir, f"pred_{subj_id}.nii.gz")
-                nib.save(nii, save_path)
-
-                val_save_interval = getattr(self.cfg, "val_save_interval", 100)
-                if val_save_interval > 0 and epoch % val_save_interval == 0:
-                    epoch_dir = os.path.join(base_dir, "predictions", f"epoch_{epoch}")
-                    os.makedirs(epoch_dir, exist_ok=True)
-                    nib.save(nii, os.path.join(epoch_dir, f"pred_{subj_id}.nii.gz"))
-
-            # Viz (only for selected subjects)
+            # Viz (only for selected subjects). Use unpadded volumes so slice picker doesn't
+            # walk into the zero-padded tail (pad-end can be >100 voxels in z).
             if i in self.val_viz_indices and self.cfg.wandb:
-                viz_metrics = {k: met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if k in met}
-                viz_body = {k: body_met[k] for k in ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone") if body_met and k in body_met} or None
-                visualize_lite(pred_matched, ct, mr, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
+                viz_metrics, viz_body = self._select_viz_metrics(met, body_met)
+                visualize_lite(pred_unpad, gt_unpad, mr_unpad, subj_id, orig_shape, self.global_step, epoch, log_name=f"viz/val_{i}", metrics=viz_metrics, body_metrics=viz_body)
 
             # Cleanup memory after each subject
-            del mr, ct, pred_latent, pred_ct_norm, gt_hu_raw, gt_hu, pred_hu, pred_matched, gt_matched, pred_unpad, gt_unpad, pred_hu_unpad, gt_hu_unpad
+            del mr, ct, pred_latent, pred_ct_norm, gt_hu_raw, gt_hu, pred_hu, pred_matched, gt_matched, pred_unpad, gt_unpad, pred_hu_unpad, gt_hu_unpad, mr_unpad
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -752,6 +622,8 @@ class MAISITrainer(BaseTrainer):
             cumulative_time = (time.time() - self.global_start_time) + (self.elapsed_time_at_resume if self.elapsed_time_at_resume else 0)
 
             if self.cfg.wandb:
+                # info/lr is logged in the per-5-steps block in train_epoch; skip here to
+                # avoid overwriting mid-epoch values at the epoch-boundary global_step.
                 wandb.log(
                     {
                         "train/total": loss,
@@ -759,7 +631,6 @@ class MAISITrainer(BaseTrainer):
                         "info/epoch_duration": ep_duration,
                         "info/val_duration": val_duration,
                         "info/cumulative_time": cumulative_time,
-                        "info/lr": self.optimizer.param_groups[0]["lr"],
                         "info/global_step": self.global_step,
                         "info/epoch": epoch,
                         "info/samples_seen": self.samples_seen,
@@ -775,15 +646,13 @@ class MAISITrainer(BaseTrainer):
             wandb.finish()
 
     def _save_maisi_checkpoint(self, epoch, is_last=False):
-        save_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) else os.path.join(self.gpfs_root, "results", "models", "maisi")
         filename = "checkpoint_last.pt" if is_last else f"maisi_epoch{epoch:05d}.pt"
         self.save_checkpoint(
             self.controlnet,
             self.optimizer,
             self.scheduler,
-            self.scaler,
             epoch,
-            os.path.join(save_dir, filename),
+            os.path.join(self._default_save_dir(), filename),
             extra_state={"scale_factor": self.scale_factor},
         )
 

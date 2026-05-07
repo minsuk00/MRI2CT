@@ -29,11 +29,11 @@ warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensi
 
 EXPERIMENT_CONFIG = [
     {
-        "val_interval": 2,
-        "steps_per_epoch": 1000,
+        "val_interval": 5,
+        "steps_per_epoch": 500,    # halved from 1000 since batch_size doubled (4→8); keeps total samples_seen
         "model_save_interval": 200,
         "total_epochs": 1000,
-        "batch_size": 4,
+        "batch_size": 8,
         "accum_steps": 1,
         "sanity_check": False,
         "run_name_prefix": "amix",
@@ -48,7 +48,7 @@ EXPERIMENT_CONFIG = [
         "validate_dice": True,
         # "enable_profiling": True,
         "enable_profiling": False,
-        "patches_per_volume": 15,
+        # "patches_per_volume": 15,
         "data_queue_max_length": 150,
         "data_queue_num_workers": 4,
         # --------------------
@@ -83,7 +83,6 @@ if __name__ == "__main__":
     parser.add_argument("--augment", type=str, choices=["True", "False"], help="Enable/disable data augmentation (True/False)")
     parser.add_argument("--pass_mri", type=str, choices=["True", "False"], help="Pass original MRI to the translator (True/False)")
     parser.add_argument("--feat_instance_norm", type=str, choices=["True", "False"], help="Enable instance norm for features (True/False)")
-    parser.add_argument("--use_zero_mask", type=str, choices=["True", "False"], help="Enable zero-masking for background (True/False)")
     parser.add_argument("--weighted_sampler", type=str, choices=["True", "False"], help="Enable/disable weighted sampler (True/False)")
     parser.add_argument("--finetune_feat", type=str, choices=["True", "False"], help="Finetune feature extractor (True/False)")
     parser.add_argument("--finetune_depth", type=int, help="Number of final layers/modules to finetune (-1 for all)")
@@ -130,8 +129,6 @@ if __name__ == "__main__":
             exp["split_file"] = args.split_file
         if args.feat_instance_norm is not None:
             exp["feat_instance_norm"] = args.feat_instance_norm == "True"
-        if args.use_zero_mask is not None:
-            exp["use_zero_mask"] = args.use_zero_mask == "True"
         if args.weighted_sampler is not None:
             exp["use_weighted_sampler"] = args.weighted_sampler == "True"
         if args.finetune_feat is not None:
