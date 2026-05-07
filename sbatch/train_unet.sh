@@ -13,27 +13,29 @@
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
 
 # --- Configuration Area ---
+# Shared knobs match amix v1.3/v1.4 exactly (BATCH_SIZE, EPOCHS, STEPS_PER_EPOCH,
+# VAL_INTERVAL, NUM_WORKERS, AUGMENT, DICE_W, DICE_BONE_W, WEIGHTED_SAMPLER).
+# Only NORM is unet-specific.
 PREFIX="unet"
 SPLIT_FILE="splits/center_wise_split.txt"
-DICE_W=0.1
-DICE_BONE_W=0.3
 AUGMENT="True"
 WEIGHTED_SAMPLER="True"
 NORM="batch"  # "batch", "instance", or "none"
-USE_CUTOUT="False"
-CUTOUT_ALPHA=1.0
+DICE_W=0.1
+DICE_BONE_W=0.3
+BATCH_SIZE=8
 EPOCHS=800
-STEPS_PER_EPOCH=1000
+STEPS_PER_EPOCH=500     # halved from 1000 since BATCH_SIZE doubled; keeps total samples_seen at 3.2M
 VAL_INTERVAL=5
 NUM_WORKERS=4
-RESUME_ID="i7beiuac"  # Leave empty if not resuming
-TAGS="thorax" # Comma-separated extra WandB tags
+RESUME_ID="9xmodnhn"  # Leave empty if not resuming
+TAGS="thorax,bs8" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
     SPLIT_NAME=$(basename "$SPLIT_FILE" .txt)
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="${PREFIX}_${SPLIT_NAME}_dice-${DICE_W}_bdice-${DICE_BONE_W}_aug-${AUGMENT}_wsmpl-${WEIGHTED_SAMPLER}_norm-${NORM}_cut-${USE_CUTOUT}_calpha-${CUTOUT_ALPHA}_ep-${EPOCHS}"
+    JOB_NAME="${PREFIX}_${SPLIT_NAME}_dice-${DICE_W}_bdice-${DICE_BONE_W}_norm-${NORM}_bs-${BATCH_SIZE}_ep-${EPOCHS}"
     if [ ! -z "$RESUME_ID" ]; then
         JOB_NAME="${JOB_NAME}_res-${RESUME_ID}"
     fi
@@ -57,7 +59,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/unet_baseline/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --use_cutout $USE_CUTOUT --cutout_alpha $CUTOUT_ALPHA --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi

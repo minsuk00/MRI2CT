@@ -13,35 +13,34 @@
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
 
 # --- Configuration Area ---
+# v1.3 and v1.4 differ ONLY by AMIX_WEIGHTS — keep the rest identical for fair comparison.
 PREFIX="amix_v1_4"
+AMIX_WEIGHTS="v1_4"
 SPLIT_FILE="splits/center_wise_split.txt"
 AUGMENT="True"
-USE_CUTOUT="False"
-CUTOUT_ALPHA=1.0
-DICE_W=0.1
-DICE_BONE_W=0.3
 PASS_MRI="True"
 FEAT_INST_NORM="True"
 INPUT_DROPOUT=0.5
-USE_ZERO_MASK="False"
 WEIGHTED_SAMPLER="True"
+DICE_W=0.1
+DICE_BONE_W=0.3
 FINETUNE_FEAT="False"
 FINETUNE_DEPTH=0
 LR_FEAT=1e-5
-AMIX_WEIGHTS="v1_4"
+BATCH_SIZE=8
 EPOCHS=800
-STEPS_PER_EPOCH=1000
+STEPS_PER_EPOCH=500     # halved from 1000 since BATCH_SIZE doubled; keeps total samples_seen at 3.2M
 VAL_INTERVAL=5
 NUM_WORKERS=4
-RESUME_ID="u5512bav" # Leave empty if not resuming
-TAGS="thorax,v1_4" # Comma-separated extra WandB tags
+RESUME_ID="xm2d3jjo" # Leave empty if not resuming
+TAGS="thorax,v1_4,bs8" # Comma-separated extra WandB tags
 
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
     SPLIT_NAME=$(basename "$SPLIT_FILE" .txt)
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="${PREFIX}_${SPLIT_NAME}_amix-${AMIX_WEIGHTS}_dice-${DICE_W}_bdice-${DICE_BONE_W}_aug-${AUGMENT}_mri-${PASS_MRI}_inorm-${FEAT_INST_NORM}_zmask-${USE_ZERO_MASK}_wsmpl-${WEIGHTED_SAMPLER}_ftune-${FINETUNE_FEAT}_fdepth-${FINETUNE_DEPTH}_drop-${INPUT_DROPOUT}_cut-${USE_CUTOUT}_calpha-${CUTOUT_ALPHA}_ep-${EPOCHS}"
+    JOB_NAME="${PREFIX}_${SPLIT_NAME}_dice-${DICE_W}_bdice-${DICE_BONE_W}_mri-${PASS_MRI}_inorm-${FEAT_INST_NORM}_drop-${INPUT_DROPOUT}_bs-${BATCH_SIZE}_ep-${EPOCHS}"
     if [ ! -z "$RESUME_ID" ]; then
         JOB_NAME="${JOB_NAME}_res-${RESUME_ID}"
     fi
@@ -65,7 +64,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/amix/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --amix_weights $AMIX_WEIGHTS --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --pass_mri $PASS_MRI --feat_instance_norm $FEAT_INST_NORM --use_zero_mask $USE_ZERO_MASK --weighted_sampler $WEIGHTED_SAMPLER --finetune_feat $FINETUNE_FEAT --finetune_depth $FINETUNE_DEPTH --lr_feat $LR_FEAT --input_dropout_p $INPUT_DROPOUT --use_cutout $USE_CUTOUT --cutout_alpha $CUTOUT_ALPHA --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --amix_weights $AMIX_WEIGHTS --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --pass_mri $PASS_MRI --feat_instance_norm $FEAT_INST_NORM --weighted_sampler $WEIGHTED_SAMPLER --finetune_feat $FINETUNE_FEAT --finetune_depth $FINETUNE_DEPTH --lr_feat $LR_FEAT --input_dropout_p $INPUT_DROPOUT --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi
