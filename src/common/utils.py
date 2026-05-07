@@ -241,7 +241,7 @@ def unpad(data, original_shape, offset=0):
     return data[..., offset : offset + w_orig, offset : offset + h_orig, offset : offset + d_orig]
 
 
-def compute_metrics(pred, target, data_range=1.0):
+def compute_metrics(pred, target, data_range=1.0, hu_range=2048):
     if pred.ndim != 5 or target.ndim != 5:
         raise ValueError(f"Expected (B, C, D, H, W), got {pred.shape}")
 
@@ -270,32 +270,21 @@ def compute_metrics(pred, target, data_range=1.0):
     targ_dz, targ_dy, targ_dx = get_gradients(target)
     grad_diff = (torch.mean(torch.abs(pred_dz - targ_dz)) + torch.mean(torch.abs(pred_dy - targ_dy)) + torch.mean(torch.abs(pred_dx - targ_dx))).item()
 
-    # 3. Bone Dice Coefficient (Structure Metric)
-    bone_thresh = 0.7
-    pred_bone = (pred > bone_thresh).float()
-    targ_bone = (target > bone_thresh).float()
-    intersection = (pred_bone * targ_bone).sum()
-    union = pred_bone.sum() + targ_bone.sum()
-    # Smooth Dice (Add epsilon to avoid division by zero)
-    dice_score = (2.0 * intersection + 1e-5) / (union + 1e-5)
-    dice_val = dice_score.item()
-
     mae_val = torch.mean(torch.abs(pred - target)).item()
 
     return {
-        "mae": mae_val,
-        "mae_hu": mae_val * 2048.0,
+        "mae_hu": mae_val * hu_range,
         "psnr": torch.mean(psnr).item(),
         "ssim": ssim_val,
         "grad_diff": grad_diff,
-        "dice_score_bone_threshold": dice_val,  # Thresholded metric (naive)
     }
 
 
-def compute_metrics_body(pred, target, mask):
+def compute_metrics_body(pred, target, mask, hu_range=2048):
     """Like compute_metrics but with background zeroed out in both pred and target.
     All metrics (MAE, PSNR, SSIM) are computed on the full volume after zeroing.
-    Returns: {mae, mae_hu, psnr, ssim}
+    `hu_range` is the data-space range (e.g., 2048 for [-1024,1024], 2000 for [-1000,1000]).
+    Returns: {mae_hu, psnr, ssim}
     """
     mask_float = mask.float()
     pred_m = pred * mask_float
@@ -310,7 +299,7 @@ def compute_metrics_body(pred, target, mask):
     mse = torch.mean((pred_m - targ_m) ** 2).clamp(min=1e-10)
     psnr = (10 * torch.log10(torch.tensor(1.0) / mse)).item()
 
-    return {"mae": mae_val, "mae_hu": mae_val * 2048.0, "psnr": psnr, "ssim": ssim_val}
+    return {"mae_hu": mae_val * hu_range, "psnr": psnr, "ssim": ssim_val}
 
 
 def visualize_lite(pred, ct, mri, subj_id, shape, step, epoch, offset=0, log_name=None, metrics=None, body_metrics=None):

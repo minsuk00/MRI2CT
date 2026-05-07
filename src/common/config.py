@@ -25,10 +25,13 @@ DEFAULT_CONFIG = {
     "project_name": "mri2ct",
     # Data
     "split_file": "splits/center_wise_split.txt",
-    "stage_data": True,
+    # Upfront NIfTI rsync GPFS->/tmp is now redundant: PersistentDataset caches
+    # preprocessed tensors on /tmp during epoch 0 (~3-4 min in workers, ~55 GB
+    # at fp16 for ~600 subjects). Old staging duplicated raw NIfTIs (~18 GB).
+    "stage_data": False,
     "augment": True,
     "patch_size": 128,
-    "patches_per_volume": 10,
+    "patches_per_volume": 1,
     "data_queue_max_length": 100,
     "data_queue_num_workers": 4,
     "anatomix_weights": "v1_3",  # "v1", "v1_2", "v1_3"
@@ -36,7 +39,10 @@ DEFAULT_CONFIG = {
     "res_mult": 32,
     "analyze_shapes": True,
     "enable_profiling": False,
-    "use_float16_storage": False,
+    # Monitoring (RAM/VRAM/timings logged to wandb under monitoring/)
+    "monitor_resources": True,
+    "monitor_interval": 10,  # log every N steps; covers worker children via psutil PSS
+    "use_float16_storage": True,  # Halves PersistentDataset cache size (~104GB->55GB) and warmup time. mri/ct in [0,1] don't need fp32.
     "enforce_ras": True,
     "mri_norm": "minmax",  # "minmax" or "percentile" (0.0–99.5, same as MAISI)
     # Training
@@ -60,11 +66,10 @@ DEFAULT_CONFIG = {
     "total_epochs": 5001,
     "dropout": 0,
     # CNN Specifics
-    "batch_size": 4,
+    "batch_size": 4,  # volumes per batch in MONAI trainers; effective patch batch = batch_size * patches_per_volume
     "final_activation": "sigmoid",
     "use_weighted_sampler": True,
     "pass_mri_to_translator": False,
-    "use_zero_mask": False,
     "n_classes": 12,  # 11 Organs + Brain
     # Sliding Window & Viz Options
     "val_patch_size": 256,
