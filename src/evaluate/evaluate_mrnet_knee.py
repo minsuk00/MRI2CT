@@ -6,8 +6,16 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import torch
-import torchio as tio
 from monai.inferers import sliding_window_inference
+from monai.transforms import (
+    Compose,
+    DivisiblePad,
+    EnsureChannelFirst,
+    LoadImage,
+    Orientation,
+    ScaleIntensity,
+    SpatialPad,
+)
 
 # Add project root and src to path
 SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,7 +25,6 @@ sys.path.append(SRC_ROOT)
 
 from anatomix.model.network import Unet
 
-from common.data import DataPreprocessing
 from common.utils import unpad
 
 
@@ -142,33 +149,36 @@ def main():
             continue
 
         print(f"\n📂 Processing {plane.upper()}...")
-        mri_img = tio.ScalarImage(mri_path)
-        affine = mri_img.affine
+        # MRI-only MONAI preprocessing (matches get_cached_transforms with no CT, no mask).
+        pre_pad = Compose([
+            LoadImage(image_only=True),
+            EnsureChannelFirst(),
+            Orientation(axcodes="RAS"),
+            ScaleIntensity(minv=0.0, maxv=1.0),
+        ])
+        img = pre_pad(mri_path)
+        orig_shape = list(img.shape[1:])
+        affine = np.asarray(img.affine.cpu()) if hasattr(img.affine, "cpu") else np.asarray(img.affine)
 
-        dummy_ct = tio.ScalarImage(tensor=torch.zeros_like(mri_img.data), affine=affine)
-        subj = tio.Subject(mri=mri_img, ct=dummy_ct)
-
-        preprocess = DataPreprocessing(patch_size=args.patch_size, res_mult=32)
-        subj_prep = preprocess(subj)
-
-        mri_tensor = subj_prep["mri"][tio.DATA].unsqueeze(0).to(device)
-        orig_shape = subj_prep["original_shape"].tolist()
-        pad_offset = int(subj_prep["pad_offset"])
+        img_padded = DivisiblePad(k=32, method="end", mode="constant")(
+            SpatialPad(spatial_size=(args.patch_size,) * 3, method="end", mode="constant")(img)
+        )
+        mri_tensor = img_padded.unsqueeze(0).float().to(device)
 
         with torch.autocast(device_type="cuda" if "cuda" in str(device) else "cpu", dtype=torch.bfloat16):
             p_unet = sliding_window_inference(mri_tensor, roi_size, 4, unet_model, overlap=args.overlap)
             p_amix = sliding_window_inference(mri_tensor, roi_size, 4, amix_forward, overlap=args.overlap)
 
-        p_unet_unpad = unpad(p_unet, orig_shape, pad_offset).squeeze().float().cpu().numpy()
+        p_unet_unpad = unpad(p_unet, orig_shape).squeeze().float().cpu().numpy()
         p_unet_hu = (p_unet_unpad * 2048.0) - 1024.0
 
-        p_amix_unpad = unpad(p_amix, orig_shape, pad_offset).squeeze().float().cpu().numpy()
+        p_amix_unpad = unpad(p_amix, orig_shape).squeeze().float().cpu().numpy()
         p_amix_hu = (p_amix_unpad * 2048.0) - 1024.0
 
         nib.save(nib.Nifti1Image(p_unet_hu, affine), os.path.join(out_subj_dir, f"pred_ct_unet_{plane}.nii.gz"))
         nib.save(nib.Nifti1Image(p_amix_hu, affine), os.path.join(out_subj_dir, f"pred_ct_amix_{plane}.nii.gz"))
 
-        mri_data = mri_img.data.squeeze().numpy()
+        mri_data = unpad(img_padded, orig_shape).squeeze().cpu().numpy()
         viz_path = os.path.join(out_subj_dir, f"comparison_3view_{plane}.png")
         create_comparison_figure(mri_data, p_unet_hu, p_amix_hu, args.subj_id, plane, viz_path)
 

@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-import torchio as tio
+from monai.data import DataLoader, PersistentDataset
 from tqdm import tqdm
 
 # Path setup
@@ -30,7 +30,7 @@ sys.path.insert(0, _SRC_DIR)
 sys.path.insert(0, os.path.join(_REPO_DIR, "MC-DDPM"))
 
 from common.config import DEFAULT_CONFIG
-from common.data import DataPreprocessing, build_tio_subjects, get_split_subjects
+from common.data import build_data_dicts, default_monai_cache_dir, get_cached_transforms, get_split_subjects
 from common.loss import get_class_dice
 from common.utils import clean_state_dict, compute_metrics, compute_metrics_body, unpad
 
@@ -39,15 +39,6 @@ _GPFS_ROOT = DEFAULT_CONFIG["root_dir"]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _get_pad_offset(batch):
-    po = batch.get("pad_offset", 0)
-    if torch.is_tensor(po):
-        return int(po[0])
-    if isinstance(po, (list, tuple)):
-        return int(po[0])
-    return int(po)
 
 
 def _resolve_root_dir(cfg_root: str, override: str = None) -> str:
@@ -60,22 +51,33 @@ def _resolve_root_dir(cfg_root: str, override: str = None) -> str:
     return _GPFS_ROOT
 
 
-def _check_masks(root_dir, val_subjects):
-    """Returns set of subject IDs that have a real mask.nii.gz file. Warns about missing ones."""
-    has_mask = set()
-    for sid in val_subjects:
-        subj_dir = os.path.join(root_dir, sid)
-        if os.path.exists(os.path.join(subj_dir, "mask.nii.gz")) or os.path.exists(os.path.join(subj_dir, "mask.nii")):
-            has_mask.add(sid)
-        else:
-            print(f"  [WARNING] mask.nii.gz not found for {sid} — will use full-volume metrics for this subject.")
-    return has_mask
-
-
-def _build_val_loader(root_dir, val_subjects, preprocess, load_mask=False, load_seg=False):
-    val_objs = build_tio_subjects(root_dir, val_subjects, load_seg=load_seg, use_weighted_sampler=load_mask)
-    val_ds = tio.SubjectsDataset(val_objs, transform=preprocess)
-    return tio.SubjectsLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+def _build_val_loader(
+    root_dir,
+    val_subjects,
+    *,
+    patch_size: int,
+    res_mult: int,
+    enforce_ras: bool = True,
+    mri_norm: str = "minmax",
+    ct_range: tuple = (-1024, 1024),
+    load_mask: bool = False,
+    load_seg: bool = False,
+):
+    """Full-volume MONAI val loader (cached preproc, no random crop, no augment)."""
+    dicts = build_data_dicts(root_dir, val_subjects, load_seg=load_seg, load_body_mask=load_mask)
+    cached = get_cached_transforms(
+        patch_size=patch_size,
+        res_mult=res_mult,
+        enforce_ras=enforce_ras,
+        mri_norm=mri_norm,
+        ct_range=ct_range,
+        load_seg=load_seg,
+        load_body_mask=load_mask,
+    )
+    cache_dir = default_monai_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    ds = PersistentDataset(data=dicts, transform=cached, cache_dir=cache_dir)
+    return DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
 
 def _compute_teacher_dice(pred_unpad, seg_unpad, teacher_model, patch_size, val_sw_batch_size, val_sw_overlap, device, cfg, body_mask_tensor=None):
@@ -199,17 +201,23 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
     translator.load_state_dict(clean_state_dict(ckpt["model_state_dict"]))
     translator.eval()
 
-    subjects_with_mask = _check_masks(root_dir, val_subjects) if body_mask else set()
-    preprocess = DataPreprocessing(patch_size=patch_size, res_mult=res_mult, use_weighted_sampler=body_mask)
-    val_loader = _build_val_loader(root_dir, val_subjects, preprocess, load_mask=body_mask, load_seg=teacher_model is not None)
+    val_loader = _build_val_loader(
+        root_dir,
+        val_subjects,
+        patch_size=patch_size,
+        res_mult=res_mult,
+        enforce_ras=cfg.get("enforce_ras", True),
+        mri_norm=cfg.get("mri_norm", "minmax"),
+        load_mask=body_mask,
+        load_seg=teacher_model is not None,
+    )
 
     val_metrics = defaultdict(list)
     for batch in tqdm(val_loader, desc="[AMIX] Validating", leave=False):
-        mri = batch["mri"][tio.DATA].to(device)
-        ct = batch["ct"][tio.DATA].to(device)
+        mri = batch["mri"].to(device)
+        ct = batch["ct"].to(device)
         orig_shape = batch["original_shape"][0].tolist()
-        pad_offset = _get_pad_offset(batch)
-        subj_id = batch["subj_id"][0] if isinstance(batch["subj_id"], (list, tuple)) else batch["subj_id"]
+        subj_id = batch["subj_id"][0]
 
         def combined_forward(x):
             f = feat_extractor(x)
@@ -229,17 +237,17 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
                 device=device,
             )
 
-        pred_unpad = unpad(pred, orig_shape, pad_offset)
-        ct_unpad = unpad(ct, orig_shape, pad_offset)
+        pred_unpad = unpad(pred, orig_shape)
+        ct_unpad = unpad(ct, orig_shape)
         mask_unpad = None
-        if body_mask and subj_id in subjects_with_mask and "prob_map" in batch:
-            mask_unpad = unpad(batch["prob_map"][tio.DATA].to(device), orig_shape, pad_offset)
+        if body_mask and "body_mask" in batch:
+            mask_unpad = unpad(batch["body_mask"].to(device), orig_shape)
             met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad)
         else:
             met = compute_metrics(pred_unpad, ct_unpad)
 
         if teacher_model is not None and "seg" in batch:
-            seg_unpad = unpad(batch["seg"][tio.DATA].to(device), orig_shape, pad_offset)
+            seg_unpad = unpad(batch["seg"].to(device), orig_shape)
             met.update(_compute_teacher_dice(pred_unpad, seg_unpad, teacher_model, patch_size, val_sw_batch_size, val_sw_overlap, device, cfg, body_mask_tensor=mask_unpad))
 
         for k, v in met.items():
@@ -301,17 +309,23 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
         else:
             print(f"  [UNet] Warning: validate_dice=True but teacher_weights_path not found ({teacher_weights}). Skipping dice.")
 
-    subjects_with_mask = _check_masks(root_dir, val_subjects) if body_mask else set()
-    preprocess = DataPreprocessing(patch_size=patch_size, res_mult=res_mult, use_weighted_sampler=body_mask)
-    val_loader = _build_val_loader(root_dir, val_subjects, preprocess, load_mask=body_mask, load_seg=teacher_model is not None)
+    val_loader = _build_val_loader(
+        root_dir,
+        val_subjects,
+        patch_size=patch_size,
+        res_mult=res_mult,
+        enforce_ras=cfg.get("enforce_ras", True),
+        mri_norm=cfg.get("mri_norm", "minmax"),
+        load_mask=body_mask,
+        load_seg=teacher_model is not None,
+    )
 
     val_metrics = defaultdict(list)
     for batch in tqdm(val_loader, desc="[UNet] Validating", leave=False):
-        mri = batch["mri"][tio.DATA].to(device)
-        ct = batch["ct"][tio.DATA].to(device)
+        mri = batch["mri"].to(device)
+        ct = batch["ct"].to(device)
         orig_shape = batch["original_shape"][0].tolist()
-        pad_offset = _get_pad_offset(batch)
-        subj_id = batch["subj_id"][0] if isinstance(batch["subj_id"], (list, tuple)) else batch["subj_id"]
+        subj_id = batch["subj_id"][0]
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = sliding_window_inference(
@@ -323,17 +337,17 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
                 device=device,
             )
 
-        pred_unpad = unpad(pred, orig_shape, pad_offset)
-        ct_unpad = unpad(ct, orig_shape, pad_offset)
+        pred_unpad = unpad(pred, orig_shape)
+        ct_unpad = unpad(ct, orig_shape)
         mask_unpad = None
-        if body_mask and subj_id in subjects_with_mask and "prob_map" in batch:
-            mask_unpad = unpad(batch["prob_map"][tio.DATA].to(device), orig_shape, pad_offset)
+        if body_mask and "body_mask" in batch:
+            mask_unpad = unpad(batch["body_mask"].to(device), orig_shape)
             met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad)
         else:
             met = compute_metrics(pred_unpad, ct_unpad)
 
         if teacher_model is not None and "seg" in batch:
-            seg_unpad = unpad(batch["seg"][tio.DATA].to(device), orig_shape, pad_offset)
+            seg_unpad = unpad(batch["seg"].to(device), orig_shape)
             met.update(_compute_teacher_dice(pred_unpad, seg_unpad, teacher_model, patch_size, val_sw_batch_size, val_sw_overlap, device, cfg, body_mask_tensor=mask_unpad))
 
         for k, v in met.items():
@@ -417,13 +431,15 @@ def validate_mcddpm(ckpt_path: str, val_subjects: list, device: torch.device, ro
     model.eval()
 
     patch_size_scalar = max(patch_size) if isinstance(patch_size, (list, tuple)) else patch_size
-    preprocess = DataPreprocessing(
+    val_loader = _build_val_loader(
+        root_dir,
+        val_subjects,
         patch_size=patch_size_scalar,
         res_mult=1,
         enforce_ras=False,
-        use_weighted_sampler=body_mask,
+        mri_norm=cfg.get("mri_norm", "minmax"),
+        load_mask=body_mask,
     )
-    val_loader = _build_val_loader(root_dir, val_subjects, preprocess, load_mask=body_mask)
 
     inferer = SlidingWindowInferer(
         roi_size=patch_size,
@@ -438,20 +454,19 @@ def validate_mcddpm(ckpt_path: str, val_subjects: list, device: torch.device, ro
 
     val_metrics = defaultdict(list)
     for batch in tqdm(val_loader, desc="[MCDDPM] Validating", leave=False):
-        mri = batch["mri"][tio.DATA].to(device)
-        ct = batch["ct"][tio.DATA].to(device)
+        mri = batch["mri"].to(device)
+        ct = batch["ct"].to(device)
         orig_shape = batch["original_shape"][0].tolist()
-        pad_offset = _get_pad_offset(batch)
 
         mri_scaled = mri * 2.0 - 1.0
         with torch.amp.autocast("cuda"):
             pred = inferer(mri_scaled, diffusion_sampling)
         pred = torch.clamp((pred + 1.0) / 2.0, 0.0, 1.0)
 
-        pred_unpad = unpad(pred, orig_shape, pad_offset)
-        ct_unpad = unpad(ct, orig_shape, pad_offset)
-        if body_mask and "prob_map" in batch:
-            mask_unpad = unpad(batch["prob_map"][tio.DATA].to(device), orig_shape, pad_offset)
+        pred_unpad = unpad(pred, orig_shape)
+        ct_unpad = unpad(ct, orig_shape)
+        if body_mask and "body_mask" in batch:
+            mask_unpad = unpad(batch["body_mask"].to(device), orig_shape)
             met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad)
         else:
             met = compute_metrics(pred_unpad, ct_unpad)
@@ -481,7 +496,6 @@ def validate_maisi(ckpt_path: str, val_subjects: list, split_file: str, device: 
     config["wandb"] = False
     config["stage_data"] = False
     config["root_dir"] = _resolve_root_dir(config.get("root_dir"), root_dir_override)
-    config["use_weighted_sampler"] = body_mask  # load body mask for masked metrics
     config["sanity_check"] = False
     config["resume_wandb_id"] = None
     config["augment"] = False
@@ -616,7 +630,7 @@ if __name__ == "__main__":
             results.append({"label": model_type, "ckpt_name": ckpt_name, "ckpt_path": ckpt_path, "metrics": metrics})
 
             # Print per-model summary
-            key_metrics = {k: metrics.get(k) for k in ["mae_hu", "ssim", "psnr", "dice_score_bone_threshold"] if k in metrics}
+            key_metrics = {k: metrics.get(k) for k in ["mae_hu", "ssim", "psnr", "dice_score_bone"] if k in metrics}
             print(f"  {key_metrics}")
 
         except Exception as e:

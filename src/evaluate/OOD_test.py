@@ -19,8 +19,17 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import torch
-import torchio as tio
 from monai.inferers import sliding_window_inference
+from monai.transforms import (
+    Compose,
+    DivisiblePad,
+    EnsureChannelFirst,
+    LoadImage,
+    Orientation,
+    ScaleIntensity,
+    ScaleIntensityRangePercentiles,
+    SpatialPad,
+)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(PROJECT_ROOT)
@@ -28,7 +37,6 @@ sys.path.append(os.path.join(PROJECT_ROOT, "src"))
 
 from anatomix.model.network import Unet
 
-from common.data import DataPreprocessing
 from common.utils import clean_state_dict, unpad
 
 # ─── configuration ───────────────────────────────────────────────────────────
@@ -66,30 +74,31 @@ OUTPUT_BASE = os.path.join(PROJECT_ROOT, "evaluation_results", "OOD_inference")
 
 # ─── preprocessing ────────────────────────────────────────────────────────────
 def preprocess_volume(vol_path, cfg):
-    """Load and preprocess an MRI volume using the same DataPreprocessing as training."""
-    nii = nib.load(vol_path)
-    mri_data = torch.from_numpy(nii.get_fdata(dtype=np.float32)).unsqueeze(0)  # (1,X,Y,Z)
+    """MRI-only MONAI pipeline matching `get_cached_transforms` (no CT, no mask)."""
+    patch_size = cfg.get("patch_size", 128)
+    res_mult = cfg.get("res_mult", 32)
+    mri_norm = cfg.get("mri_norm", "minmax")
 
-    # DataPreprocessing normalizes both mri and ct; pass a dummy ct (zeros)
-    subject = tio.Subject(
-        mri=tio.ScalarImage(tensor=mri_data, affine=nii.affine),
-        ct=tio.ScalarImage(tensor=torch.zeros_like(mri_data), affine=nii.affine),
+    if mri_norm == "percentile":
+        norm = ScaleIntensityRangePercentiles(lower=0.0, upper=99.5, b_min=0.0, b_max=1.0, clip=True)
+    else:
+        norm = ScaleIntensity(minv=0.0, maxv=1.0)
+
+    # Stage 1: load + reorient + normalize (need post-RAS pre-pad shape for unpad).
+    pre_pad = Compose([
+        LoadImage(image_only=True),
+        EnsureChannelFirst(),
+        Orientation(axcodes="RAS"),
+        norm,
+    ])
+    img = pre_pad(vol_path)
+    orig_shape = list(img.shape[1:])
+    # Stage 2: pad.
+    img = DivisiblePad(k=res_mult, method="end", mode="constant")(
+        SpatialPad(spatial_size=(patch_size,) * 3, method="end", mode="constant")(img)
     )
-
-    preprocess = DataPreprocessing(
-        patch_size=cfg.get("patch_size", 128),
-        res_mult=cfg.get("res_mult", 32),
-        use_weighted_sampler=False,
-        enforce_ras=True,
-        mri_norm=cfg.get("mri_norm", "minmax"),
-    )
-    subject = preprocess(subject)
-
-    mri_tensor = subject["mri"].data.float()  # (1,X',Y',Z')
-    orig_shape = subject["original_shape"].tolist()
-    pad_offset = int(subject["pad_offset"])
-    affine = subject["mri"].affine  # RAS-reoriented affine
-    return mri_tensor, orig_shape, pad_offset, affine
+    affine = np.asarray(img.affine.cpu()) if hasattr(img.affine, "cpu") else np.asarray(img.affine)
+    return img.float(), orig_shape, affine
 
 
 # ─── model loading ────────────────────────────────────────────────────────────
@@ -158,7 +167,6 @@ def load_model(ckpt_path, device):
 def make_amix_forward(feat_extractor, translator, cfg):
     feat_in = cfg.get("feat_instance_norm", False)
     feat_scale = cfg.get("feat_scale_down", 1)
-    zero_mask = cfg.get("use_zero_mask", False)
     pass_mri = cfg.get("pass_mri_to_translator", False)
 
     def forward(x):
@@ -168,8 +176,6 @@ def make_amix_forward(feat_extractor, translator, cfg):
             f = torch.nn.functional.instance_norm(f)
         if feat_scale != 1:
             f = f / feat_scale
-        if zero_mask:
-            f = f * (x > 0.01).to(x.dtype)
         if pass_mri:
             f = torch.cat([f, x], dim=1)
         return translator(f)
@@ -248,14 +254,14 @@ def main():
 
             for vol_name, vol_path in chaos_vols.items():
                 print(f"  [{vol_name}] preprocessing...")
-                mri_tensor, orig_shape, pad_offset, affine = preprocess_volume(vol_path, cfg)
+                mri_tensor, orig_shape, affine = preprocess_volume(vol_path, cfg)
                 mri_tensor = mri_tensor.unsqueeze(0).to(device)  # (1,1,X',Y',Z')
 
                 print(f"    Shape: {list(mri_tensor.shape[2:])}, running inference...")
                 pred = run_inference(model, feat_extractor, cfg, mri_tensor, device)
 
-                pred_unpad = unpad(pred, orig_shape, pad_offset)
-                mri_unpad = unpad(mri_tensor, orig_shape, pad_offset)
+                pred_unpad = unpad(pred, orig_shape)
+                mri_unpad = unpad(mri_tensor, orig_shape)
 
                 pred_np = pred_unpad.float().squeeze().cpu().numpy()  # (X,Y,Z) in [0,1]
                 pred_hu = pred_np * 2048.0 - 1024.0

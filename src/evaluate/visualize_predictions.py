@@ -26,11 +26,10 @@ import warnings
 import matplotlib
 import numpy as np
 import torch
-import torchio as tio
+from monai.data import DataLoader, PersistentDataset
 
 matplotlib.use("Agg")
 warnings.filterwarnings("ignore", category=UserWarning, module="monai.utils.module")
-warnings.filterwarnings("ignore", message=".*SubjectsLoader in PyTorch >= 2.3.*")
 
 _SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _REPO_DIR = os.path.abspath(os.path.join(_SRC_DIR, ".."))
@@ -38,7 +37,13 @@ sys.path.insert(0, _SRC_DIR)
 sys.path.insert(0, os.path.join(_REPO_DIR, "MC-DDPM"))
 
 from common.config import DEFAULT_CONFIG
-from common.data import DataPreprocessing, build_tio_subjects, get_region_key, get_split_subjects
+from common.data import (
+    build_data_dicts,
+    default_monai_cache_dir,
+    get_cached_transforms,
+    get_region_key,
+    get_split_subjects,
+)
 from common.utils import clean_state_dict, unpad
 
 _GPFS_ROOT = DEFAULT_CONFIG["root_dir"]
@@ -70,15 +75,6 @@ DEFAULT_SUBJECTS = [
 # ---------------------------------------------------------------------------
 # Helpers shared with evaluate_models.py
 # ---------------------------------------------------------------------------
-
-
-def _get_pad_offset(batch):
-    po = batch.get("pad_offset", 0)
-    if torch.is_tensor(po):
-        return int(po[0])
-    if isinstance(po, (list, tuple)):
-        return int(po[0])
-    return int(po)
 
 
 def _resolve_root_dir(cfg_root, override=None):
@@ -138,12 +134,12 @@ def _select_subjects(root_dir, split_file=None):
 # ---------------------------------------------------------------------------
 
 
-def _load_subject_batch(root_dir, subj_id, patch_size, res_mult, body_mask):
-    """Load a single subject through DataPreprocessing. Returns (batch_dict, ct_affine)."""
+def _load_subject_batch(root_dir, subj_id, patch_size, res_mult, body_mask, mri_norm="minmax", enforce_ras=True):
+    """Load a single subject via the MONAI cached pipeline. Returns (batch, ct_affine)."""
     import nibabel as nib
 
-    subj_objs = build_tio_subjects(root_dir, [subj_id], use_weighted_sampler=body_mask)
-    if not subj_objs:
+    dicts = build_data_dicts(root_dir, [subj_id], load_seg=False, load_body_mask=body_mask)
+    if not dicts:
         raise RuntimeError(f"Could not build subject {subj_id} from {root_dir}")
 
     ct_path = os.path.join(root_dir, subj_id, "ct.nii.gz")
@@ -151,9 +147,18 @@ def _load_subject_batch(root_dir, subj_id, patch_size, res_mult, body_mask):
         ct_path = os.path.join(root_dir, subj_id, "ct.nii")
     affine = nib.load(ct_path).affine
 
-    preprocess = DataPreprocessing(patch_size=patch_size, res_mult=res_mult, use_weighted_sampler=body_mask)
-    ds = tio.SubjectsDataset(subj_objs, transform=preprocess)
-    loader = tio.SubjectsLoader(ds, batch_size=1, shuffle=False, num_workers=0)
+    cached = get_cached_transforms(
+        patch_size=patch_size,
+        res_mult=res_mult,
+        enforce_ras=enforce_ras,
+        mri_norm=mri_norm,
+        load_seg=False,
+        load_body_mask=body_mask,
+    )
+    cache_dir = default_monai_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    ds = PersistentDataset(data=dicts, transform=cached, cache_dir=cache_dir)
+    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
     batch = next(iter(loader))
     return batch, affine
 
@@ -205,11 +210,14 @@ def _infer_amix(ckpt_path, subj_id, root_dir, device, body_mask):
     translator.load_state_dict(clean_state_dict(ckpt["model_state_dict"]))
     translator.eval()
 
-    batch, affine = _load_subject_batch(root_dir, subj_id, patch_size, res_mult, body_mask)
-    mri = batch["mri"][tio.DATA].to(device)
-    ct = batch["ct"][tio.DATA].to(device)
+    batch, affine = _load_subject_batch(
+        root_dir, subj_id, patch_size, res_mult, body_mask,
+        mri_norm=cfg.get("mri_norm", "minmax"),
+        enforce_ras=cfg.get("enforce_ras", True),
+    )
+    mri = batch["mri"].to(device)
+    ct = batch["ct"].to(device)
     orig_shape = batch["original_shape"][0].tolist()
-    pad_offset = _get_pad_offset(batch)
 
     def combined_forward(x, _fe=feat_extractor, _tr=translator):
         f = _fe(x)
@@ -230,10 +238,10 @@ def _infer_amix(ckpt_path, subj_id, root_dir, device, body_mask):
         )
 
     result = {
-        "pred": unpad(pred, orig_shape, pad_offset).cpu().float(),
-        "ct": unpad(ct, orig_shape, pad_offset).cpu().float(),
-        "mri": unpad(mri, orig_shape, pad_offset).cpu().float(),
-        "mask": unpad(batch["prob_map"][tio.DATA].to(device), orig_shape, pad_offset).cpu().float() if body_mask and "prob_map" in batch else None,
+        "pred": unpad(pred, orig_shape).cpu().float(),
+        "ct": unpad(ct, orig_shape).cpu().float(),
+        "mri": unpad(mri, orig_shape).cpu().float(),
+        "mask": unpad(batch["body_mask"].to(device), orig_shape).cpu().float() if body_mask and "body_mask" in batch else None,
         "affine": affine,
     }
     del feat_extractor, translator, mri, ct, pred
@@ -262,11 +270,14 @@ def _infer_unet(ckpt_path, subj_id, root_dir, device, body_mask):
     model.load_state_dict(clean_state_dict(ckpt["model_state_dict"]))
     model.eval()
 
-    batch, affine = _load_subject_batch(root_dir, subj_id, patch_size, res_mult, body_mask)
-    mri = batch["mri"][tio.DATA].to(device)
-    ct = batch["ct"][tio.DATA].to(device)
+    batch, affine = _load_subject_batch(
+        root_dir, subj_id, patch_size, res_mult, body_mask,
+        mri_norm=cfg.get("mri_norm", "minmax"),
+        enforce_ras=cfg.get("enforce_ras", True),
+    )
+    mri = batch["mri"].to(device)
+    ct = batch["ct"].to(device)
     orig_shape = batch["original_shape"][0].tolist()
-    pad_offset = _get_pad_offset(batch)
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         pred = sliding_window_inference(
@@ -279,10 +290,10 @@ def _infer_unet(ckpt_path, subj_id, root_dir, device, body_mask):
         )
 
     result = {
-        "pred": unpad(pred, orig_shape, pad_offset).cpu().float(),
-        "ct": unpad(ct, orig_shape, pad_offset).cpu().float(),
-        "mri": unpad(mri, orig_shape, pad_offset).cpu().float(),
-        "mask": unpad(batch["prob_map"][tio.DATA].to(device), orig_shape, pad_offset).cpu().float() if body_mask and "prob_map" in batch else None,
+        "pred": unpad(pred, orig_shape).cpu().float(),
+        "ct": unpad(ct, orig_shape).cpu().float(),
+        "mri": unpad(mri, orig_shape).cpu().float(),
+        "mask": unpad(batch["body_mask"].to(device), orig_shape).cpu().float() if body_mask and "body_mask" in batch else None,
         "affine": affine,
     }
     del model, mri, ct, pred
@@ -350,11 +361,14 @@ def _infer_mcddpm(ckpt_path, subj_id, root_dir, device, body_mask):
     model.eval()
 
     patch_size_scalar = max(patch_size) if isinstance(patch_size, (list, tuple)) else patch_size
-    batch, affine = _load_subject_batch(root_dir, subj_id, patch_size_scalar, 1, body_mask)
-    mri = batch["mri"][tio.DATA].to(device)
-    ct = batch["ct"][tio.DATA].to(device)
+    batch, affine = _load_subject_batch(
+        root_dir, subj_id, patch_size_scalar, 1, body_mask,
+        mri_norm=cfg.get("mri_norm", "minmax"),
+        enforce_ras=False,
+    )
+    mri = batch["mri"].to(device)
+    ct = batch["ct"].to(device)
     orig_shape = batch["original_shape"][0].tolist()
-    pad_offset = _get_pad_offset(batch)
 
     inferer = SlidingWindowInferer(roi_size=patch_size, sw_batch_size=val_sw_batch_size, overlap=val_sw_overlap, mode="constant")
 
@@ -368,10 +382,10 @@ def _infer_mcddpm(ckpt_path, subj_id, root_dir, device, body_mask):
     pred = torch.clamp((pred + 1.0) / 2.0, 0.0, 1.0)
 
     result = {
-        "pred": unpad(pred, orig_shape, pad_offset).cpu().float(),
-        "ct": unpad(ct, orig_shape, pad_offset).cpu().float(),
-        "mri": unpad(mri, orig_shape, pad_offset).cpu().float(),
-        "mask": unpad(batch["prob_map"][tio.DATA].to(device), orig_shape, pad_offset).cpu().float() if body_mask and "prob_map" in batch else None,
+        "pred": unpad(pred, orig_shape).cpu().float(),
+        "ct": unpad(ct, orig_shape).cpu().float(),
+        "mri": unpad(mri, orig_shape).cpu().float(),
+        "mask": unpad(batch["body_mask"].to(device), orig_shape).cpu().float() if body_mask and "body_mask" in batch else None,
         "affine": affine,
     }
     del model, mri, ct, pred
@@ -407,27 +421,29 @@ def _infer_maisi(ckpt_path, subj_id, root_dir, device):
             def validate(self_t, epoch):
                 self_t._viz_result = None
                 self_t.controlnet.eval()
-                for i, batch_list in enumerate(self_t.val_loader):
+                for i, batch in enumerate(self_t.val_loader):
                     if i not in self_t.val_indices_to_run:
                         continue
-                    subj_data = batch_list[0]
-                    mr = subj_data["mri"]["data"].unsqueeze(0).to(self_t.device)
-                    ct = subj_data["ct"]["data"].unsqueeze(0).to(self_t.device)
-                    spacing = subj_data["original_spacing"].unsqueeze(0).to(self_t.device) * 100.0
-                    orig_shape = subj_data["original_spatial_shape"].tolist()
+                    mr = batch["mri"].to(self_t.device)
+                    ct = batch["ct"].to(self_t.device)
+                    # ct_spacing recorded as plain tensor in cached pipeline (cache-hit safe).
+                    spacing = batch["ct_spacing"].float().to(self_t.device) * 100.0
+                    orig_shape = batch["original_shape"][0].tolist()
 
                     pred_latent = self_t._sample(mr, spacing, num_steps=self_t.cfg.num_inference_steps)
                     pred_ct_norm = self_t._decode(pred_latent)
 
-                    pred_resized = F.interpolate(pred_ct_norm.float(), size=orig_shape, mode="trilinear", align_corners=False)
+                    # Unpad (MONAI pads at the end so offset is 0).
+                    from common.utils import unpad as _unpad
+                    pred_unpad = _unpad(pred_ct_norm.float(), orig_shape)
                     gt_matched = (torch.clamp((ct * 2048.0) - 1024.0, -1000.0, 1000.0) + 1000.0) / 2000.0
-                    gt_resized = F.interpolate(gt_matched.float(), size=orig_shape, mode="trilinear", align_corners=False)
-                    mr_resized = F.interpolate(mr.float(), size=orig_shape, mode="trilinear", align_corners=False)
+                    gt_unpad = _unpad(gt_matched.float(), orig_shape)
+                    mr_unpad = _unpad(mr.float(), orig_shape)
 
                     self_t._viz_result = {
-                        "pred": pred_resized.cpu(),
-                        "ct": gt_resized.cpu(),
-                        "mri": mr_resized.cpu(),
+                        "pred": pred_unpad.cpu(),
+                        "ct": gt_unpad.cpu(),
+                        "mri": mr_unpad.cpu(),
                         "mask": None,
                     }
                     break  # Only 1 subject needed
