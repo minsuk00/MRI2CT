@@ -1,18 +1,107 @@
 import datetime
+import gc
 import os
 import random
+import textwrap
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 from glob import glob
 
 import matplotlib.pyplot as plt
+import nibabel as nib
 import numpy as np
 import torch
-import torchio as tio
 from monai.transforms import CutOut
+from tqdm import tqdm
 
 import wandb
-from common.data import DataPreprocessing, get_augmentations, get_split_subjects, get_subject_paths, stage_data_to_local
-from common.utils import apply_synchronized_cutout, clean_state_dict, log_model_summary, send_notification, set_seed
+from common.data import (
+    build_data_dicts,
+    get_cached_transforms,
+    get_gpu_transforms,
+    get_random_crop,
+    get_region_key,
+    get_split_subjects,
+    get_subject_paths,
+)
+from common.utils import apply_synchronized_cutout, clean_state_dict, get_ram_info, log_model_summary, set_seed, unpad
+
+VIZ_METRIC_KEYS = ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone")
+
+
+class StepTimer:
+    """Per-step timing aggregator for monitoring. Use as a `with` block; wrap
+    sub-sections with `timer.cpu(name)` (perf_counter) or `timer.gpu(name)`
+    (cuda.Event for accurate GPU-stream timing). Multiple records of the same
+    name are averaged on `timings_ms()` (suits gradient-accumulation).
+
+    Disabled mode (`enabled=False`) makes every section a zero-overhead no-op,
+    so trainers can wrap critical paths unconditionally.
+    """
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self._cpu_total = {}
+        self._cpu_count = {}
+        self._gpu_evts = {}
+        self._t_step_start = None
+        self._t_step_end = None
+
+    def __enter__(self):
+        if self.enabled:
+            torch.cuda.synchronize()
+            self._t_step_start = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        if self.enabled:
+            torch.cuda.synchronize()
+            self._t_step_end = time.perf_counter()
+        return False
+
+    @contextmanager
+    def cpu(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._cpu_total[name] = self._cpu_total.get(name, 0.0) + (time.perf_counter() - t0)
+            self._cpu_count[name] = self._cpu_count.get(name, 0) + 1
+
+    @contextmanager
+    def gpu(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        try:
+            yield
+        finally:
+            e.record()
+            self._gpu_evts.setdefault(name, []).append((s, e))
+
+    def elapsed_s(self) -> float:
+        if not self.enabled or self._t_step_start is None or self._t_step_end is None:
+            return 0.0
+        return self._t_step_end - self._t_step_start
+
+    def timings_ms(self) -> dict:
+        """Per-section averages in milliseconds, plus 'step_total'. Empty when disabled."""
+        if not self.enabled:
+            return {}
+        out = {}
+        for name, total in self._cpu_total.items():
+            out[name] = (total / self._cpu_count[name]) * 1000.0
+        for name, evts in self._gpu_evts.items():
+            out[name] = sum(s.elapsed_time(e) for s, e in evts) / max(1, len(evts))
+        out["step_total"] = self.elapsed_s() * 1000.0
+        return out
 
 
 class BaseTrainer:
@@ -67,12 +156,6 @@ class BaseTrainer:
                 self.train_subjects = get_split_subjects(self.cfg.split_file, "train")
                 self.val_subjects = get_split_subjects(self.cfg.split_file, "val")
                 print(f"[{self.prefix}] Data Split - Train: {len(self.train_subjects)} | Val: {len(self.val_subjects)}")
-
-    def _stage_data_local(self):
-        """Copies dataset to local NVMe RAID for blazing fast I/O."""
-        all_to_sync = sorted(list(set(self.train_subjects) | set(self.val_subjects)))
-        self.cfg.root_dir = stage_data_to_local(self.gpfs_root, all_to_sync, self.cfg, prefix=self.prefix)
-        print(f"[{self.prefix}] ✅ Data staged. New root: {self.cfg.root_dir}")
 
     def _setup_wandb(self):
         if not self.cfg.wandb:
@@ -140,7 +223,7 @@ class BaseTrainer:
         wandb.config.update({"total_params": tot, "trainable_params": train}, allow_val_change=True)
         return tot, train
 
-    def _load_resume(self, model, optimizer=None, scheduler=None, scaler=None, extra_modules=None):
+    def _load_resume(self, model, optimizer=None, scheduler=None, extra_modules=None):
         if not self.cfg.resume_wandb_id:
             return
 
@@ -233,7 +316,7 @@ class BaseTrainer:
                     print(f"[RESUME] 📥 Loading {key} state...")
                     load_state(mod, checkpoint[state_key])
 
-        # 3. Restore Optimizer/Scheduler/Scaler
+        # 3. Restore Optimizer/Scheduler
         if not self.cfg.diverge_wandb_branch:
             # Capture the fresh LRs from config (which were just set in _setup_opt)
             if optimizer:
@@ -260,7 +343,13 @@ class BaseTrainer:
 
                     scheduler.step(self.global_step)
                 else:
-                    # Standard logic: Load state, update T_max if needed, and step once
+                    # Standard logic: load_state_dict fully restores last_epoch + base_lrs.
+                    # Optimizer.lr was restored by optimizer.load_state_dict above; the next
+                    # scheduler.step() in the train loop advances correctly from there.
+                    # NOTE: do NOT call scheduler.step() here — the recurrence formula in
+                    # CosineAnnealingLR / PolynomialLR uses optimizer.lr as "previous lr",
+                    # which is already at last_epoch=N, so a manual extra step would apply
+                    # one extra round of decay (~1% drift per resume).
                     print("[RESUME] 📥 Loading Scheduler state...")
                     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
@@ -268,19 +357,15 @@ class BaseTrainer:
                     if hasattr(scheduler, "T_max") and new_t_max != scheduler.T_max:
                         print(f"[RESUME] 🔧 Updating Scheduler T_max: {scheduler.T_max} -> {new_t_max}")
                         scheduler.T_max = new_t_max
-
-                    restored_epoch = scheduler.last_epoch
-                    scheduler.last_epoch = restored_epoch - 1
-                    scheduler.step()
-
-            if scaler and "scaler_state_dict" in checkpoint:
-                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                    elif hasattr(scheduler, "total_iters") and new_t_max != scheduler.total_iters:
+                        print(f"[RESUME] 🔧 Updating Scheduler total_iters: {scheduler.total_iters} -> {new_t_max}")
+                        scheduler.total_iters = new_t_max
 
             print(f"[RESUME] ✅ Resumed from Epoch {self.start_epoch}")
         else:
             print("[RESUME] 🌿 Diverging. Weights loaded, but state (epoch, step) reset.")
 
-    def save_checkpoint(self, model, optimizer, scheduler, scaler, epoch, path, extra_state=None):
+    def save_checkpoint(self, model, optimizer, scheduler, epoch, path, extra_state=None):
         """Universal checkpoint saver."""
         save_dir = os.path.dirname(path)
         os.makedirs(save_dir, exist_ok=True)
@@ -293,7 +378,6 @@ class BaseTrainer:
             "model_state_dict": target_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-            "scaler_state_dict": scaler.state_dict() if scaler else None,
             "elapsed_time": self.elapsed_time_at_resume + (time.time() - self.global_start_time) if self.global_start_time else self.elapsed_time_at_resume,
             "config": vars(self.cfg),
         }
@@ -305,7 +389,7 @@ class BaseTrainer:
         print(f"[{self.prefix}] [Save] {path}")
 
     def _inf_gen(self, loader):
-        """Infinite generator for tio.SubjectsLoader."""
+        """Infinite generator over a torch DataLoader."""
         while True:
             iterator = iter(loader)
             for batch in iterator:
@@ -315,58 +399,185 @@ class BaseTrainer:
 
             gc.collect()
 
+    def _log_monitoring(self, timings_ms: dict, throughput: float = None):
+        """Log RAM (parent + DataLoader workers via PSS), VRAM (alloc + interval peak),
+        per-section timings and throughput to wandb under `monitoring/`.
+
+        Trainers should call this every `cfg.monitor_interval` steps after a
+        `torch.cuda.synchronize()` so cuda.Event timings are valid.
+        """
+        if not self.cfg.wandb or not getattr(self.cfg, "monitor_resources", False):
+            return
+
+        payload = {f"monitoring/time_{k}_ms": v for k, v in timings_ms.items()}
+
+        ram = get_ram_info()
+        payload.update({
+            "monitoring/ram_total_gb": ram["total_gb"],
+            "monitoring/ram_main_rss_gb": ram["main_rss_gb"],
+            "monitoring/ram_workers_count": ram["num_children"],
+            "monitoring/ram_percent": ram["percent"],
+        })
+
+        if torch.cuda.is_available():
+            payload.update({
+                "monitoring/vram_alloc_gb": torch.cuda.memory_allocated() / (1024**3),
+                "monitoring/vram_peak_gb": torch.cuda.max_memory_allocated() / (1024**3),
+            })
+            torch.cuda.reset_peak_memory_stats()
+
+        if throughput is not None:
+            payload["monitoring/samples_per_sec"] = throughput
+
+        wandb.log(payload, step=self.global_step)
+
+        if ram["percent"] > 90:
+            tqdm.write(f"[WARNING] ⚠️ RAM {ram['percent']:.1f}% (Total: {ram['total_gb']:.2f} GB) — gc + cache flush.")
+            gc.collect()
+            torch.cuda.empty_cache()
+
     def _log_aug_viz(self, step):
-        """Visualizes augmentations."""
+        """Visualize one cropped patch before/after random augmentation (batchaug pipeline).
+
+        Records the per-transform fire mask by wrapping each Rand*d transform's
+        `sample_params` for this single call, so the figure shows what *actually*
+        fired this step — not just the static pipeline manifest.
+        """
         try:
             subj_id = self.val_subjects[0]
-            paths = get_subject_paths(self.cfg.root_dir, subj_id)
-            subj = tio.Subject(mri=tio.ScalarImage(paths["mri"]), ct=tio.ScalarImage(paths["ct"]))
-            prep = DataPreprocessing(patch_size=self.cfg.patch_size, res_mult=self.cfg.res_mult, enforce_ras=getattr(self.cfg, "enforce_ras", False))
-            subj = prep(subj)
-            aug = get_augmentations()(subj)
-            hist_str = " | ".join([t.name for t in aug.history])
-            z = subj["mri"].shape[-1] // 2
-            orig_sl = subj["mri"].data[0, ..., z].numpy()
-            aug_sl = aug["mri"].data[0, ..., z].numpy()
-            fig, ax = plt.subplots(1, 3, figsize=(10, 4))
+            dicts = build_data_dicts(self.cfg.root_dir, [subj_id], load_seg=False)
+            cached = get_cached_transforms(
+                patch_size=self.cfg.patch_size,
+                res_mult=self.cfg.res_mult,
+                enforce_ras=getattr(self.cfg, "enforce_ras", False),
+                mri_norm=getattr(self.cfg, "mri_norm", "minmax"),
+            )
+            crop = get_random_crop(
+                patch_size=self.cfg.patch_size,
+                use_weighted_sampler=True, has_seg=False, num_samples=1,
+            )
+            full_aug = get_gpu_transforms(augment=True, has_seg=False)
+
+            base = cached(dicts[0])
+            patch = crop(base)[0]
+
+            # Move to GPU as 5D batched dict (B=1) for batchaug.
+            def _prep(t):
+                t = t.as_tensor() if hasattr(t, "as_tensor") else t
+                return t.unsqueeze(0).to(self.device).float()
+
+            orig5 = {"mri": _prep(patch["mri"]), "ct": _prep(patch["ct"])}
+
+            # Patch sample_params on each Rand*d transform to capture its fire mask
+            # for batch element 0. batchaug stores the dict-wrapped transform under
+            # `t.transform`; in lazy mode Compose calls that directly.
+            fire_log: dict[str, bool] = {}
+            patches: list[tuple[object, str, callable]] = []
+            order: list[str] = []
+            for t in full_aug.transforms:
+                cls_name = type(t).__name__
+                if not cls_name.startswith("Rand"):
+                    continue
+                inner = getattr(t, "transform", None)
+                if inner is None or not hasattr(inner, "sample_params"):
+                    continue
+                # Use repeated-key handling: append index if duplicate (shouldn't occur).
+                label = cls_name
+                if label in fire_log:
+                    label = f"{cls_name}#{order.count(cls_name)}"
+                order.append(label)
+                fire_log[label] = False
+                orig_fn = inner.sample_params
+
+                def make_wrapper(orig, key):
+                    def wrapped(batch_size, shape, device):
+                        params = orig(batch_size, shape, device)
+                        m = params.get("mask") if isinstance(params, dict) else None
+                        if m is not None and m.numel() > 0:
+                            fire_log[key] = bool(m.flatten()[0].item())
+                        return params
+                    return wrapped
+
+                inner.sample_params = make_wrapper(orig_fn, label)
+                patches.append((inner, "sample_params", orig_fn))
+
+            try:
+                aug5 = full_aug({k: v.clone() for k, v in orig5.items()})
+            finally:
+                for inner, attr, orig_fn in patches:
+                    setattr(inner, attr, orig_fn)
+
+            fired = [k for k in order if fire_log[k]]
+            skipped = [k for k in order if not fire_log[k]]
+            n_f, n_total = len(fired), len(order)
+
+            def _wrap(items, width=70):
+                if not items:
+                    return "(none)"
+                return "\n  ".join(textwrap.wrap(", ".join(items), width=width))
+
+            caption = (
+                f"Fired ({n_f}/{n_total}):\n  {_wrap(fired)}\n"
+                f"Skipped ({n_total - n_f}/{n_total}):\n  {_wrap(skipped)}"
+            )
+
+            z = orig5["mri"].shape[-1] // 2
+            orig_sl = orig5["mri"][0, 0, ..., z].cpu().numpy()
+            aug_sl = aug5["mri"][0, 0, ..., z].float().cpu().numpy()
+            fig, ax = plt.subplots(1, 3, figsize=(12, 5.0))
             ax[0].imshow(np.rot90(orig_sl), cmap="gray", vmin=0, vmax=1)
             ax[0].set_title("Original")
             ax[1].imshow(np.rot90(aug_sl), cmap="gray", vmin=0, vmax=1)
-            ax[1].set_title(f"Augmented\n{hist_str}")
+            ax[1].set_title(f"Augmented ({n_f}/{n_total} fired)")
             ax[2].imshow(np.rot90(aug_sl - orig_sl), cmap="seismic", vmin=-0.5, vmax=0.5)
             ax[2].set_title("Diff")
+            for a in ax:
+                a.set_xticks([]); a.set_yticks([])
+            fig.text(0.01, 0.01, caption, fontsize=7, family="monospace",
+                     ha="left", va="bottom")
+            fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.30)
             wandb.log({"val/aug_viz": wandb.Image(fig)}, step=step)
             plt.close(fig)
         except Exception as e:
             print(f"[{self.prefix}] [WARNING] Aug Viz failed: {e}")
 
+    _DEFAULT_VAL_EXCLUDE = {"loss_l1", "loss_ssim", "loss_dice", "grad_diff"}
+
     def _log_val_metrics(self, val_metrics, exclude=None, extra=None, subject_ids=None):
-        """Compute mean over val subjects and log to WandB. Returns avg_met."""
-        exclude = exclude or set()
+        """Mean-reduce over val subjects and log to WandB under three namespaces:
+          val/        — image metrics (mae_hu, psnr, ssim, dice_score_*)
+          val_loss/   — composite loss + components ("loss" → total; "loss_X" → X)
+          val_body/   — body-masked metrics
+
+        Defaults exclude redundant components (loss_l1≡mae_hu, loss_ssim≡ssim,
+        loss_dice≡dice_score_all, grad_diff). Returns the unsplit avg_met dict
+        for downstream callers (train printing, etc.).
+        """
+        exclude = exclude if exclude is not None else self._DEFAULT_VAL_EXCLUDE
         avg_met = {k: np.mean(v) for k, v in val_metrics.items() if not k.startswith("body_")}
-        min_met = {k: np.min(v)  for k, v in val_metrics.items() if not k.startswith("body_")}
-        max_met = {k: np.max(v)  for k, v in val_metrics.items() if not k.startswith("body_")}
         avg_body = {k[5:]: np.mean(v) for k, v in val_metrics.items() if k.startswith("body_")}
-        min_body = {k[5:]: np.min(v)  for k, v in val_metrics.items() if k.startswith("body_")}
-        max_body = {k[5:]: np.max(v)  for k, v in val_metrics.items() if k.startswith("body_")}
 
         if extra:
             avg_met.update(extra)
 
         if self.cfg.wandb:
-            wandb.log(
-                {f"val/{k}": v for k, v in avg_met.items() if k not in exclude},
-                # | {f"val/{k}_min": v for k, v in min_met.items() if k not in exclude}
-                # | {f"val/{k}_max": v for k, v in max_met.items() if k not in exclude},
-                step=self.global_step,
-            )
+            metric_log, loss_log = {}, {}
+            for k, v in avg_met.items():
+                if k in exclude:
+                    continue
+                if k == "loss":
+                    loss_log["total"] = v
+                elif k.startswith("loss_"):
+                    loss_log[k[5:]] = v
+                else:
+                    metric_log[k] = v
+
+            if metric_log:
+                wandb.log({f"val/{k}": v for k, v in metric_log.items()}, step=self.global_step)
+            if loss_log:
+                wandb.log({f"val_loss/{k}": v for k, v in loss_log.items()}, step=self.global_step)
             if avg_body:
-                wandb.log(
-                    {f"val_body/{k}": v for k, v in avg_body.items()},
-                    # | {f"val_body/{k}_min": v for k, v in min_body.items()}
-                    # | {f"val_body/{k}_max": v for k, v in max_body.items()},
-                    step=self.global_step,
-                )
+                wandb.log({f"val_body/{k}": v for k, v in avg_body.items() if k not in exclude}, step=self.global_step)
 
         if subject_ids is not None and "mae_hu" in val_metrics:
             self._save_val_ranking(subject_ids, val_metrics)
@@ -394,15 +605,170 @@ class BaseTrainer:
                 extra_vals = "".join(f"  {v:<16.4f}" for v in row[2:])
                 f.write(f"{rank:<6}{sid:<20}{mae:<12.2f}{extra_vals}\n")
 
-    def _compute_val_metrics(self, pred_unpad, ct_unpad, mask_unpad=None):
-        """Returns (standard_met, body_met_or_None). Log under val/ and val_body/ respectively."""
+    def _compute_val_metrics(self, pred_unpad, ct_unpad, mask_unpad=None, hu_range=2048):
+        """Returns (standard_met, body_met_or_None). Log under val/ and val_body/ respectively.
+
+        `hu_range`: data-space HU width to scale the [0,1] MAE into HU.
+          - amix/unet: 2048 (CT clipped to [-1024, 1024])
+          - maisi:     2000 (CT clipped to [-1000, 1000])
+        """
         from common.utils import compute_metrics, compute_metrics_body
 
-        met = compute_metrics(pred_unpad, ct_unpad)
-        body_met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad) if mask_unpad is not None else None
+        met = compute_metrics(pred_unpad, ct_unpad, hu_range=hu_range)
+        body_met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad, hu_range=hu_range) if mask_unpad is not None else None
         return met, body_met
 
-    def _setup_loss_and_scaler(self):
+    def _get_body_mask_unpad(self, batch, orig_shape):
+        """Unpad body_mask from batch when cfg.val_body_mask is True; else None."""
+        if getattr(self.cfg, "val_body_mask", False) and "body_mask" in batch:
+            return unpad(batch["body_mask"].to(self.device), orig_shape)
+        return None
+
+    def _select_viz_metrics(self, met, body_met):
+        """Build the (viz_metrics, viz_body) dict pair from full metric dicts."""
+        viz_metrics = {k: met[k] for k in VIZ_METRIC_KEYS if k in met}
+        viz_body = {k: body_met[k] for k in VIZ_METRIC_KEYS if body_met and k in body_met} or None
+        return viz_metrics, viz_body
+
+    def _compute_dice_metrics(self, pred_probs, seg, orig_shape, mask_unpad=None, target_met=None):
+        """Compute dice_score_all / dice_score_bone from teacher pred_probs + seg.
+
+        If pred_probs/seg are pre-unpadded (passed already at orig_shape), pass orig_shape=None.
+        Returns the updated `target_met` dict (or a fresh dict). When mask_unpad is given, dices
+        are body-masked via get_class_dice's mask kwarg.
+        """
+        from common.loss import get_class_dice
+
+        if orig_shape is not None:
+            pred_probs = unpad(pred_probs, orig_shape)
+            seg = unpad(seg, orig_shape)
+        bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
+        excl_bg = getattr(self.cfg, "dice_exclude_background", True)
+        class_dices, bone_dice = get_class_dice(pred_probs, seg, mask=mask_unpad, bone_idx=bone_idx)
+        out = target_met if target_met is not None else {}
+        out["dice_score_all"] = (class_dices[1:].mean() if excl_bg else class_dices.mean()).item()
+        if bone_dice is not None:
+            out["dice_score_bone"] = bone_dice.item()
+        return out
+
+    def _run_teacher_sw(self, inputs, val_ps):
+        """Run sliding-window inference with self.teacher_model under bf16 autocast."""
+        from monai.inferers import sliding_window_inference
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            return sliding_window_inference(
+                inputs=inputs,
+                roi_size=(val_ps, val_ps, val_ps),
+                sw_batch_size=self.cfg.val_sw_batch_size,
+                predictor=self.teacher_model,
+                overlap=self.cfg.val_sw_overlap,
+                device=self.device,
+            )
+
+    def _setup_teacher_model(self, compile_model=False, dtype=torch.bfloat16):
+        """Load + freeze + (optionally compile) the Baby U-Net teacher.
+
+        Caller is responsible for the decision to call this (i.e., for the
+        enable predicate). Returns the loaded teacher, or None on failure
+        when cfg.dice_w==0 (preserving original behavior of swallowing the
+        exception unless dice loss is required).
+        """
+        from anatomix.segmentation.segmentation_utils import load_model_v1_2
+
+        print(f"[{self.prefix}] 👨‍🏫 Initializing Baby U-Net Teacher...")
+        try:
+            teacher = load_model_v1_2(
+                pretrained_ckpt=self.cfg.teacher_weights_path,
+                n_classes=self.cfg.n_classes - 1,
+                device=self.device,
+                compile_model=False,
+            )
+            teacher.to(device=self.device, dtype=dtype)
+            teacher.eval()
+            for p in teacher.parameters():
+                p.requires_grad = False
+            if compile_model:
+                print(f"[{self.prefix}] 🚀 Compiling Teacher (mode=default)")
+                teacher = torch.compile(teacher, mode="default")
+            from common.utils import count_parameters
+            tot, trn = count_parameters(teacher)
+            print(f"[{self.prefix}] Teacher Params: Total={tot:,} | Trainable={trn:,} | Dtype={dtype}")
+            return teacher
+        except Exception as e:
+            print(f"[{self.prefix}] ❌ Failed to init Teacher Model: {e}")
+            if self.cfg.dice_w > 0:
+                raise
+            return None
+
+    def _default_save_dir(self):
+        """Resolve the canonical checkpoint directory: local_run_dir if wandb, else gpfs fallback."""
+        if self.cfg.wandb and self.local_run_dir:
+            return self.local_run_dir
+        return os.path.join(self.gpfs_root, "results", "models")
+
+    def _build_val_loader(self, cached_xform, load_seg, cache_dir):
+        """Build the standard val DataLoader: PersistentDataset, batch=1, no workers."""
+        from monai.data import DataLoader, PersistentDataset
+
+        val_dicts = build_data_dicts(self.cfg.root_dir, self.val_subjects, load_seg=load_seg)
+        val_ds = PersistentDataset(data=val_dicts, transform=cached_xform, cache_dir=cache_dir)
+        return DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+
+    def _stratify_val_indices(self, n_per_region: int, seed: int = None):
+        """Pick `n_per_region` validation subject indices per anatomical region.
+
+        Returns (chosen_set, region_to_indices). Uses cfg.seed if seed is None,
+        so the choice is reproducible across resumes.
+        """
+        rng = random.Random(seed if seed is not None else self.cfg.seed)
+        region_to_indices = defaultdict(list)
+        for idx, subj_id in enumerate(self.val_subjects):
+            region_to_indices[get_region_key(subj_id)].append(idx)
+        chosen = []
+        for region, indices in region_to_indices.items():
+            chosen.extend(rng.sample(indices, min(n_per_region, len(indices))))
+        return set(chosen), region_to_indices
+
+    def _save_val_pred(self, pred_unpad, batch, subj_id, epoch, *, already_hu: bool = False):
+        """Save a validation prediction as NIfTI under `<run_dir>/predictions/last/`,
+        plus a copy under `predictions/epoch_<N>/` every cfg.val_save_interval epochs.
+
+        already_hu=False expects pred in [0,1] -> rescaled to HU via *2048-1024 (amix/unet).
+        already_hu=True expects pred already in HU (MAISI).
+
+        Returns the 'last' save path, or None if cfg.save_val_volumes is False.
+        """
+        if not getattr(self.cfg, "save_val_volumes", True):
+            return None
+
+        base_dir = self.local_run_dir if (self.cfg.wandb and self.local_run_dir) \
+            else os.path.join(self.cfg.prediction_dir, self.run_name)
+
+        pred_np = pred_unpad.float().cpu().numpy().squeeze()
+        if not already_hu:
+            pred_np = (pred_np * 2048.0) - 1024.0
+
+        # Pulled from the cached pipeline as a plain tensor under "ct_affine"
+        # (PersistentDataset's weights_only=True save strips MetaTensor.affine).
+        affine = batch["ct_affine"][0] if "ct_affine" in batch else batch["ct"].affine[0]
+        affine = affine.cpu().numpy() if hasattr(affine, "cpu") else np.array(affine)
+
+        nii = nib.Nifti1Image(pred_np, affine)
+
+        last_dir = os.path.join(base_dir, "predictions", "last")
+        os.makedirs(last_dir, exist_ok=True)
+        save_path = os.path.join(last_dir, f"pred_{subj_id}.nii.gz")
+        nib.save(nii, save_path)
+
+        val_save_interval = getattr(self.cfg, "val_save_interval", 0)
+        if val_save_interval > 0 and epoch % val_save_interval == 0:
+            epoch_dir = os.path.join(base_dir, "predictions", f"epoch_{epoch}")
+            os.makedirs(epoch_dir, exist_ok=True)
+            nib.save(nii, os.path.join(epoch_dir, f"pred_{subj_id}.nii.gz"))
+
+        return save_path
+
+    def _setup_loss(self):
         from common.loss import CompositeLoss
 
         self.loss_fn = CompositeLoss(
@@ -416,7 +782,6 @@ class BaseTrainer:
                 "dice_exclude_background": getattr(self.cfg, "dice_exclude_background", True),
             }
         ).to(self.device)
-        self.scaler = torch.amp.GradScaler("cuda")
 
     @torch.inference_mode()
     def _log_training_patch(self, mri, ct, pred, step, batch_idx, seg=None, pred_probs=None, subj_id=None):
