@@ -29,7 +29,7 @@ STEPS_PER_EPOCH=500     # halved from 1000 since BATCH_SIZE doubled; keeps total
 VAL_INTERVAL=5
 NUM_WORKERS=4
 RESUME_ID="9xmodnhn"  # Leave empty if not resuming
-TAGS="thorax,bs8" # Comma-separated extra WandB tags
+TAGS="bs8" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then

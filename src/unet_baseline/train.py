@@ -153,7 +153,7 @@ class BaselineTrainer(BaseTrainer):
             batch_size=self.cfg.batch_size,
             shuffle=True,
             num_workers=self.cfg.data_queue_num_workers,
-            persistent_workers=False,
+            persistent_workers=True,
             pin_memory=False,
         )
         self.train_iter = self._inf_gen(self.train_loader)

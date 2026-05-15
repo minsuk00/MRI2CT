@@ -32,8 +32,8 @@ EPOCHS=800
 STEPS_PER_EPOCH=500     # halved from 1000 since BATCH_SIZE doubled; keeps total samples_seen at 3.2M
 VAL_INTERVAL=5
 NUM_WORKERS=4
-RESUME_ID="xm2d3jjo" # Leave empty if not resuming
-TAGS="thorax,v1_4,bs8" # Comma-separated extra WandB tags
+RESUME_ID="6hjye9gp" # Leave empty if not resuming
+TAGS="v1_4,bs8" # Comma-separated extra WandB tags
 
 
 # --- Self-Submission Logic ---
