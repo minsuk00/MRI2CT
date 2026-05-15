@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from monai.bundle import ConfigParser
 from monai.data import DataLoader, PersistentDataset
+from monai.data.utils import pickle_hashing
 from monai.inferers import SlidingWindowInferer, sliding_window_inference
 from monai.networks.schedulers import RFlowScheduler
 from monai.networks.schedulers.ddpm import DDPMPredictionType
@@ -85,7 +86,7 @@ class MAISITrainer(BaseTrainer):
         # 2. Denoising UNet (Frozen)
         self.unet = parser.get_parsed_content("diffusion_unet_def", instantiate=True).to(self.device)
         unet_ckpt = torch.load(self.cfg.diffusion_path, map_location=self.device, weights_only=False)
-        self.unet.load_state_dict(unet_ckpt["unet_state_dict"], strict=False)
+        self.unet.load_state_dict(unet_ckpt["unet_state_dict"], strict=True)
 
         # Automatic Scale Factor
         if "scale_factor" in unet_ckpt:
@@ -108,11 +109,9 @@ class MAISITrainer(BaseTrainer):
 
         self.noise_scheduler = parser.get_parsed_content("noise_scheduler", instantiate=True)
 
-        # 4. Compile Mode (ControlNet, UNet)
-        if getattr(self.cfg, "compile_mode", None):
-            print(f"[{self.prefix}] ⚡ Compiling models (ControlNet, UNet)...")
-            self.controlnet = torch.compile(self.controlnet)
-            self.unet = torch.compile(self.unet)
+        # 4. ControlNet/UNet are NOT torch.compile'd: subjects have different padded
+        # sizes, which would force constant recompiles. Only the VAE encoder is
+        # compiled (above), since SW patches always have a fixed shape.
 
         tot, train = count_parameters(self.controlnet)
         print(f"[{self.prefix}] ControlNet Params: Total={tot:,} | Trainable={train:,}")
@@ -132,6 +131,24 @@ class MAISITrainer(BaseTrainer):
                 print(f"[{self.prefix}] ℹ️ SSO Mode detected: Setting steps_per_epoch=1.")
                 self.cfg.steps_per_epoch = 1
 
+        # Preencoded latent mode: skip on-the-fly VAE encode at train time by
+        # pulling pre-computed `{subj_id}_ct_latent.pt` (already × scale_factor)
+        # from GPFS. Static latents are incompatible with random MR augmentation
+        # — RandAffine/RandFlip on MR would mis-register against frozen CT latents.
+        self.preencoded_dir = getattr(self.cfg, "preencoded_latents_dir", None)
+        if self.preencoded_dir:
+            if not os.path.isdir(self.preencoded_dir):
+                raise FileNotFoundError(
+                    f"[MAISI] preencoded_latents_dir not found: {self.preencoded_dir}. "
+                    f"Run `python src/maisi_baseline/encode_all_volumes.py --output_dir {self.preencoded_dir}` first."
+                )
+            if self.cfg.augment:
+                raise ValueError(
+                    "[MAISI] preencoded_latents_dir is set but augment=True. "
+                    "Static latents require augment=False (MR augmentations would mis-register against frozen CT latents)."
+                )
+            print(f"[{self.prefix}] 📦 Preencoded mode: loading CT latents from {self.preencoded_dir}")
+
         # MONAI pipeline (full-volume MAISI: cached preproc + GPU aug, NO crop).
         # MAISI norm presets: ct_range=(-1000, 1000), mri_norm="percentile" (0–99.5).
         # res_mult=32 to satisfy the VAE's 8x downsampling × 4 patch alignment.
@@ -140,24 +157,51 @@ class MAISITrainer(BaseTrainer):
         os.makedirs(cache_dir, exist_ok=True)
         print(f"[{self.prefix}] 💾 MONAI cache dir: {cache_dir}")
 
-        cached_xform = get_cached_transforms(
+        # Train side: skip CT image entirely in preencoded mode (replaced by LoadLatentd).
+        train_cached_xform = get_cached_transforms(
+            patch_size=self.cfg.patch_size,
+            res_mult=32,
+            enforce_ras=True,
+            mri_norm="percentile",
+            ct_range=(-1000, 1000),
+            load_seg=False,
+            load_ct_image=self.preencoded_dir is None,
+            load_ct_latent_from=self.preencoded_dir,
+        )
+        # Val side: keep CT image (needed for metrics). In preencoded mode, also
+        # append LoadLatentd so the proxy diffusion loss reuses the cached latent.
+        val_cached_xform = get_cached_transforms(
             patch_size=self.cfg.patch_size,
             res_mult=32,
             enforce_ras=True,
             mri_norm="percentile",
             ct_range=(-1000, 1000),
             load_seg=load_seg,
+            load_ct_image=True,
+            load_ct_latent_from=self.preencoded_dir,
         )
 
         # Train: full padded volumes; batch_size=1 → no collation pad needed.
         train_dicts = build_data_dicts(self.cfg.root_dir, self.train_subjects, load_seg=False)
-        train_ds = PersistentDataset(data=train_dicts, transform=cached_xform, cache_dir=cache_dir)
+        if self.preencoded_dir is not None:
+            # Drop "ct" path key — train side no longer loads the CT NIfTI. Also
+            # differentiates the PersistentDataset cache key from on-the-fly mode.
+            train_dicts = [{k: v for k, v in d.items() if k != "ct"} for d in train_dicts]
+        # `hash_transform=pickle_hashing` makes PersistentDataset include the transform
+        # spec in the cache key, so preencoded vs on-the-fly modes (and any future
+        # MAISI preset change) cannot poison each other's cached tensors.
+        train_ds = PersistentDataset(
+            data=train_dicts,
+            transform=train_cached_xform,
+            cache_dir=cache_dir,
+            hash_transform=pickle_hashing,
+        )
         self.train_loader = DataLoader(
             train_ds,
             batch_size=self.cfg.batch_size,
             shuffle=True,
             num_workers=self.cfg.dataloader_num_workers,
-            persistent_workers=False,
+            persistent_workers=True,
             pin_memory=False,
         )
         self.train_iter = self._inf_gen(self.train_loader)
@@ -166,7 +210,7 @@ class MAISITrainer(BaseTrainer):
         self.gpu_transforms = get_gpu_transforms(augment=self.cfg.augment, has_seg=False)
 
         # Val: same cached preproc, batch_size=1, no aug.
-        self.val_loader = self._build_val_loader(cached_xform, load_seg, cache_dir)
+        self.val_loader = self._build_val_loader(val_cached_xform, load_seg, cache_dir, hash_transform=pickle_hashing)
 
         # Stratified Validation Sampling
         if self.cfg.full_val:
@@ -327,9 +371,10 @@ class MAISITrainer(BaseTrainer):
         """Iterative denoising to sample synthetic CT latent."""
         self.controlnet.eval()
         latent_shape = (1, 4, mr.shape[2] // 4, mr.shape[3] // 4, mr.shape[4] // 4)
-        latents = torch.randn(latent_shape, device=self.device).half()
-        mr_h = mr.half()
-        sp_h = spacing.half()
+        # fp32 mainline; autocast below casts ops to bf16. Mixing explicit .half() with
+        # bf16 autocast silently promotes scheduler.step's `sample + v_pred*dt` to fp32
+        # after iter 0, leaving the dtype contract incoherent.
+        latents = torch.randn(latent_shape, device=self.device)
 
         try:
             num_voxels = int(torch.prod(torch.tensor(latent_shape[2:])).item())
@@ -345,8 +390,8 @@ class MAISITrainer(BaseTrainer):
                 t_tensor = torch.tensor([t], device=self.device).float()
                 # Modality 1 corresponds to CT (refer to modality_mapping.json)
                 class_labels = torch.ones(latents.shape[0], dtype=torch.long, device=self.device)
-                down_res, mid_res = self.controlnet(x=latents, timesteps=t_tensor, controlnet_cond=mr_h, class_labels=class_labels)
-                model_output = self.unet(x=latents, timesteps=t_tensor, spacing_tensor=sp_h, class_labels=class_labels, down_block_additional_residuals=down_res, mid_block_additional_residual=mid_res)
+                down_res, mid_res = self.controlnet(x=latents, timesteps=t_tensor, controlnet_cond=mr, class_labels=class_labels)
+                model_output = self.unet(x=latents, timesteps=t_tensor, spacing_tensor=spacing, class_labels=class_labels, down_block_additional_residuals=down_res, mid_block_additional_residual=mid_res)
                 latents, _ = self.noise_scheduler.step(model_output, t, latents, next_t)
 
         return latents.float()
@@ -380,18 +425,25 @@ class MAISITrainer(BaseTrainer):
 
                     with timer.gpu("augment"):
                         # Apply batched GPU aug via batchaug to full padded volumes (no crop, B=1).
+                        # In preencoded mode the batch has no "ct" key; gpu_augment_batch operates
+                        # only on present keys so this is a no-op for absent keys.
                         batch = gpu_augment_batch(batch, self.gpu_transforms, self.device)
 
                     mr = batch["mri"]
-                    ct = batch["ct"]
+                    ct = batch.get("ct", None)
 
-                    # Modular Synchronized CutOut (via BaseTrainer)
-                    # Note: Maisi uses stack of single-channel tensors: (B, 1, D, H, W)
-                    mr, ct, _ = self.apply_cutout(mr, ct)
+                    # Modular Synchronized CutOut (via BaseTrainer). Skipped in preencoded
+                    # mode (CT image absent + augment=False enforced upstream).
+                    if ct is not None:
+                        mr, ct, _ = self.apply_cutout(mr, ct)
 
                     with timer.gpu("encode"):
-                        # 1. Encode CT to latent on-the-fly via sliding window
-                        ct_emb = self._encode_sliding_window(ct) * self.scale_factor
+                        if self.preencoded_dir is not None:
+                            # Latent already multiplied by scale_factor at encode time.
+                            ct_emb = batch["ct_latent"].to(self.device)
+                        else:
+                            # 1. Encode CT to latent on-the-fly via sliding window
+                            ct_emb = self._encode_sliding_window(ct) * self.scale_factor
 
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         # 2. Diffusion forward: sample timestep and corrupt latent
@@ -439,11 +491,13 @@ class MAISITrainer(BaseTrainer):
                 )
 
             if self.cfg.wandb and self.global_step % 5 == 0:
+                total_steps = self.cfg.steps_per_epoch * self.cfg.total_epochs
                 wandb.log(
                     {
                         "train/loss": step_loss,
                         "train/grad_norm": grad_norm.item(),
                         "info/lr": self.optimizer.param_groups[0]["lr"],
+                        "info/train_pct": self.global_step / total_steps,
                     },
                     step=self.global_step,
                 )
@@ -503,8 +557,12 @@ class MAISITrainer(BaseTrainer):
             gt_hu = torch.clamp(gt_hu_raw, -1000.0, 1000.0)
             pred_hu = (pred_ct_norm * 2000.0) - 1000.0
 
-            # Proxy diffusion loss (on resampled latent space)
-            ct_emb = self._encode_sliding_window(ct) * self.scale_factor
+            # Proxy diffusion loss (on resampled latent space). In preencoded mode
+            # the latent is already cached alongside the val batch (× scale_factor).
+            if self.preencoded_dir is not None:
+                ct_emb = batch["ct_latent"].to(self.device)
+            else:
+                ct_emb = self._encode_sliding_window(ct) * self.scale_factor
             noise, timesteps, noisy_latent = self._sample_noise_and_timesteps(ct_emb)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 model_output, _, _ = self._controlnet_unet_forward(noisy_latent, mr, spacing, timesteps)
@@ -576,13 +634,18 @@ class MAISITrainer(BaseTrainer):
         return avg_met
 
     def _log_training_patch(self, mr, ct, decoded_ct, step, step_idx, subj_id=None):
-        """Visualizes [MR, GT, Decoded GT Latent] for full-volume training."""
+        """Visualizes [MR, (optional) GT, Decoded GT Latent] for full-volume training.
+
+        In preencoded mode `ct` is None — the CT image isn't loaded — so the GT
+        row is omitted and the figure shows MR + decoded(latent) only.
+        """
         mr_img = mr[0, 0].cpu().numpy()
-        gt_ct = ct[0, 0].cpu().numpy()
         dec_ct = decoded_ct[0, 0].cpu().numpy()
+        gt_ct = ct[0, 0].cpu().numpy() if ct is not None else None
 
         cx, cy, cz = np.array(mr_img.shape) // 2
-        fig, axes = plt.subplots(3, 3, figsize=(10, 10))
+        n_rows = 3 if gt_ct is not None else 2
+        fig, axes = plt.subplots(n_rows, 3, figsize=(10, 3.3 * n_rows))
 
         def plot_row(row_idx, vol, title):
             axes[row_idx, 0].imshow(np.rot90(vol[:, :, cz]), cmap="gray", vmin=0, vmax=1)
@@ -593,8 +656,11 @@ class MAISITrainer(BaseTrainer):
             axes[row_idx, 2].set_title(f"{title} Cor")
 
         plot_row(0, mr_img, "MRI (Cond)")
-        plot_row(1, gt_ct, "GT CT")
-        plot_row(2, dec_ct, "Decoded Latent")
+        if gt_ct is not None:
+            plot_row(1, gt_ct, "GT CT")
+            plot_row(2, dec_ct, "Decoded Latent")
+        else:
+            plot_row(1, dec_ct, "Decoded Latent")
 
         for ax in axes.flatten():
             ax.axis("off")

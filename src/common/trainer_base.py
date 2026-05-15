@@ -706,19 +706,28 @@ class BaseTrainer:
             return self.local_run_dir
         return os.path.join(self.gpfs_root, "results", "models")
 
-    def _build_val_loader(self, cached_xform, load_seg, cache_dir):
-        """Build the standard val DataLoader: PersistentDataset, batch=1, no workers."""
+    def _build_val_loader(self, cached_xform, load_seg, cache_dir, hash_transform=None):
+        """Build the standard val DataLoader: PersistentDataset, batch=1, no workers.
+
+        `hash_transform`: optional callable forwarded to PersistentDataset so the
+        cache key includes the transform spec. Pass `pickle_hashing` when the
+        same data dict can be paired with semantically-different transforms
+        (e.g. MAISI preencoded vs on-the-fly), to prevent cache poisoning.
+        """
         from monai.data import DataLoader, PersistentDataset
 
         val_dicts = build_data_dicts(self.cfg.root_dir, self.val_subjects, load_seg=load_seg)
-        val_ds = PersistentDataset(data=val_dicts, transform=cached_xform, cache_dir=cache_dir)
+        kwargs = {"hash_transform": hash_transform} if hash_transform is not None else {}
+        val_ds = PersistentDataset(data=val_dicts, transform=cached_xform, cache_dir=cache_dir, **kwargs)
         return DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
     def _stratify_val_indices(self, n_per_region: int, seed: int = None):
         """Pick `n_per_region` validation subject indices per anatomical region.
 
         Returns (chosen_set, region_to_indices). Uses cfg.seed if seed is None,
-        so the choice is reproducible across resumes.
+        so the choice is reproducible across resumes. Subject IDs listed in
+        cfg.viz_force_include are always added to the chosen set (if present
+        in val_subjects).
         """
         rng = random.Random(seed if seed is not None else self.cfg.seed)
         region_to_indices = defaultdict(list)
@@ -727,7 +736,13 @@ class BaseTrainer:
         chosen = []
         for region, indices in region_to_indices.items():
             chosen.extend(rng.sample(indices, min(n_per_region, len(indices))))
-        return set(chosen), region_to_indices
+        chosen_set = set(chosen)
+        for forced_id in getattr(self.cfg, "viz_force_include", []) or []:
+            for idx, subj_id in enumerate(self.val_subjects):
+                if subj_id == forced_id:
+                    chosen_set.add(idx)
+                    break
+        return chosen_set, region_to_indices
 
     def _save_val_pred(self, pred_unpad, batch, subj_id, epoch, *, already_hu: bool = False):
         """Save a validation prediction as NIfTI under `<run_dir>/predictions/last/`,
@@ -831,15 +846,15 @@ class BaseTrainer:
             if img_pred_seg is not None:
                 seg_vmax = max(seg_vmax, img_pred_seg.max())
 
-            plot_row(3, img_seg, "GT Seg", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest")
-
-            if img_pred_seg is not None:
-                plot_row(4, img_pred_seg, "Pred Seg", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest")
+                # Pred → GT alternation matches the CT rows above (Pred CT → GT CT).
+                plot_row(3, img_pred_seg, "Pred Seg", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest")
+                plot_row(4, img_seg, "GT Seg", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest")
 
                 # Overlay Row: Show Pred CT first, then overlay Pred Seg
                 plot_row(5, img_pred, "Overlay", vmin=0, vmax=1, cmap="gray")
                 plot_row(5, img_pred_seg, "Overlay", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest", alpha=0.3)
             else:
+                plot_row(3, img_seg, "GT Seg", vmin=seg_vmin, vmax=seg_vmax, cmap="tab20", interpolation="nearest")
                 for r in range(4, 6):
                     for c in range(3):
                         axes[r, c].axis("off")

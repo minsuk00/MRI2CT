@@ -40,7 +40,6 @@ MAISI_CONFIG = {
     "dataloader_num_workers": 4,
     "enable_profiling": True,
     "vae_compile": True,
-    "compile_mode": None,
     # ----------------------
     # Experiment Basics
     "project_name": "mri2ct",
@@ -52,6 +51,11 @@ MAISI_CONFIG = {
     "wandb_note": "MAISI Baseline ControlNet (On-the-fly VAE).",
     # Data
     "augment": True,  # Enable standard augmentations
+    # When set, the training side skips on-the-fly VAE encoding and pulls
+    # `{subj_id}_ct_latent.pt` from this dir (pre-multiplied by scale_factor).
+    # Run `python src/maisi_baseline/encode_all_volumes.py --output_dir <this>`
+    # once before training. Requires `augment=False` (latents are static).
+    "preencoded_latents_dir": None,
     # Validation
     "val_sw_batch_size": 1,
     "val_sw_overlap": 0.4,
@@ -77,10 +81,12 @@ def main():
     parser.add_argument("--model_save_interval", type=int, help="Model save interval")
     parser.add_argument("--wandb", type=str, choices=["True", "False"], help="Enable/disable wandb")
     parser.add_argument("--resume_wandb_id", type=str, help="WandB Run ID to resume from")
+    parser.add_argument("--override_lr", type=str, choices=["True", "False"], help="Reset optimizer LR + recompute scheduler curve from current step")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
-    parser.add_argument("--compile_mode", type=str, help="torch.compile mode: 'full', 'model', or 'None'")
     parser.add_argument("--vae_compile", type=str, choices=["True", "False"], help="Enable/disable VAE compilation")
     parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
+    parser.add_argument("--augment", type=str, choices=["True", "False"], help="Enable/disable GPU augmentation")
+    parser.add_argument("--preencoded_latents_dir", type=str, help="Directory with pre-encoded CT latents (skips on-the-fly VAE encode at train time). Requires --augment False.")
 
     args = parser.parse_args()
 
@@ -124,8 +130,8 @@ def main():
         MAISI_CONFIG["wandb"] = args.wandb == "True"
     if args.resume_wandb_id:
         MAISI_CONFIG["resume_wandb_id"] = args.resume_wandb_id
-    if args.compile_mode:
-        MAISI_CONFIG["compile_mode"] = None if args.compile_mode.lower() == "none" else args.compile_mode
+    if args.override_lr:
+        MAISI_CONFIG["override_lr"] = args.override_lr == "True"
     if args.vae_compile:
         MAISI_CONFIG["vae_compile"] = args.vae_compile == "True"
     if args.tags:
@@ -133,6 +139,10 @@ def main():
         MAISI_CONFIG["wandb_tags"] = MAISI_CONFIG["wandb_tags"] + [t.strip(' "') for t in args.tags.split(",") if t.strip()]
     if args.stage_data:
         MAISI_CONFIG["stage_data"] = args.stage_data == "True"
+    if args.augment:
+        MAISI_CONFIG["augment"] = args.augment == "True"
+    if args.preencoded_latents_dir:
+        MAISI_CONFIG["preencoded_latents_dir"] = args.preencoded_latents_dir
 
     try:
         trainer = MAISITrainer(MAISI_CONFIG)

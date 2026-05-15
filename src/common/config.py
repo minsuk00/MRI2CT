@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     "accum_steps": 2,
     "model_save_interval": 200,
     "viz_limit": 4,
+    "viz_force_include": ["1THB011"],  # Always visualize these val subjects (in addition to stratified pick)
     "viz_pca": False,
     "steps_per_epoch": 1000,
     "finetune_feat_extractor": False,

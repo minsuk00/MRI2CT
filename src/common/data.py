@@ -172,14 +172,17 @@ class RecordAffineD(MapTransform):
 
     Required because `PersistentDataset` uses `torch.load(weights_only=True)` on cache read,
     which strips the MetaTensor subclass — so `.affine` is unavailable on cache hits (epoch ≥ 1).
-    Stores `<ref>_affine` (4,4) for NIfTI export and `<ref>_spacing` (3,) for MAISI's spacing input.
+    Stores `<prefix>_affine` (4,4) for NIfTI export and `<prefix>_spacing` (3,) for MAISI's spacing input.
+    `key_prefix` defaults to `ref_key`; override when the dict lacks `ref_key` upstream
+    (e.g., preencoded MAISI train side has no "ct" image but trainer still reads `ct_spacing`).
     """
 
-    def __init__(self, ref_key: str = "ct"):
+    def __init__(self, ref_key: str = "ct", key_prefix: str = None):
         super().__init__([ref_key], allow_missing_keys=False)
         self.ref_key = ref_key
-        self.affine_key = f"{ref_key}_affine"
-        self.spacing_key = f"{ref_key}_spacing"
+        prefix = key_prefix if key_prefix is not None else ref_key
+        self.affine_key = f"{prefix}_affine"
+        self.spacing_key = f"{prefix}_spacing"
 
     def __call__(self, data):
         d = dict(data)
@@ -192,6 +195,32 @@ class RecordAffineD(MapTransform):
             aff = affine.float() if hasattr(affine, "float") else torch.as_tensor(affine, dtype=torch.float32)
             d[self.affine_key] = aff.clone()
             d[self.spacing_key] = torch.linalg.norm(aff[:3, :3], dim=0)
+        return d
+
+
+class LoadLatentd(MapTransform):
+    """Load a pre-encoded MAISI CT latent (.pt) from `latents_dir/{subj_id}_ct_latent.pt`.
+
+    Latents are produced by `src/maisi_baseline/encode_all_volumes.py` already
+    multiplied by `scale_factor`, so the trainer can use the loaded tensor as
+    `ct_emb` directly with no further scaling. Drops the leading batch dim that
+    `encode_all_volumes` saved so the result mirrors a 4D (C, D, H, W) tensor
+    that PersistentDataset/DataLoader will batch normally.
+    """
+
+    def __init__(self, latents_dir: str, subj_key: str = "subj_id", output_key: str = "ct_latent"):
+        super().__init__([subj_key], allow_missing_keys=False)
+        self.latents_dir = latents_dir
+        self.subj_key = subj_key
+        self.output_key = output_key
+
+    def __call__(self, data):
+        d = dict(data)
+        path = os.path.join(self.latents_dir, f"{d[self.subj_key]}_ct_latent.pt")
+        latent = torch.load(path, map_location="cpu", weights_only=True)
+        if latent.ndim == 5 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)
+        d[self.output_key] = latent
         return d
 
 
@@ -232,14 +261,24 @@ def get_cached_transforms(
     load_seg: bool = False,
     load_body_mask: bool = True,
     use_float16_storage: bool = False,
+    load_ct_image: bool = True,
+    load_ct_latent_from: str = None,
 ):
     """Deterministic CPU pipeline for PersistentDataset caching.
 
     Normalization presets:
       - amix / unet: ct_range=(-1024, 1024), mri_norm="minmax"
       - maisi:       ct_range=(-1000, 1000), mri_norm="percentile" (0.0–99.5)
+
+    MAISI preencoded mode (independent toggles):
+      - Train: `load_ct_image=False, load_ct_latent_from=<dir>` — skip CT NIfTI,
+        load only the pre-encoded latent. MR + body_mask flow normally. Spacing
+        is sourced from MRI but recorded as `ct_spacing` so trainer reads the
+        same key.
+      - Val:   `load_ct_image=True,  load_ct_latent_from=<dir>` — load CT for
+        metrics AND latent for proxy diffusion loss.
     """
-    spatial_keys = ["mri", "ct"] + (["body_mask"] if load_body_mask else [])
+    spatial_keys = ["mri"] + (["ct"] if load_ct_image else []) + (["body_mask"] if load_body_mask else [])
     if load_seg:
         spatial_keys.append("seg")
 
@@ -250,8 +289,9 @@ def get_cached_transforms(
     if enforce_ras:
         transforms.append(Orientationd(keys=spatial_keys, axcodes="RAS"))
 
-    # CT: clip-and-scale to [0, 1].
-    transforms.append(ScaleIntensityRanged(keys=["ct"], a_min=ct_range[0], a_max=ct_range[1], b_min=0.0, b_max=1.0, clip=True))
+    if load_ct_image:
+        # CT image: clip-and-scale to [0, 1].
+        transforms.append(ScaleIntensityRanged(keys=["ct"], a_min=ct_range[0], a_max=ct_range[1], b_min=0.0, b_max=1.0, clip=True))
 
     # MRI: per-volume minmax OR percentile clip-and-scale.
     if mri_norm == "percentile":
@@ -268,11 +308,13 @@ def get_cached_transforms(
     else:
         transforms.append(MonaiScaleIntensityd(keys=["mri"], minv=0.0, maxv=1.0))
 
-    # Snapshot pre-pad shape, then pad at end up to patch_size and to next multiple of res_mult.
+    # Snapshot pre-pad shape + affine/spacing, then pad at end up to patch_size and to next multiple of res_mult.
+    # Preencoded mode: source ref is MR (CT image absent) but record under `ct_*` keys for trainer compatibility.
+    affine_ref = "ct" if load_ct_image else "mri"
     transforms.extend(
         [
-            RecordOriginalShapeD(ref_key="ct"),
-            RecordAffineD(ref_key="ct"),
+            RecordOriginalShapeD(ref_key=affine_ref),
+            RecordAffineD(ref_key=affine_ref, key_prefix="ct"),
             SpatialPadd(keys=spatial_keys, spatial_size=(patch_size,) * 3, method="end", mode="constant"),
             DivisiblePadd(keys=spatial_keys, k=res_mult, method="end", mode="constant"),
         ]
@@ -284,11 +326,17 @@ def get_cached_transforms(
         transforms.append(CastToTyped(keys=mask_keys, dtype=torch.uint8))
 
     if use_float16_storage:
-        transforms.append(CastToTyped(keys=["mri", "ct"], dtype=torch.float16))
+        fp16_keys = ["mri"] + (["ct"] if load_ct_image else [])
+        transforms.append(CastToTyped(keys=fp16_keys, dtype=torch.float16))
 
     # Final: drop MetaTensor subclass so cache-hit (plain) and cache-miss (MetaTensor)
     # batches collate uniformly. RecordAffineD already saved the affine/spacing.
     transforms.append(StripMetaD(keys=spatial_keys))
+
+    # Preencoded MAISI: append after the MR pipeline so the loaded latent gets
+    # cached alongside the preprocessed MR in the PersistentDataset blob.
+    if load_ct_latent_from is not None:
+        transforms.append(LoadLatentd(latents_dir=load_ct_latent_from))
 
     return Compose(transforms)
 
@@ -409,6 +457,74 @@ def get_gpu_transforms(
             kernel_sizes=randconv_kernel_sizes,
             mixing=True,
         ),
+        B.ScaleIntensityd(keys=["mri", "ct"]),
+    ]
+
+    return B.Compose(transforms=transforms, lazy=True, mode=mode_dict)
+
+
+def get_gpu_transforms_torchio_match(
+    *,
+    augment: bool = True,
+    has_seg: bool = False,
+):
+    """Legacy torchio-equivalent GPU augmentation pipeline (testing/ablation only).
+
+    Mirrors `src/_archive/data_torchio.py::get_augmentations()` 1-to-1 using
+    batchaug ops, so A/B tests can isolate whether the expanded MONAI aug
+    stack in `get_gpu_transforms` is what regressed quality. Drop-in
+    replacement: same call signature as `get_gpu_transforms`.
+
+    Mapping (torchio → batchaug):
+      RandomFlip(axes=(0,1,2), p=0.5)         → three RandFlipd, prob=0.5
+      RandomAffine(scales=(0.95,1.1),
+                   degrees=7, translation=4,
+                   p=0.8)                     → RandAffined(prob=0.8, rotate_range=±7°,
+                                                            scale_range=(-0.05,+0.10),
+                                                            translate_range=±4)
+      RandomBiasField(coefficients=0.5,
+                      order=2, p=0.4)         → RandBiasFieldd(prob=0.4, degree=2,
+                                                               coeff_range=(-0.5, 0.5))
+      RandomGamma(log_gamma=(-0.3, 0.3),
+                  p=0.4)                      → RandAdjustContrastd(prob=0.4,
+                                                                    gamma=(e^-0.3, e^0.3))
+      RandomNoise(std=(0, 0.02), p=0.25)      → RandGaussianNoised(prob=0.25, std=(0, 0.02))
+      RescaleIntensity()                      → ScaleIntensityd(keys=mri,ct)
+
+    Caveat: torchio's `default_pad_value="minimum"` has no batchaug equivalent;
+    `padding_mode="zeros"` matches the volume minimum because MRI/CT are
+    normalized to [0,1] in the cached stage.
+    """
+    spatial_keys = ["mri", "ct"] + (["seg"] if has_seg else [])
+
+    mode_dict = {"mri": "bilinear", "ct": "bilinear"}
+    if has_seg:
+        mode_dict["seg"] = "nearest"
+
+    if not augment:
+        return B.Compose(transforms=[], lazy=True, mode=mode_dict)
+
+    transforms = [
+        B.RandFlipd(keys=spatial_keys, prob=0.5, spatial_axis=[0]),
+        B.RandFlipd(keys=spatial_keys, prob=0.5, spatial_axis=[1]),
+        B.RandFlipd(keys=spatial_keys, prob=0.5, spatial_axis=[2]),
+        B.RandAffined(
+            keys=spatial_keys,
+            prob=0.8,
+            rotate_range=(float(np.deg2rad(7)),) * 3,
+            scale_range=((-0.05, 0.10),) * 3,
+            translate_range=(4.0,) * 3,
+            padding_mode="zeros",
+        ),
+        B.RandBiasFieldd(
+            keys=["mri"], prob=0.4, degree=2, coeff_range=(-0.5, 0.5),
+        ),
+        B.RandAdjustContrastd(
+            keys=["mri"],
+            prob=0.4,
+            gamma=(float(np.exp(-0.3)), float(np.exp(0.3))),
+        ),
+        B.RandGaussianNoised(keys=["mri"], prob=0.25, std=(0.0, 0.02)),
         B.ScaleIntensityd(keys=["mri", "ct"]),
     ]
 
