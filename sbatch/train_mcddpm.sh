@@ -22,19 +22,19 @@ LR=3e-5         # paper page 6
 WEIGHT_DECAY=1e-5  # paper page 6
 BATCH_SIZE=4
 PATCHES_PER_VOL=2
-LR_ANNEAL_STEPS=0
-USE_AMP="False"
+LR_ANNEAL_STEPS=0         # 0 = constant LR (scheduler is None); train as long as we keep submitting
+USE_AMP="True"     # bf16 autocast — matches notebook AMP path, safer than fp16
 USE_CHECKPOINT="False"
 DIFFUSION_STEPS=1000
 VAL_STEPS=25
-EPOCHS=500
+EPOCHS=1500               # extended past original 500 (250k -> 750k opt steps); LR stays constant since LR_ANNEAL_STEPS=0
 STEPS_PER_EPOCH=500
 SAVE_INTERVAL=5
 VAL_INTERVAL=5
 VAL_SUBJ_ID="1THB011"
 NUM_WORKERS=4
-RESUME_ID="a3g28rez"      # Set to <wandb-id> to chain-resume after SLURM cut
-TAGS=""                   # Comma-separated extra WandB tags
+RESUME_ID="a3g28rez"      # resume run; extend training
+TAGS="extended"           # Comma-separated extra WandB tags
 
 
 # --- Self-Submission Logic ---

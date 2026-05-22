@@ -82,6 +82,8 @@ def main():
     parser.add_argument("--wandb", type=str, choices=["True", "False"], help="Enable/disable wandb")
     parser.add_argument("--resume_wandb_id", type=str, help="WandB Run ID to resume from")
     parser.add_argument("--override_lr", type=str, choices=["True", "False"], help="Reset optimizer LR + recompute scheduler curve from current step")
+    parser.add_argument("--no_scheduler", type=str, choices=["True", "False"], help="Disable LR scheduler entirely (constant LR). Use to extend training past the original poly-decay schedule.")
+    parser.add_argument("--full_val", type=str, choices=["True", "False"], help="Full val over all subjects (True) vs reduced 1-per-region (False; ~5 subjects). Default True.")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
     parser.add_argument("--vae_compile", type=str, choices=["True", "False"], help="Enable/disable VAE compilation")
     parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
@@ -132,6 +134,10 @@ def main():
         MAISI_CONFIG["resume_wandb_id"] = args.resume_wandb_id
     if args.override_lr:
         MAISI_CONFIG["override_lr"] = args.override_lr == "True"
+    if args.no_scheduler:
+        MAISI_CONFIG["no_scheduler"] = args.no_scheduler == "True"
+    if args.full_val:
+        MAISI_CONFIG["full_val"] = args.full_val == "True"
     if args.vae_compile:
         MAISI_CONFIG["vae_compile"] = args.vae_compile == "True"
     if args.tags:

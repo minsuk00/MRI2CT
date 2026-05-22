@@ -24,17 +24,20 @@
 # 30k opt steps × eff_bs=8 = 240k samples.
 PREFIX="maisi"
 SPLIT_FILE="splits/center_wise_split.txt"
-LR="5e-4"
+LR="1e-4"                   # lowered from 5e-4: original PolynomialLR decayed to ~0 by step 30k, so 5e-4 on resume = ~5x jump above the late-training effective LR. 1e-4 fine-tunes rather than soft-restarts.
 BATCH_SIZE=1                # full-volume; cannot increase
 ACCUM_STEPS=8               # effective batch = 1 × 8 = 8 samples/optimizer step
-EPOCHS=600                  # 30k opt steps
+EPOCHS=1500                 # extended past original 600 (30k -> 75k opt steps); scheduler disabled so LR stays constant
 STEPS_PER_EPOCH=50
-VAL_INTERVAL=100            # 6 validations across 600 epochs — cheap intermediate signal, save full eval for final checkpoint
+VAL_INTERVAL=50             # reduced val (1 subj/region = ~5) is cheap; fire often for a progress signal
+FULL_VAL="False"            # 1-subject-per-region val (~5 subjects) instead of all 207 — like cWDM. Full eval lives in src/maisi_baseline/validate.py.
 AUGMENT="False"             # match ablation: no random augmentation
 VAE_COMPILE="True"          # confirmed best — VAE input fixed-size, compiles once
 PREENCODED_LATENTS_DIR="/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD/1.5mm_registered_flat_masked_maisi_latents"   # Leave empty to encode on-the-fly. Generate with src/maisi_baseline/encode_all_volumes.py.
-RESUME_ID="5hprtpwl"                # Fresh run from scratch
-TAGS="noaug,lr5e-4"
+NO_SCHEDULER="True"         # disable PolynomialLR -> constant LR for extended training past the original poly-decay horizon
+OVERRIDE_LR="True"          # reset optimizer LR to $LR=1e-4 (checkpoint state has it decayed near 0 by the old scheduler)
+RESUME_ID="5hprtpwl"                # resume run; extend past original 30k-step poly-decay horizon
+TAGS="noaug,lr5e-4,extended"
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -61,7 +64,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/maisi_baseline/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --batch_size $BATCH_SIZE --lr $LR --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --accum_steps $ACCUM_STEPS --vae_compile $VAE_COMPILE --augment $AUGMENT"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --batch_size $BATCH_SIZE --lr $LR --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --accum_steps $ACCUM_STEPS --vae_compile $VAE_COMPILE --augment $AUGMENT --no_scheduler $NO_SCHEDULER --override_lr $OVERRIDE_LR --full_val $FULL_VAL"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_wandb_id $RESUME_ID"
 fi

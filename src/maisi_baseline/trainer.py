@@ -227,6 +227,11 @@ class MAISITrainer(BaseTrainer):
     def _setup_opt(self):
         self.optimizer = torch.optim.AdamW(self.controlnet.parameters(), lr=self.cfg.lr)
 
+        if getattr(self.cfg, "no_scheduler", False):
+            print(f"[{self.prefix}] 📉 Scheduler disabled — constant LR={self.cfg.lr}")
+            self.scheduler = None
+            return
+
         # Standardize: Use fixed steps_per_epoch for comparability with other models
         total_steps = self.cfg.total_epochs * self.cfg.steps_per_epoch
         print(f"[{self.prefix}] 📉 Learning rate scheduler: total_steps={total_steps} (Epochs={self.cfg.total_epochs}, Steps/Epoch={self.cfg.steps_per_epoch})")
@@ -477,7 +482,8 @@ class MAISITrainer(BaseTrainer):
                 with timer.gpu("optimizer"):
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.controlnet.parameters(), 1.0)
                     self.optimizer.step()
-            self.scheduler.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
 
             total_loss += step_loss
             total_grad += grad_norm.item()
@@ -631,6 +637,39 @@ class MAISITrainer(BaseTrainer):
         n_val = len(self.val_indices_to_run)
         extra = {"avg_inference_time": (time.time() - t_inf_start) / n_val if n_val > 0 else 0.0}
         avg_met = self._log_val_metrics(val_metrics, extra=extra, subject_ids=val_subject_ids)
+
+        # Train-side viz: sample one random in-flight training subject so we can
+        # compare train/* vs val/* trajectories for overfitting.
+        if self.cfg.wandb:
+            try:
+                tb = next(self.train_iter)
+                tr_mr      = tb["mri"].to(self.device)
+                tr_spacing = tb["ct_spacing"].float().to(self.device) * 100.0
+                tr_subj    = tb.get("subj_id", ["?"])[0]
+                tr_shape   = tb["original_shape"][0].tolist()
+
+                tr_pred_latent = self._sample(tr_mr, tr_spacing, num_steps=self.cfg.num_inference_steps)
+                tr_pred_norm   = self._decode(tr_pred_latent)
+
+                # GT via VAE roundtrip — keeps preencoded and non-preencoded paths uniform.
+                if self.preencoded_dir is not None:
+                    tr_ct_emb = tb["ct_latent"].to(self.device)
+                else:
+                    tr_ct     = tb["ct"].to(self.device)
+                    tr_ct_emb = self._encode_sliding_window(tr_ct) * self.scale_factor
+                tr_gt_norm = self._decode(tr_ct_emb)
+
+                tr_pred_u = unpad(tr_pred_norm.float(), tr_shape)
+                tr_gt_u   = unpad(tr_gt_norm.float(), tr_shape)
+                tr_mr_u   = unpad(tr_mr.float(), tr_shape)
+                visualize_lite(tr_pred_u, tr_gt_u, tr_mr_u, tr_subj, tr_shape, self.global_step, epoch, log_name="viz/train")
+
+                del tr_mr, tr_pred_latent, tr_pred_norm, tr_ct_emb, tr_gt_norm, tr_pred_u, tr_gt_u, tr_mr_u
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[{self.prefix}] [WARNING] train viz failed: {e}")
+
         return avg_met
 
     def _log_training_patch(self, mr, ct, decoded_ct, step, step_idx, subj_id=None):
