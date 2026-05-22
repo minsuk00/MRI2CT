@@ -1,188 +1,191 @@
+"""
+OOD inference on MRNet knee MR volumes across all 5 model families.
+
+Models: see `_family_dispatch.MODELS` — unet_300k, amix_v1_4_300k, maisi, cwdm, mcddpm.
+
+For the chosen subject, runs every model on the 3 reoriented planes
+(axial / coronal / sagittal, all 1.5 mm iso) and saves:
+
+  <out_dir>/subject<id>/
+    unet_300k/       pred_ct_{axial,coronal,sagittal}.nii.gz
+    amix_v1_4_300k/  ...
+    maisi/           ...
+    cwdm/            ...
+    mcddpm/          ...
+    comparison_axial.png    (3 anat views × 6 cols: MRI + 5 model preds)
+    comparison_coronal.png
+    comparison_sagittal.png
+
+All models were trained on SynthRAD abdomen/thorax CT — knee anatomy is *very*
+OOD; predictions are exploratory, not faithful. The pre-existing `ct_predictions/`
+folder (legacy UNet+Amix outputs from the old 2-model version of this script) is
+left untouched.
+"""
+
 import argparse
 import os
 import sys
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import torch
-from monai.inferers import sliding_window_inference
-from monai.transforms import (
-    Compose,
-    DivisiblePad,
-    EnsureChannelFirst,
-    LoadImage,
-    Orientation,
-    ScaleIntensity,
-    SpatialPad,
-)
 
-# Add project root and src to path
-SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROJECT_ROOT = os.path.dirname(SRC_ROOT)
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(PROJECT_ROOT)
-sys.path.append(SRC_ROOT)
-
-from anatomix.model.network import Unet
+sys.path.append(os.path.join(PROJECT_ROOT, "src"))
 
 from common.utils import unpad
 
+from src.evaluate._family_dispatch import (
+    MODELS,
+    infer_for_family,
+    load_for_family,
+    preprocess_for_family,
+    to_hu,
+)
 
-def clean_state_dict(state_dict):
-    """Removes '_orig_mod.' prefix from keys if present."""
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        name = k[10:] if k.startswith("_orig_mod.") else k
-        new_state_dict[name] = v
-    return new_state_dict
+
+PLANES = ["axial", "coronal", "sagittal"]
 
 
-def create_comparison_figure(mri, pred_unet, pred_amix, subj_id, plane, out_path):
-    """Generates a comparison PNG with middle slices of all 3 orthogonal views."""
-    # Data is (X, Y, Z)
-    nx, ny, nz = mri.shape
+def get_mrnet_vols(data_dir, subj_id):
+    subj_dir = os.path.join(data_dir, f"subject{subj_id}")
+    return {plane: os.path.join(subj_dir, f"{plane}.nii.gz") for plane in PLANES}
+
+
+def _stretch01(x):
+    """Rescale array to [0, 1] for display."""
+    lo, hi = float(x.min()), float(x.max())
+    if hi - lo < 1e-6:
+        return np.zeros_like(x)
+    return (x - lo) / (hi - lo)
+
+
+def _ct_to_disp(hu):
+    """Clip predicted HU to amix window [-1024, 1024] → [0, 1] for display."""
+    return np.clip((hu + 1024.0) / 2048.0, 0.0, 1.0)
+
+
+def save_comparison_figure(mri_np, preds_by_model, plane_name, subj_id, out_path):
+    """3 rows (axial/coronal/sagittal mid-slices) × N+1 cols (MRI + per-model pred).
+
+    Inputs are (X, Y, Z) numpy arrays of the same shape (one input plane volume +
+    one prediction per model). All viewed as the same 3 orthogonal mid-slices.
+    """
+    model_names = list(preds_by_model.keys())
+    nx, ny, nz = mri_np.shape
     mid_x, mid_y, mid_z = nx // 2, ny // 2, nz // 2
 
-    # Normalize CT predictions (HU -1024 to 1024) to [0, 1] for visualization
-    def normalize_ct(vol):
-        return np.clip((vol + 1024) / 2048.0, 0, 1)
+    mri_disp = _stretch01(mri_np)
+    pred_disps = {name: _ct_to_disp(p) for name, p in preds_by_model.items()}
 
-    pred_unet_viz = normalize_ct(pred_unet)
-    pred_amix_viz = normalize_ct(pred_amix)
+    views = [
+        ("Axial",    mid_z, lambda v, idx: np.rot90(v[:, :, idx])),
+        ("Coronal",  mid_y, lambda v, idx: np.rot90(v[:, idx, :])),
+        ("Sagittal", mid_x, lambda v, idx: np.rot90(v[idx, :, :])),
+    ]
+    columns = [("Input MRI", mri_disp)] + [(name, pred_disps[name]) for name in model_names]
 
-    # Normalize MRI (0-99th percentile)
-    mri_viz = np.clip(mri, 0, np.percentile(mri, 99))
-    mri_viz = mri_viz / (mri_viz.max() + 1e-8)
-
-    # Columns: MRI, UNet, Anatomix
-    volumes = [(mri_viz, "Input MRI"), (pred_unet_viz, "UNet Prediction"), (pred_amix_viz, "Anatomix Prediction")]
-
-    # Rows: Axial (Z-slice), Coronal (Y-slice), Sagittal (X-slice)
-    views = [("Axial", mid_z, lambda v, idx: np.rot90(v[:, :, idx])), ("Coronal", mid_y, lambda v, idx: np.rot90(v[:, idx, :])), ("Sagittal", mid_x, lambda v, idx: np.rot90(v[idx, :, :]))]
-
-    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
-    plt.subplots_adjust(wspace=0.05, hspace=0.1)
+    ncols = len(columns)
+    nrows = len(views)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.6 * ncols, 2.6 * nrows))
+    plt.subplots_adjust(wspace=0.04, hspace=0.08)
 
     for i, (view_name, slice_idx, slice_fn) in enumerate(views):
-        for j, (vol_data, vol_name) in enumerate(volumes):
+        for j, (col_title, vol) in enumerate(columns):
             ax = axes[i, j]
-            slice_data = slice_fn(vol_data, slice_idx)
-            ax.imshow(slice_data, cmap="gray", vmin=0, vmax=1)
-
-            # Labeling
+            ax.imshow(slice_fn(vol, slice_idx), cmap="gray", vmin=0.0, vmax=1.0)
             if i == 0:
-                ax.set_title(vol_name, fontsize=16, pad=10)
+                ax.set_title(col_title, fontsize=11, pad=6)
             if j == 0:
-                ax.set_ylabel(f"{view_name}\nSlice {slice_idx}", fontsize=14, labelpad=10)
-
+                ax.set_ylabel(f"{view_name}\nslice {slice_idx}", fontsize=10, labelpad=6)
             ax.set_xticks([])
             ax.set_yticks([])
 
-    fig.suptitle(f"MRNet Evaluation: {subj_id} ({plane.capitalize()})\nMiddle Slices Comparison", fontsize=22, y=0.98)
-    plt.savefig(out_path, bbox_inches="tight", dpi=150)
+    fig.suptitle(f"MRNet subject{subj_id} — input plane: {plane_name}", fontsize=14, y=0.99)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"🖼️ Saved 3-view comparison figure to {out_path}")
+    print(f"  Saved comparison → {out_path}")
 
 
-@torch.inference_mode()
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate SynthRAD models on MRNet Knee MRI")
+    parser = argparse.ArgumentParser(description="OOD MRNet knee inference with all 5 models.")
     parser.add_argument("--subj_id", type=str, default="0016")
-    parser.add_argument("--name", type=str, default="ct_predictions", help="Subfolder name for these predictions")
-    parser.add_argument("--unet_ckpt", type=str, required=True)
-    parser.add_argument("--amix_ckpt", type=str, required=True)
-    parser.add_argument("--data_dir", type=str, default="MRNet_Knee_1.5mm")
-    parser.add_argument("--out_dir", type=str, default="MRNet_Knee_1.5mm", help="Output directory")
-    parser.add_argument("--patch_size", type=int, default=128)
-    parser.add_argument("--overlap", type=float, default=0.7)
+    parser.add_argument("--data_dir", type=str, default=os.path.join(PROJECT_ROOT, "MRNet_Knee_1.5mm"))
+    parser.add_argument("--out_dir", type=str, default=None,
+                        help="Output base dir; defaults to --data_dir (writes alongside the input).")
     args = parser.parse_args()
+    if args.out_dir is None:
+        args.out_dir = args.data_dir
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Using device: {device}")
+    print(f"Device: {device}")
+    print(f"Subject: subject{args.subj_id}")
 
-    subj_dir = os.path.join(args.data_dir, f"subject{args.subj_id}")
-    out_subj_dir = os.path.join(args.out_dir, f"subject{args.subj_id}", args.name)
-    os.makedirs(out_subj_dir, exist_ok=True)
+    vols = get_mrnet_vols(args.data_dir, args.subj_id)
+    for plane, path in vols.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing MRNet volume: {path}")
 
-    # 1. Load Models
-    print("🏗️ Loading UNet Baseline...")
-    unet_model = Unet(dimension=3, input_nc=1, output_nc=1, num_downs=4, ngf=16, final_act="sigmoid").to(device)
-    unet_ckpt = torch.load(args.unet_ckpt, map_location=device)
-    unet_model.load_state_dict(clean_state_dict(unet_ckpt["model_state_dict"]))
-    unet_model.eval()
+    subj_out_dir = os.path.join(args.out_dir, f"subject{args.subj_id}")
+    os.makedirs(subj_out_dir, exist_ok=True)
 
-    print("🏗️ Loading Anatomix MRI2CT...")
-    amix_ckpt = torch.load(args.amix_ckpt, map_location=device)
-    translator_state = clean_state_dict(amix_ckpt["model_state_dict"])
+    # preds[plane][model_name] = pred_hu_np  (unpadded, (X, Y, Z))
+    preds = {plane: {} for plane in PLANES}
+    # mri_unpadded[plane] = mri_np from any one preprocess (we'll save the first family's mri).
+    mri_unpadded = {}
+    affines = {}
 
-    first_conv_weight = translator_state.get("model.0.weight", None)
-    translator_input_nc = first_conv_weight.shape[1] if first_conv_weight is not None else 16
+    for model_name, info in MODELS.items():
+        family = info["family"]
+        print(f"\n{'=' * 60}\nModel: {model_name} (family={family})\n{'=' * 60}")
+        ckpt_path = info["ckpt_path"]
 
-    feat_extractor = Unet(3, 1, 16, 5, 20, norm="instance", interp="trilinear", pooling="Avg").to(device)
-    translator = Unet(dimension=3, input_nc=translator_input_nc, output_nc=1, num_downs=4, ngf=16, final_act="sigmoid").to(device)
-    translator.load_state_dict(translator_state)
+        family_tag, bundle, cfg, epoch = load_for_family(family, ckpt_path, device)
+        print(f"  Loaded (epoch={epoch}) from {os.path.basename(ckpt_path)}")
 
-    if "feat_extractor_state_dict" in amix_ckpt:
-        feat_extractor.load_state_dict(clean_state_dict(amix_ckpt["feat_extractor_state_dict"]))
-    else:
-        default_amix = os.path.join(PROJECT_ROOT, "anatomix/model-weights/best_val_net_G_v2.pth")
-        if os.path.exists(default_amix):
-            feat_extractor.load_state_dict(clean_state_dict(torch.load(default_amix, map_location=device)))
+        model_out_dir = os.path.join(subj_out_dir, model_name)
+        os.makedirs(model_out_dir, exist_ok=True)
 
-    feat_extractor.eval()
-    translator.eval()
+        for plane, vol_path in vols.items():
+            print(f"  [{plane}] preprocessing...")
+            mri_tensor, orig_shape, affine, voxel_sizes = preprocess_for_family(family, vol_path, cfg)
+            mri_tensor = mri_tensor.unsqueeze(0).to(device)
+            print(f"    Shape: {list(mri_tensor.shape[2:])}, voxel_sizes: {voxel_sizes.round(2).tolist()}, running inference...")
 
-    def amix_forward(x):
-        f = feat_extractor(x)
-        if translator_input_nc > 16:
-            f = torch.cat([f, x], dim=1)
-        return translator(f)
+            pred = infer_for_family(family, bundle, cfg, mri_tensor, voxel_sizes, device)
 
-    # 2. Process each plane
-    planes = ["axial", "coronal", "sagittal"]
-    roi_size = (args.patch_size, args.patch_size, args.patch_size)
+            pred_unpad = unpad(pred.float(), orig_shape)
+            if family == "mcddpm":
+                pred_hu = pred_unpad.cpu().numpy().squeeze()
+            else:
+                pred_hu = to_hu(family, pred_unpad).cpu().numpy().squeeze()
 
-    for plane in planes:
-        mri_path = os.path.join(subj_dir, f"{plane}.nii.gz")
-        if not os.path.exists(mri_path):
-            print(f"⚠️ Skipping {plane}, file not found: {mri_path}")
-            continue
+            ct_path = os.path.join(model_out_dir, f"pred_ct_{plane}.nii.gz")
+            nib.save(nib.Nifti1Image(pred_hu.astype(np.float32), affine), ct_path)
+            print(f"    Saved CT → {ct_path}")
 
-        print(f"\n📂 Processing {plane.upper()}...")
-        # MRI-only MONAI preprocessing (matches get_cached_transforms with no CT, no mask).
-        pre_pad = Compose([
-            LoadImage(image_only=True),
-            EnsureChannelFirst(),
-            Orientation(axcodes="RAS"),
-            ScaleIntensity(minv=0.0, maxv=1.0),
-        ])
-        img = pre_pad(mri_path)
-        orig_shape = list(img.shape[1:])
-        affine = np.asarray(img.affine.cpu()) if hasattr(img.affine, "cpu") else np.asarray(img.affine)
+            preds[plane][model_name] = pred_hu
+            if plane not in mri_unpadded:
+                mri_unpadded[plane] = unpad(mri_tensor.float(), orig_shape).cpu().numpy().squeeze()
+                affines[plane] = affine
 
-        img_padded = DivisiblePad(k=32, method="end", mode="constant")(
-            SpatialPad(spatial_size=(args.patch_size,) * 3, method="end", mode="constant")(img)
+        del bundle
+        torch.cuda.empty_cache()
+
+    # Build one 3×6 figure per input plane (MRI + 5 model preds, 3 mid-slice views).
+    print(f"\n{'=' * 60}\nBuilding comparison figures\n{'=' * 60}")
+    for plane in PLANES:
+        out_path = os.path.join(subj_out_dir, f"comparison_{plane}.png")
+        save_comparison_figure(
+            mri_unpadded[plane], preds[plane], plane, args.subj_id, out_path
         )
-        mri_tensor = img_padded.unsqueeze(0).float().to(device)
 
-        with torch.autocast(device_type="cuda" if "cuda" in str(device) else "cpu", dtype=torch.bfloat16):
-            p_unet = sliding_window_inference(mri_tensor, roi_size, 4, unet_model, overlap=args.overlap)
-            p_amix = sliding_window_inference(mri_tensor, roi_size, 4, amix_forward, overlap=args.overlap)
-
-        p_unet_unpad = unpad(p_unet, orig_shape).squeeze().float().cpu().numpy()
-        p_unet_hu = (p_unet_unpad * 2048.0) - 1024.0
-
-        p_amix_unpad = unpad(p_amix, orig_shape).squeeze().float().cpu().numpy()
-        p_amix_hu = (p_amix_unpad * 2048.0) - 1024.0
-
-        nib.save(nib.Nifti1Image(p_unet_hu, affine), os.path.join(out_subj_dir, f"pred_ct_unet_{plane}.nii.gz"))
-        nib.save(nib.Nifti1Image(p_amix_hu, affine), os.path.join(out_subj_dir, f"pred_ct_amix_{plane}.nii.gz"))
-
-        mri_data = unpad(img_padded, orig_shape).squeeze().cpu().numpy()
-        viz_path = os.path.join(out_subj_dir, f"comparison_3view_{plane}.png")
-        create_comparison_figure(mri_data, p_unet_hu, p_amix_hu, args.subj_id, plane, viz_path)
-
-    print(f"\n✅ Done! Results saved to {out_subj_dir}")
+    print(f"\nDone. Outputs under {subj_out_dir}")
 
 
 if __name__ == "__main__":
