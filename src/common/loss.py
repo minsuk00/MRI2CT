@@ -14,7 +14,11 @@ def get_class_dice(logits, target_mask, mask=None, bone_idx=5):
     Returns: class_dices [C], bone_dice scalar (or None if bone_idx out of range)
     """
     smooth = 1e-5
-    probs = F.softmax(logits, dim=1)  # [B, C, X, Y, Z]
+    # Cast to fp32 before softmax: fp16 probs.sum() over millions of voxels
+    # overflows (fp16 max ≈ 65504), zeroing high-mass classes' Dice (e.g. bone).
+    # Triggered when val data is fp16 via use_float16_storage. bf16 is safe
+    # (fp32-range exponent), but fp32 is cheap insurance.
+    probs = F.softmax(logits.float(), dim=1)  # [B, C, X, Y, Z]
     if target_mask.ndim == 5:
         target_mask = target_mask.squeeze(1)  # [B, X, Y, Z]
 
