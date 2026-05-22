@@ -6,8 +6,8 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Brain diagnostic UNets (fresh runs).
-bash "$SCRIPT_DIR/train_unet_brain_random.sh"
 bash "$SCRIPT_DIR/train_unet_brain_center_wise.sh"
+bash "$SCRIPT_DIR/train_unet_brain_random.sh"
 
 # Resumes of the all-region center-wise baselines.
 bash "$SCRIPT_DIR/train_amix_v1_3.sh"
