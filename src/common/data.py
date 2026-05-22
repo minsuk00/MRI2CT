@@ -395,12 +395,10 @@ def get_gpu_transforms(
 
     Operates on a **5D batched dict** `{mri: (B,1,H,W,D), ct: (B,1,H,W,D),
     [seg: (B,1,H,W,D)]}`. Each item in the batch gets independent random
-    parameters. Spatial ops (flip, rotate90, affine, elastic) are fused into
-    a single grid_sample call via `lazy=True`. Photometric ops apply only
-    to "mri".
-
-    Note: batchaug splits MONAI's `Rand3DElasticd` into separate `RandAffined`
-    + `Rand3DElasticd`. Lazy fusion means the cost is the same as one call.
+    parameters. Affine spatial ops (flip, rotate90, affine) are fused into
+    a single grid_sample call via `lazy=True`. `Rand3DElasticd` runs eagerly
+    (non-affine warp) — its own per-key `mode_dict` is passed so seg still
+    gets nearest-neighbor interpolation. Photometric ops apply only to "mri".
 
     body_mask is intentionally NOT augmented here: it's only used for
     weighted cropping upstream and is not consumed after GPU aug.
@@ -449,6 +447,7 @@ def get_gpu_transforms(
             prob=aug_prob,
             sigma_range=elastic_sigma_range,
             magnitude_range=elastic_magnitude_range,
+            mode=mode_dict,
             padding_mode="zeros",
         ),
         B.RandConvd(
