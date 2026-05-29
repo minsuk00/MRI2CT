@@ -12,12 +12,14 @@ results/
 data/
 *.pyc
 /anatomix/
+/inference/
 dataset
 CADS/
 maisi-mr-to-ct/
 pyproject.toml
 .vscodde/
 _archive/
+_archive
 .gemini/
 gha-creds-*.json
 *.pt
@@ -26,3 +28,25 @@ gha-creds-*.json
 *.h5
 *.log
 *.csv
+
+# GPFS-symlinked dirs (data/outputs live on GPFS, like wandb/dataset above)
+ckpt
+evaluation_results
+
+# Vendored external repos with their own .git (re-clonable upstream, not tracked here)
+/PortPy/
+/NV-Generate-CTMR/
+/batchaug/
+/MRNet_Knee_1.5mm/
+/baselines/koalAI/
+/baselines/koalAI-seg/
+/baselines/vs-ddpm/
+
+# Regenerable outputs / artifacts
+*.nii
+*.nii.gz
+*.npy
+*.out
+*.html
+slurm_logs/
+/*.png
