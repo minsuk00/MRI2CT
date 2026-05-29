@@ -3,7 +3,9 @@ A script for training a diffusion model for paired image-to-image translation.
 """
 
 import argparse
+import glob
 import os
+import re
 import numpy as np
 import random
 import sys
@@ -21,6 +23,54 @@ from guided_diffusion.train_util import TrainLoop
 from guided_diffusion.bratsloader import BRATSVolumes
 from guided_diffusion.synthradloader import SynthRADVolumes
 from torch.utils.tensorboard import SummaryWriter
+
+
+def checkpoint_step(path, dataset):
+    """Training step encoded by a checkpoint path, or -1 if undeterminable.
+
+    - ``<dataset>_NNNNNN.pt``  -> int(NNNNNN)            (milestone)
+    - ``<dataset>_last.pt``    -> int from sibling ``last_step.txt`` (rolling)
+    """
+    base = os.path.basename(path)
+    if base == f"{dataset}_last.pt":
+        sidecar = os.path.join(os.path.dirname(path), "last_step.txt")
+        try:
+            with open(sidecar) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return -1
+    m = re.fullmatch(rf"{re.escape(dataset)}_(\d+)\.pt", base)
+    return int(m.group(1)) if m else -1
+
+
+def discover_resume_checkpoint(wb_dir, resume_id, dataset):
+    """Pick the resume checkpoint with the HIGHEST training step across *all*
+    ``run-*-<id>`` dirs of a wandb run id.
+
+    A single wandb run id accumulates one run dir per resume session, each with
+    its own ``<dataset>_last.pt`` at a different step. Selecting by glob order
+    (the old ``[0]`` bug) could resume from a stale, lower-step checkpoint —
+    redoing finished steps and, because wandb enforces monotonic steps per id,
+    silently dropping all subsequently-logged metrics.
+
+    Considers both rolling ``_last.pt`` and ``_NNNNNN.pt`` milestones; on a tie
+    prefers ``_last.pt`` (freshest). Returns ``(path, step)`` or ``(None, -1)``.
+    """
+    run_dir_globs = [f"run-*-{resume_id}", f"offline-run-*-{resume_id}"]
+    cand = []
+    for g in run_dir_globs:
+        ck = os.path.join(wb_dir, "wandb", g, "files", "checkpoints")
+        cand.extend(glob.glob(os.path.join(ck, f"{dataset}_last.pt")))
+        cand.extend(glob.glob(os.path.join(ck, f"{dataset}_[0-9]*.pt")))
+    if not cand:
+        return None, -1
+
+    def key(p):
+        is_last = os.path.basename(p) == f"{dataset}_last.pt"
+        return (checkpoint_step(p, dataset), int(is_last))
+
+    best = max(cand, key=key)
+    return best, checkpoint_step(best, dataset)
 
 
 def main():
@@ -73,37 +123,18 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     logger.configure(dir=log_dir)
 
-    # Auto-discover the latest checkpoint when resuming via wandb id (amix-style ergonomics):
-    # if --wandb_resume_id is set but --resume_checkpoint is empty:
-    #   1. Prefer the rolling `<dataset>_last.pt` if it exists (newest, written every save_last_interval).
-    #   2. Else fall back to the highest-numbered milestone `<dataset>_NNNNNN.pt`.
+    # Auto-discover the resume checkpoint when resuming via wandb id (amix-style
+    # ergonomics): if --wandb_resume_id is set but --resume_checkpoint is empty,
+    # pick the HIGHEST-step checkpoint across all run-*-<id> dirs (see
+    # discover_resume_checkpoint for why glob order is unsafe).
     if args.use_wandb and args.wandb_resume_id and not args.resume_checkpoint:
-        import glob
         wb_dir = os.environ.get('WANDB_DIR', '.')
-        run_dir_globs = [f'run-*-{args.wandb_resume_id}', f'offline-run-*-{args.wandb_resume_id}']
-
-        # 1. Look for rolling last.pt first.
-        last_pt = []
-        for g in run_dir_globs:
-            last_pt.extend(glob.glob(os.path.join(wb_dir, 'wandb', g, 'files', 'checkpoints', f'{args.dataset}_last.pt')))
-        if last_pt:
-            args.resume_checkpoint = last_pt[0]
-            logger.log(f"[resume] auto-discovered rolling last checkpoint: {args.resume_checkpoint}")
+        best, step = discover_resume_checkpoint(wb_dir, args.wandb_resume_id, args.dataset)
+        if best:
+            args.resume_checkpoint = best
+            logger.log(f"[resume] selected highest-step checkpoint (step={step}): {best}")
         else:
-            # 2. Fall back to milestones.
-            patterns = [
-                os.path.join(wb_dir, 'wandb', g, 'files', 'checkpoints', f'{args.dataset}_[0-9]*.pt')
-                for g in run_dir_globs
-            ]
-            cand = []
-            for p in patterns:
-                cand.extend(glob.glob(p))
-            cand = sorted(cand, key=lambda p: os.path.basename(p))
-            if cand:
-                args.resume_checkpoint = cand[-1]
-                logger.log(f"[resume] no last.pt; using highest milestone: {args.resume_checkpoint}")
-            else:
-                logger.log(f"[resume] wandb_resume_id={args.wandb_resume_id} set but no checkpoint found under {wb_dir}/wandb/*-{args.wandb_resume_id}/...")
+            logger.log(f"[resume] wandb_resume_id={args.wandb_resume_id} set but no checkpoint found under {wb_dir}/wandb/*-{args.wandb_resume_id}/...")
 
     dist_util.setup_dist(devices=args.devices)
 
