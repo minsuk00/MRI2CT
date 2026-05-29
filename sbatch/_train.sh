@@ -5,14 +5,14 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Brain diagnostic UNets (fresh runs).
+# Resumes of the brain diagnostic UNets.
 bash "$SCRIPT_DIR/train_unet_brain_center_wise.sh"
 bash "$SCRIPT_DIR/train_unet_brain_random.sh"
 
 # Resumes of the all-region center-wise baselines.
-bash "$SCRIPT_DIR/train_amix_v1_3.sh"
+# bash "$SCRIPT_DIR/train_amix_v1_3.sh"
 bash "$SCRIPT_DIR/train_amix_v1_4.sh"
 bash "$SCRIPT_DIR/train_cwdm.sh"
-bash "$SCRIPT_DIR/train_maisi_noaug.sh"
+# bash "$SCRIPT_DIR/train_maisi_noaug.sh"
 bash "$SCRIPT_DIR/train_mcddpm.sh"
 

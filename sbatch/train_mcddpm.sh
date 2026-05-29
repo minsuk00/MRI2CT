@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=48g
-#SBATCH --time=48:00:00
+#SBATCH --time=14-00:00:00
 #SBATCH --mail-user=minsukc@umich.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
@@ -27,9 +27,9 @@ USE_AMP="True"     # bf16 autocast — matches notebook AMP path, safer than fp1
 USE_CHECKPOINT="False"
 DIFFUSION_STEPS=1000
 VAL_STEPS=25
-EPOCHS=1500               # extended past original 500 (250k -> 750k opt steps); LR stays constant since LR_ANNEAL_STEPS=0
+EPOCHS=7000               # extend further; LR stays constant since LR_ANNEAL_STEPS=0
 STEPS_PER_EPOCH=500
-SAVE_INTERVAL=5
+SAVE_INTERVAL=50          # bumped from 5: at SAVE_INTERVAL=5 a 657MB snapshot every 5 epochs filled the gpfs quota
 VAL_INTERVAL=5
 VAL_SUBJ_ID="1THB011"
 NUM_WORKERS=4
