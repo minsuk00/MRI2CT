@@ -24,12 +24,13 @@ WEIGHTED_SAMPLER="True"
 NORM="batch"  # "batch", "instance", or "none"
 DICE_W=0.1
 DICE_BONE_W=0.3
+PERCEPTUAL_W=0.0          # Anatomix v1_4 perceptual loss weight (0 = off)
 BATCH_SIZE=8
 EPOCHS=800
 STEPS_PER_EPOCH=500     # halved from 1000 since BATCH_SIZE doubled; keeps total samples_seen at 3.2M
-VAL_INTERVAL=5
+VAL_INTERVAL=20
 NUM_WORKERS=4
-RESUME_ID="" # Leave empty if not resuming
+RESUME_ID="6lqy7zz7" # Leave empty if not resuming
 TAGS="brain,random,bs8" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
@@ -60,7 +61,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/unet_baseline/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --perceptual_w $PERCEPTUAL_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi

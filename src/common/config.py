@@ -86,6 +86,8 @@ DEFAULT_CONFIG = {
     "dice_bone_w": 0.0,
     "dice_bone_idx": 5,
     "dice_exclude_background": True,
+    "perceptual_w": 0.0,  # Anatomix v1_4 perceptual loss weight (0 = off)
+    "perceptual_layers": None,  # comma-separated encoder layer indices; None -> all encoder_idx
     "wandb_tags": [],
     "wandb_note": "test_run",
     "resume_wandb_id": None,
@@ -93,7 +95,7 @@ DEFAULT_CONFIG = {
     "diverge_wandb_branch": False,
     # Validation Saving
     "save_val_volumes": True,
-    "val_save_interval": 100,  # Save epoch-stamped predictions every N epochs (0 = disabled)
+    "val_save_interval": 0,  # Save epoch-stamped predictions every N epochs (0 = disabled)
     "full_val": True,
     # DRR Validation
     "val_drr": True,

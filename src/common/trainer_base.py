@@ -579,6 +579,12 @@ class BaseTrainer:
             if avg_body:
                 wandb.log({f"val_body/{k}": v for k, v in avg_body.items() if k not in exclude}, step=self.global_step)
 
+        if self.cfg.wandb and subject_ids is not None and "psnr" in val_metrics:
+            region_psnr = defaultdict(list)
+            for subj_id, v in zip(subject_ids, val_metrics["psnr"]):
+                region_psnr[get_region_key(subj_id)].append(v)
+            wandb.log({f"val_region/psnr/{r}": np.mean(vs) for r, vs in region_psnr.items()}, step=self.global_step)
+
         if subject_ids is not None and "mae_hu" in val_metrics:
             self._save_val_ranking(subject_ids, val_metrics)
 
@@ -784,18 +790,28 @@ class BaseTrainer:
         return save_path
 
     def _setup_loss(self):
-        from common.loss import CompositeLoss
+        from common.loss import AnatomixPerceptualLoss, CompositeLoss
+
+        perceptual_w = getattr(self.cfg, "perceptual_w", 0.0)
+        perceptual = None
+        if perceptual_w > 0:
+            layers = getattr(self.cfg, "perceptual_layers", None)
+            if isinstance(layers, str):
+                layers = [int(x) for x in layers.split(",") if x.strip()]
+            perceptual = AnatomixPerceptualLoss(layers=layers, device=self.device)
 
         self.loss_fn = CompositeLoss(
             weights={
                 "l1": self.cfg.l1_w,
                 "l2": self.cfg.l2_w,
                 "ssim": self.cfg.ssim_w,
+                "perceptual": perceptual_w,
                 "dice_w": getattr(self.cfg, "dice_w", 0.0),
                 "dice_bone_w": getattr(self.cfg, "dice_bone_w", 0.0),
                 "dice_bone_idx": getattr(self.cfg, "dice_bone_idx", 5),
                 "dice_exclude_background": getattr(self.cfg, "dice_exclude_background", True),
-            }
+            },
+            perceptual=perceptual,
         ).to(self.device)
 
     @torch.inference_mode()

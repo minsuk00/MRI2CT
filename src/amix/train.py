@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensi
 
 EXPERIMENT_CONFIG = [
     {
-        "val_interval": 5,
+        "val_interval": 20,
         "steps_per_epoch": 500,    # halved from 1000 since batch_size doubled (4→8); keeps total samples_seen
         "model_save_interval": 200,
         "total_epochs": 1000,
@@ -103,6 +103,8 @@ if __name__ == "__main__":
     parser.add_argument("--val_interval", type=int, help="Run validation every N epochs")
     parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
     parser.add_argument("--mri_norm", type=str, choices=["minmax", "percentile"], help="MRI normalization: 'minmax' (default) or 'percentile' (0–99.5, same as MAISI)")
+    parser.add_argument("--perceptual_w", type=float, help="Anatomix v1_4 perceptual loss weight (0=off)")
+    parser.add_argument("--perceptual_layers", type=str, help="Comma-separated encoder layer indices, e.g. '8,15,22,29' (default: all)")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
@@ -173,6 +175,10 @@ if __name__ == "__main__":
             exp["stage_data"] = args.stage_data == "True"
         if args.mri_norm is not None:
             exp["mri_norm"] = args.mri_norm
+        if args.perceptual_w is not None:
+            exp["perceptual_w"] = args.perceptual_w
+        if args.perceptual_layers is not None:
+            exp["perceptual_layers"] = args.perceptual_layers
 
         print(f"\n{'=' * 40}")
         print(f"STARTING EXPERIMENT {i + 1}/{len(EXPERIMENT_CONFIG)}")

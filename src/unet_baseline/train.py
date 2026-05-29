@@ -45,7 +45,7 @@ BASELINE_CONFIG = {
     "lr": 3e-4,
     "total_epochs": 1000,
     "steps_per_epoch": 500,    # halved from 1000 since batch_size doubled (4→8); keeps total samples_seen
-    "val_interval": 5,
+    "val_interval": 20,
     "model_save_interval": 200,
     "use_weighted_sampler": True,
     "resume_wandb_id": None,
@@ -86,6 +86,8 @@ BASELINE_CONFIG = {
     "l1_w": 1.0,
     "ssim_w": 0.1,
     "l2_w": 0.0,
+    "perceptual_w": 0.0,  # Anatomix v1_4 perceptual loss weight (0 = off)
+    "perceptual_layers": None,  # comma-separated encoder layer indices; None -> all encoder_idx
     # Resuming
     "override_lr": False,  # If True, uses 'lr' from config instead of saved state
     # Validation
@@ -503,6 +505,8 @@ if __name__ == "__main__":
     parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
     parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
     parser.add_argument("--val_interval", type=int, help="Run validation every N epochs")
+    parser.add_argument("--perceptual_w", type=float, help="Anatomix v1_4 perceptual loss weight (0=off)")
+    parser.add_argument("--perceptual_layers", type=str, help="Comma-separated encoder layer indices, e.g. '8,15,22,29' (default: all)")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -547,6 +551,10 @@ if __name__ == "__main__":
         BASELINE_CONFIG["stage_data"] = args.stage_data == "True"
     if args.val_interval is not None:
         BASELINE_CONFIG["val_interval"] = args.val_interval
+    if args.perceptual_w is not None:
+        BASELINE_CONFIG["perceptual_w"] = args.perceptual_w
+    if args.perceptual_layers is not None:
+        BASELINE_CONFIG["perceptual_layers"] = args.perceptual_layers
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

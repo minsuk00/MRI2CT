@@ -45,14 +45,54 @@ def get_class_dice(logits, target_mask, mask=None, bone_idx=5):
     return class_dices, bone_dice
 
 
+class AnatomixPerceptualLoss(nn.Module):
+    """Perceptual loss: mean L1 distance between Anatomix encoder features of pred vs target.
+
+    Runs a frozen Anatomix U-Net on both images and compares multi-scale encoder feature maps.
+    pred/target are CT in [0, 1], shape (B, 1, D, H, W). Gradients flow through pred only.
+    """
+
+    CKPT = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_BN_v1_4.pth"
+
+    def __init__(self, layers=None, device="cuda"):
+        super().__init__()
+        from anatomix.model.network import Unet
+
+        from common.utils import clean_state_dict
+
+        self.extractor = Unet(3, 1, 16, 4, 32, norm="batch", interp="nearest", pooling="Max").to(device)
+        self.extractor.load_state_dict(clean_state_dict(torch.load(self.CKPT, map_location=device)), strict=True)
+        for p in self.extractor.parameters():
+            p.requires_grad = False
+        self.extractor.eval()
+        self.layers = sorted(layers) if layers else list(self.extractor.encoder_idx)
+        self.dist = nn.L1Loss()
+        print(f"[DEBUG] AnatomixPerceptualLoss (v1_4) using encoder layers {self.layers}")
+
+    def forward(self, pred, target):
+        with torch.no_grad():
+            tgt = self.extractor(target, layers=self.layers, encode_only=True)
+        prd = self.extractor(pred, layers=self.layers, encode_only=True)
+        return sum(self.dist(p, t) for p, t in zip(prd, tgt)) / len(prd)
+
+
 class CompositeLoss(nn.Module):
-    def __init__(self, weights):
+    def __init__(self, weights, perceptual=None):
         super().__init__()
         self.weights = weights
         self.l1 = nn.L1Loss()
         self.l2 = nn.MSELoss()
+        self.perceptual = perceptual
 
     def forward(self, pred, target, pred_probs=None, target_mask=None):
+        """Returns (total_loss, loss_components).
+
+        total_loss is the WEIGHTED sum of the active terms. The values in loss_components
+        (loss_l1, loss_ssim, loss_perceptual, loss_dice, ...) are RAW, unweighted per-term
+        losses — these are what get logged to wandb (train/l1, train/ssim, train/perceptual,
+        ...). Only train/total is scaled by `weights`. Read the raw values to pick weights:
+        e.g. set perceptual_w so perceptual_w * loss_perceptual is comparable to l1_w * loss_l1.
+        """
         total_loss = torch.tensor(0.0, device=pred.device)
         loss_components = {}
 
@@ -74,7 +114,13 @@ class CompositeLoss(nn.Module):
             loss_components["loss_ssim"] = ssim_val
             total_loss += self.weights["ssim"] * ssim_val
 
-        # 4. Dice Losses (Teacher-guided)
+        # 4. Anatomix Perceptual Loss
+        if self.perceptual is not None and self.weights.get("perceptual", 0) > 0:
+            perc_val = self.perceptual(pred, target)
+            loss_components["loss_perceptual"] = perc_val
+            total_loss += self.weights["perceptual"] * perc_val
+
+        # 5. Dice Losses (Teacher-guided)
         if pred_probs is not None and target_mask is not None:
             bone_idx = self.weights.get("dice_bone_idx", 5)
             class_dices, bone_dice = get_class_dice(pred_probs, target_mask, bone_idx=bone_idx)
