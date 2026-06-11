@@ -53,7 +53,8 @@ DEFAULT_CONFIG = {
     "sanity_check": True,
     "accum_steps": 2,
     "model_save_interval": 200,
-    "viz_limit": 4,
+    "viz_limit": 2,
+    "viz_interval": 25,  # Log train/patch_viz figure every N epochs (was every epoch)
     "viz_force_include": ["1THB011"],  # Always visualize these val subjects (in addition to stratified pick)
     "viz_pca": False,
     "steps_per_epoch": 1000,
@@ -85,9 +86,9 @@ DEFAULT_CONFIG = {
     "dice_w": 0.0,
     "dice_bone_w": 0.0,
     "dice_bone_idx": 5,
-    "dice_exclude_background": True,
     "perceptual_w": 0.0,  # Anatomix v1_4 perceptual loss weight (0 = off)
-    "perceptual_layers": None,  # comma-separated encoder layer indices; None -> all encoder_idx
+    "perceptual_layers": None,  # comma-separated decoder layer indices; None -> [38,45,52,65]
+    "perceptual_metric": "ncc",  # "ncc" (normalized cross-correlation, default) or "l1"
     "wandb_tags": [],
     "wandb_note": "test_run",
     "resume_wandb_id": None,
@@ -98,7 +99,7 @@ DEFAULT_CONFIG = {
     "val_save_interval": 0,  # Save epoch-stamped predictions every N epochs (0 = disabled)
     "full_val": True,
     # DRR Validation
-    "val_drr": True,
+    "val_drr": False,
     "val_drr_angles": 4,
     "val_drr_res": 256,
 }

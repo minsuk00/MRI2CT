@@ -649,10 +649,9 @@ class BaseTrainer:
             pred_probs = unpad(pred_probs, orig_shape)
             seg = unpad(seg, orig_shape)
         bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
-        excl_bg = getattr(self.cfg, "dice_exclude_background", True)
         class_dices, bone_dice = get_class_dice(pred_probs, seg, mask=mask_unpad, bone_idx=bone_idx)
         out = target_met if target_met is not None else {}
-        out["dice_score_all"] = (class_dices[1:].mean() if excl_bg else class_dices.mean()).item()
+        out["dice_score_all"] = class_dices.mean().item()
         if bone_dice is not None:
             out["dice_score_bone"] = bone_dice.item()
         return out
@@ -798,7 +797,14 @@ class BaseTrainer:
             layers = getattr(self.cfg, "perceptual_layers", None)
             if isinstance(layers, str):
                 layers = [int(x) for x in layers.split(",") if x.strip()]
-            perceptual = AnatomixPerceptualLoss(layers=layers, device=self.device)
+            metric = getattr(self.cfg, "perceptual_metric", "ncc")
+            perceptual = AnatomixPerceptualLoss(layers=layers, device=self.device, metric=metric)
+            # The perceptual extractor lives inside CompositeLoss, so the model-level compile in
+            # _setup_models never reaches it. Compile it here in "model" mode (benchmark: ~6% faster,
+            # ~3GB less; in "full" mode it's already inside the compiled step). See _reports/compile_mode_benchmark.html
+            if getattr(self.cfg, "compile_mode", None) == "model":
+                print(f"[{self.prefix}] 🚀 Compiling Perceptual Extractor (mode=default)")
+                perceptual.extractor = torch.compile(perceptual.extractor, mode="default")
 
         self.loss_fn = CompositeLoss(
             weights={
@@ -809,7 +815,6 @@ class BaseTrainer:
                 "dice_w": getattr(self.cfg, "dice_w", 0.0),
                 "dice_bone_w": getattr(self.cfg, "dice_bone_w", 0.0),
                 "dice_bone_idx": getattr(self.cfg, "dice_bone_idx", 5),
-                "dice_exclude_background": getattr(self.cfg, "dice_exclude_background", True),
             },
             perceptual=perceptual,
         ).to(self.device)

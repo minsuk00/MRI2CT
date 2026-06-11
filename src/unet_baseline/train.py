@@ -44,9 +44,9 @@ BASELINE_CONFIG = {
     "batch_size": 8,
     "lr": 3e-4,
     "total_epochs": 1000,
-    "steps_per_epoch": 500,    # halved from 1000 since batch_size doubled (4→8); keeps total samples_seen
+    "steps_per_epoch": 500,  # halved from 1000 since batch_size doubled (4→8); keeps total samples_seen
     "val_interval": 20,
-    "model_save_interval": 200,
+    "model_save_interval": 100,
     "use_weighted_sampler": True,
     "resume_wandb_id": None,
     "resume_epoch": None,  # Optional: specify epoch number
@@ -78,16 +78,17 @@ BASELINE_CONFIG = {
     "model_type": "unet_baseline",
     "norm": "batch",  # "batch", "instance", or "none"
     # Optimization
-    "compile_mode": "full",  # "full", "model", or None
+    "compile_mode": "model",  # "model" compiles UNet+teacher separately; "full" breaks on fused_ssim3d
     "scheduler_min_lr": 0.0,
     "accum_steps": 1,
-    "viz_limit": 4,
+    "viz_limit": 2,
     # Loss Weights (Matches DEFAULT_CONFIG)
     "l1_w": 1.0,
     "ssim_w": 0.1,
     "l2_w": 0.0,
     "perceptual_w": 0.0,  # Anatomix v1_4 perceptual loss weight (0 = off)
-    "perceptual_layers": None,  # comma-separated encoder layer indices; None -> all encoder_idx
+    "perceptual_layers": None,  # comma-separated decoder layer indices; None -> [38,45,52,65]
+    "perceptual_metric": "ncc",  # "ncc" (normalized cross-correlation, default) or "l1"
     # Resuming
     "override_lr": False,  # If True, uses 'lr' from config instead of saved state
     # Validation
@@ -272,7 +273,7 @@ class BaselineTrainer(BaseTrainer):
                         # Call the training step (modular)
                         pred, loss, comps, pred_probs = self.train_step(mri, ct, seg)
 
-                    if self.cfg.wandb and step_idx == 0:
+                    if self.cfg.wandb and step_idx == 0 and epoch % self.cfg.viz_interval == 0:
                         subj_id = batch["subj_id"][0] if "subj_id" in batch else None
                         self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg=seg, pred_probs=pred_probs, subj_id=subj_id)
 
@@ -307,11 +308,13 @@ class BaselineTrainer(BaseTrainer):
                 samples_per_step = self.cfg.batch_size * self.cfg.patches_per_volume * self.cfg.accum_steps
                 timings = timer.timings_ms()
                 self._log_monitoring(timings, throughput=samples_per_step / timer.elapsed_s())
-                pbar_dict.update({
-                    "dt": f"{timings['data']:.0f}ms",
-                    "cmp": f"{timings['compute']:.0f}ms",
-                    "tot": f"{timings['step_total'] / 1000:.2f}s",
-                })
+                pbar_dict.update(
+                    {
+                        "dt": f"{timings['data']:.0f}ms",
+                        "cmp": f"{timings['compute']:.0f}ms",
+                        "tot": f"{timings['step_total'] / 1000:.2f}s",
+                    }
+                )
 
             pbar.set_postfix(pbar_dict)
 
@@ -374,7 +377,7 @@ class BaselineTrainer(BaseTrainer):
             # Total Composite Loss for Validation
             # Cast pred (bf16 from autocast SW inference) and ct (fp16 from cached storage) to fp32:
             # nn.L1Loss on mixed bf16/fp16 inputs would otherwise rely on implicit type promotion.
-            l_val, l_comps = self.loss_fn(pred.float(), ct.float(), pred_probs=pred_probs, target_mask=seg)
+            l_val, l_comps = self.loss_fn(pred.float(), ct.float(), pred_probs=pred_probs, target_mask=seg, compute_perceptual=False)
             met["loss"] = l_val.item()
             for k, v in l_comps.items():
                 met[k] = v.item() if hasattr(v, "item") else v
@@ -418,7 +421,8 @@ class BaselineTrainer(BaseTrainer):
         print(f"[Baseline] 🏁 Starting Loop: {self.cfg.total_epochs} epochs")
         self.global_start_time = time.time()
 
-        if getattr(self.cfg, "sanity_check", False) and not self.cfg.resume_wandb_id:
+        do_val = bool(self.val_subjects) and not getattr(self.cfg, "no_val", False)
+        if do_val and getattr(self.cfg, "sanity_check", False) and not self.cfg.resume_wandb_id:
             print("[Baseline] Running sanity check...")
             self.validate(0)
 
@@ -428,9 +432,14 @@ class BaselineTrainer(BaseTrainer):
             ep_start = time.time()
             loss, comps, gn = self.train_epoch(epoch)
 
+            # Raw (unweighted) per-term magnitudes -> stdout, for picking loss weights.
+            raw = {k.replace("loss_", ""): (v.item() if hasattr(v, "item") else v)
+                   for k, v in comps.items() if "score" not in k}
+            tqdm.write(f"[raw-comps] Ep {epoch} | " + " | ".join(f"{k}={v:.5f}" for k, v in raw.items()))
+
             # Validation interval
             val_duration = 0.0
-            if (epoch % self.cfg.val_interval == 0) or (epoch + 1) == self.cfg.total_epochs:
+            if do_val and ((epoch % self.cfg.val_interval == 0) or (epoch + 1) == self.cfg.total_epochs):
                 val_start = time.time()
                 avg_met = self.validate(epoch)
                 val_duration = time.time() - val_start
@@ -500,13 +509,17 @@ if __name__ == "__main__":
     parser.add_argument("--norm", type=str, choices=["batch", "instance", "none"], help="Normalization type for U-Net (batch, instance, or none)")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
     parser.add_argument("--dice_bone_w", type=float, help="Bone-specific dice loss weight")
+    parser.add_argument("--ssim_w", type=float, help="SSIM loss weight (0=off)")
     parser.add_argument("--use_cutout", type=str, choices=["True", "False"], help="Enable/disable cutout augmentation (True/False)")
     parser.add_argument("--cutout_alpha", type=float, help="Beta(alpha, alpha) parameter controlling cutout box size distribution")
     parser.add_argument("--validate_dice", type=str, choices=["True", "False"], help="Enable/disable dice validation (True/False)")
     parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
     parser.add_argument("--val_interval", type=int, help="Run validation every N epochs")
+    parser.add_argument("--val_patch_size", type=int, help="Sliding-window val ROI size (default 256; lower to cut val VRAM)")
+    parser.add_argument("--no_val", action="store_true", help="Skip all validation (fast loss-magnitude probes)")
     parser.add_argument("--perceptual_w", type=float, help="Anatomix v1_4 perceptual loss weight (0=off)")
-    parser.add_argument("--perceptual_layers", type=str, help="Comma-separated encoder layer indices, e.g. '8,15,22,29' (default: all)")
+    parser.add_argument("--perceptual_layers", type=str, help="Comma-separated decoder layer indices (default: 38,45,52,65)")
+    parser.add_argument("--perceptual_metric", type=str, choices=["l1", "ncc"], help="Perceptual feature distance: 'l1' (default) or 'ncc'")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -524,6 +537,8 @@ if __name__ == "__main__":
         BASELINE_CONFIG["dice_w"] = args.dice_w
     if args.dice_bone_w is not None:
         BASELINE_CONFIG["dice_bone_w"] = args.dice_bone_w
+    if args.ssim_w is not None:
+        BASELINE_CONFIG["ssim_w"] = args.ssim_w
     if args.resume_id is not None:
         BASELINE_CONFIG["resume_wandb_id"] = args.resume_id
     if args.batch_size is not None:
@@ -551,10 +566,16 @@ if __name__ == "__main__":
         BASELINE_CONFIG["stage_data"] = args.stage_data == "True"
     if args.val_interval is not None:
         BASELINE_CONFIG["val_interval"] = args.val_interval
+    if args.val_patch_size is not None:
+        BASELINE_CONFIG["val_patch_size"] = args.val_patch_size
+    if args.no_val:
+        BASELINE_CONFIG["no_val"] = True
     if args.perceptual_w is not None:
         BASELINE_CONFIG["perceptual_w"] = args.perceptual_w
     if args.perceptual_layers is not None:
         BASELINE_CONFIG["perceptual_layers"] = args.perceptual_layers
+    if args.perceptual_metric is not None:
+        BASELINE_CONFIG["perceptual_metric"] = args.perceptual_metric
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

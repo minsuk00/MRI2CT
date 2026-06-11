@@ -25,8 +25,8 @@ def get_class_dice(logits, target_mask, mask=None, bone_idx=5):
     if mask is not None:
         # Body-voxel path: extract masked voxels, compute dice on flattened body region
         mask_bool = mask.squeeze().bool()  # [X, Y, Z]
-        probs_flat = probs.squeeze()[:, mask_bool]         # [C, N_body]
-        seg_flat = target_mask.squeeze()[mask_bool].long() # [N_body]
+        probs_flat = probs.squeeze()[:, mask_bool]  # [C, N_body]
+        seg_flat = target_mask.squeeze()[mask_bool].long()  # [N_body]
         seg_oh = F.one_hot(seg_flat, num_classes=probs.shape[1]).float().T  # [C, N_body]
         intersection = (probs_flat * seg_oh).sum(dim=1)
         union = probs_flat.sum(dim=1) + seg_oh.sum(dim=1)
@@ -46,15 +46,25 @@ def get_class_dice(logits, target_mask, mask=None, bone_idx=5):
 
 
 class AnatomixPerceptualLoss(nn.Module):
-    """Perceptual loss: mean L1 distance between Anatomix encoder features of pred vs target.
+    """Perceptual loss between Anatomix decoder features of pred vs target.
 
-    Runs a frozen Anatomix U-Net on both images and compares multi-scale encoder feature maps.
-    pred/target are CT in [0, 1], shape (B, 1, D, H, W). Gradients flow through pred only.
+    Runs a frozen Anatomix U-Net on both images and compares multi-scale decoder feature maps.
+    Default layers [38, 45, 52, 65] are the three decoder convs + the final 16-D anatomix
+    descriptor, i.e. the decoder subset of the layers the contrastive (NCE) objective was
+    applied to during v1_4 pretraining (27,31,38,45,52,65). pred/target are CT in [0, 1],
+    shape (B, 1, D, H, W). Gradients flow through pred only.
+
+    metric:
+      "ncc" — (default) 1 − normalized cross-correlation per (batch, channel) over spatial
+              dims, averaged. Compares feature *patterns* invariant to per-channel affine
+              intensity; matches the cosine geometry anatomix was pretrained under. In [0, 2].
+      "l1"  — mean L1 distance between feature maps (AFP-loss convention).
     """
 
     CKPT = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_BN_v1_4.pth"
+    DEFAULT_LAYERS = [38, 45, 52, 65]
 
-    def __init__(self, layers=None, device="cuda"):
+    def __init__(self, layers=None, device="cuda", metric="ncc"):
         super().__init__()
         from anatomix.model.network import Unet
 
@@ -65,15 +75,36 @@ class AnatomixPerceptualLoss(nn.Module):
         for p in self.extractor.parameters():
             p.requires_grad = False
         self.extractor.eval()
-        self.layers = sorted(layers) if layers else list(self.extractor.encoder_idx)
+        self.layers = sorted(layers) if layers else list(self.DEFAULT_LAYERS)
+        self.metric = metric.lower()
+        assert self.metric in ("l1", "ncc"), f"unknown perceptual metric {metric!r} (use 'l1' or 'ncc')"
         self.dist = nn.L1Loss()
-        print(f"[DEBUG] AnatomixPerceptualLoss (v1_4) using encoder layers {self.layers}")
+        print(f"[DEBUG] AnatomixPerceptualLoss (v1_4) metric={self.metric} decoder layers {self.layers}")
+
+    @staticmethod
+    def _ncc_loss(p, t, eps=1e-5):
+        """1 - normalized cross-correlation, per (batch, channel) over spatial dims, averaged.
+
+        p, t: (B, C, D, H, W). Centers each feature map, normalizes by the centered norm
+        (Pearson correlation), so it's invariant to per-channel affine intensity shifts.
+        Returns a scalar in [0, 2] (0 = perfectly correlated).
+        """
+        dims = (2, 3, 4)
+        pc = p - p.mean(dim=dims, keepdim=True)
+        tc = t - t.mean(dim=dims, keepdim=True)
+        num = (pc * tc).sum(dim=dims)
+        den = torch.sqrt((pc * pc).sum(dim=dims) * (tc * tc).sum(dim=dims) + eps)
+        ncc = num / (den + eps)  # (B, C) in [-1, 1]
+        return 1.0 - ncc.mean()
+
+    def _dist(self, p, t):
+        return self.dist(p, t) if self.metric == "l1" else self._ncc_loss(p, t)
 
     def forward(self, pred, target):
         with torch.no_grad():
             tgt = self.extractor(target, layers=self.layers, encode_only=True)
         prd = self.extractor(pred, layers=self.layers, encode_only=True)
-        return sum(self.dist(p, t) for p, t in zip(prd, tgt)) / len(prd)
+        return sum(self._dist(p, t) for p, t in zip(prd, tgt)) / len(prd)
 
 
 class CompositeLoss(nn.Module):
@@ -84,7 +115,7 @@ class CompositeLoss(nn.Module):
         self.l2 = nn.MSELoss()
         self.perceptual = perceptual
 
-    def forward(self, pred, target, pred_probs=None, target_mask=None):
+    def forward(self, pred, target, pred_probs=None, target_mask=None, compute_perceptual=True):
         """Returns (total_loss, loss_components).
 
         total_loss is the WEIGHTED sum of the active terms. The values in loss_components
@@ -92,6 +123,10 @@ class CompositeLoss(nn.Module):
         losses — these are what get logged to wandb (train/l1, train/ssim, train/perceptual,
         ...). Only train/total is scaled by `weights`. Read the raw values to pick weights:
         e.g. set perceptual_w so perceptual_w * loss_perceptual is comparable to l1_w * loss_l1.
+
+        compute_perceptual: set False during validation. The perceptual extractor's
+        full-volume decoder forward OOMs on val-size volumes, so it's skipped there.
+        (Dice is excluded from val separately, by not passing pred_probs — see validate_dice.)
         """
         total_loss = torch.tensor(0.0, device=pred.device)
         loss_components = {}
@@ -109,13 +144,13 @@ class CompositeLoss(nn.Module):
             total_loss += self.weights["l2"] * l2_val
 
         # 3. SSIM Loss
-        ssim_val = 1.0 - fused_ssim3d(pred.float(), target.float(), train=True)
         if self.weights.get("ssim", 0) > 0:
+            ssim_val = 1.0 - fused_ssim3d(pred.float(), target.float(), train=True)
             loss_components["loss_ssim"] = ssim_val
             total_loss += self.weights["ssim"] * ssim_val
 
         # 4. Anatomix Perceptual Loss
-        if self.perceptual is not None and self.weights.get("perceptual", 0) > 0:
+        if compute_perceptual and self.perceptual is not None and self.weights.get("perceptual", 0) > 0:
             perc_val = self.perceptual(pred, target)
             loss_components["loss_perceptual"] = perc_val
             total_loss += self.weights["perceptual"] * perc_val
@@ -124,23 +159,25 @@ class CompositeLoss(nn.Module):
         if pred_probs is not None and target_mask is not None:
             bone_idx = self.weights.get("dice_bone_idx", 5)
             class_dices, bone_dice = get_class_dice(pred_probs, target_mask, bone_idx=bone_idx)
+            C = class_dices.shape[0]
 
-            # --- General Dice (All classes or Foreground only) ---
-            if self.weights.get("dice_exclude_background", True):
-                gen_dice = class_dices[1:].mean()
-            else:
-                gen_dice = class_dices.mean()
+            # Per-class weight vector over ALL classes (background included): every
+            # class defaults to dice_w; bone is REPLACED by dice_bone_w (not added).
+            # Dice is applied once as a mean over all classes, so when
+            # dice_bone_w == dice_w this reduces exactly to dice_w * mean(1 - dice).
+            w = torch.full((C,), self.weights.get("dice_w", 0.0), device=class_dices.device, dtype=class_dices.dtype)
+            if bone_idx < C:
+                w[bone_idx] = self.weights.get("dice_bone_w", 0.0)
 
+            if torch.any(w > 0):
+                total_loss += (w * (1.0 - class_dices)).sum() / C
+
+            # Diagnostics (unweighted; logged to wandb, no gradient impact).
+            gen_dice = class_dices.mean()
             loss_components["dice_score_all"] = gen_dice
-            if self.weights.get("dice_w", 0) > 0:
-                loss_components["loss_dice"] = 1.0 - gen_dice
-                total_loss += self.weights["dice_w"] * (1.0 - gen_dice)
-
-            # --- Bone-Specific Dice ---
+            loss_components["loss_dice"] = 1.0 - gen_dice
             if bone_dice is not None:
                 loss_components["dice_score_bone"] = bone_dice
-                if self.weights.get("dice_bone_w", 0) > 0:
-                    loss_components["loss_dice_bone"] = 1.0 - bone_dice
-                    total_loss += self.weights["dice_bone_w"] * (1.0 - bone_dice)
+                loss_components["loss_dice_bone"] = 1.0 - bone_dice
 
         return total_loss, loss_components

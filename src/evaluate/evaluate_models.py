@@ -98,8 +98,7 @@ def _compute_teacher_dice(pred_unpad, seg_unpad, teacher_model, patch_size, val_
     class_dices, bone_dice = get_class_dice(pred_probs, seg_unpad, mask=body_mask_tensor, bone_idx=bone_idx)
 
     result = {}
-    excl_bg = cfg.get("dice_exclude_background", True)
-    result["dice_score_all"] = (class_dices[1:].mean() if excl_bg else class_dices.mean()).item()
+    result["dice_score_all"] = class_dices.mean().item()
     if bone_dice is not None:
         result["dice_score_bone"] = bone_dice.item()
 

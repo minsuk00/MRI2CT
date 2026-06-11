@@ -30,8 +30,8 @@ warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensi
 EXPERIMENT_CONFIG = [
     {
         "val_interval": 20,
-        "steps_per_epoch": 500,    # halved from 1000 since batch_size doubled (4→8); keeps total samples_seen
-        "model_save_interval": 200,
+        "steps_per_epoch": 500,  # halved from 1000 since batch_size doubled (4→8); keeps total samples_seen
+        "model_save_interval": 100,
         "total_epochs": 1000,
         "batch_size": 8,
         "accum_steps": 1,
@@ -53,8 +53,8 @@ EXPERIMENT_CONFIG = [
         "data_queue_num_workers": 4,
         # --------------------
         # "subjects": ["1ABA011"],
-        "viz_limit": 4,
-        "compile_mode": "full",
+        "viz_limit": 2,
+        "compile_mode": "model",  # benchmark: "model" beats "full" 1.19x @ b=8, -12GB (see _reports/compile_mode_benchmark.html)
         # "compile_mode": "None",
         "lr": 3e-4,
         "scheduler_min_lr": 0.0,
@@ -104,7 +104,7 @@ if __name__ == "__main__":
     parser.add_argument("--stage_data", type=str, choices=["True", "False"], help="Stage data to local NVMe (True/False)")
     parser.add_argument("--mri_norm", type=str, choices=["minmax", "percentile"], help="MRI normalization: 'minmax' (default) or 'percentile' (0–99.5, same as MAISI)")
     parser.add_argument("--perceptual_w", type=float, help="Anatomix v1_4 perceptual loss weight (0=off)")
-    parser.add_argument("--perceptual_layers", type=str, help="Comma-separated encoder layer indices, e.g. '8,15,22,29' (default: all)")
+    parser.add_argument("--perceptual_layers", type=str, help="Comma-separated decoder layer indices (default: 38,45,52,65)")
     args = parser.parse_args()
 
     print(f"📚 Found {len(EXPERIMENT_CONFIG)} experiments to run.")
