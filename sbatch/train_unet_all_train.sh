@@ -13,11 +13,13 @@
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
 
 # --- Configuration Area ---
-# Shared knobs match amix v1.3/v1.4 exactly (BATCH_SIZE, EPOCHS, STEPS_PER_EPOCH,
-# VAL_INTERVAL, NUM_WORKERS, AUGMENT, DICE_W, DICE_BONE_W, WEIGHTED_SAMPLER).
-# Only NORM is unet-specific.
+# Same config as the unet baseline (L1 + SSIM + Dice 0.1 + Bone Dice 0.4, background-included
+# dice, no perceptual, bs8, norm batch, augment + weighted sampler, 800ep x 500 steps),
+# but trained on ALL SynthRAD data (splits/all_train_split.txt) with NO held-out val.
+# Validation is skipped automatically when the split has no `val` lines (so val_interval /
+# validate_dice are no-ops here). FRESH run on the new dice impl (can't resume tz56kmux).
 PREFIX="unet"
-SPLIT_FILE="splits/center_wise_split.txt"
+SPLIT_FILE="splits/all_train_split.txt"
 AUGMENT="True"
 WEIGHTED_SAMPLER="True"
 NORM="batch"  # "batch", "instance", or "none"
@@ -25,13 +27,11 @@ DICE_W=0.1
 DICE_BONE_W=0.4
 BATCH_SIZE=8
 EPOCHS=800
-STEPS_PER_EPOCH=500     # halved from 1000 since BATCH_SIZE doubled; keeps total samples_seen at 3.2M
-VAL_INTERVAL=40
-VALIDATE_DICE="False"   # no teacher dice in validation (manual held-out eval at the end); training dice still logged
+STEPS_PER_EPOCH=500     # matches 9xmodnhn: 800*500*8 = 3.2M samples seen
+VAL_INTERVAL=20         # no-op here (no val set), kept for config parity
 NUM_WORKERS=4
-RESUME_ID=""  # FRESH run: re-train clean on the label-interp fix (do NOT resume buggy 9xmodnhn).
-              # To continue past the 3-day walltime, set this to the NEW run's wandb id and resubmit.
-TAGS="bs8" # Comma-separated extra WandB tags
+RESUME_ID=""  # Leave empty if not resuming
+TAGS="all_train,bs8" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -61,7 +61,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/unet_baseline/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --validate_dice $VALIDATE_DICE --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --weighted_sampler $WEIGHTED_SAMPLER --norm $NORM --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi

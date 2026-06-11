@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=48g
-#SBATCH --time=48:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --mail-user=minsukc@umich.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
@@ -23,16 +23,18 @@ FEAT_INST_NORM="True"
 INPUT_DROPOUT=0.5
 WEIGHTED_SAMPLER="True"
 DICE_W=0.1
-DICE_BONE_W=0.3
+DICE_BONE_W=0.4
 FINETUNE_FEAT="False"
 FINETUNE_DEPTH=0
 LR_FEAT=1e-5
 BATCH_SIZE=8
 EPOCHS=800
 STEPS_PER_EPOCH=500     # halved from 1000 since BATCH_SIZE doubled; keeps total samples_seen at 3.2M
-VAL_INTERVAL=20
+VAL_INTERVAL=40
+VALIDATE_DICE="False"   # no teacher dice in validation (manual held-out eval at the end); training dice still logged
 NUM_WORKERS=4
-RESUME_ID="6hjye9gp" # Leave empty if not resuming
+RESUME_ID="" # FRESH run: re-train on the new dice impl + bone-w 0.4 (can't resume 6hjye9gp across a loss change).
+             # To continue past the 3-day walltime, set this to the NEW run's wandb id and resubmit.
 TAGS="v1_4,bs8" # Comma-separated extra WandB tags
 
 
@@ -64,7 +66,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/amix/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --amix_weights $AMIX_WEIGHTS --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --pass_mri $PASS_MRI --feat_instance_norm $FEAT_INST_NORM --weighted_sampler $WEIGHTED_SAMPLER --finetune_feat $FINETUNE_FEAT --finetune_depth $FINETUNE_DEPTH --lr_feat $LR_FEAT --input_dropout_p $INPUT_DROPOUT --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --amix_weights $AMIX_WEIGHTS --batch_size $BATCH_SIZE --dice_w $DICE_W --dice_bone_w $DICE_BONE_W --augment $AUGMENT --pass_mri $PASS_MRI --feat_instance_norm $FEAT_INST_NORM --weighted_sampler $WEIGHTED_SAMPLER --finetune_feat $FINETUNE_FEAT --finetune_depth $FINETUNE_DEPTH --lr_feat $LR_FEAT --input_dropout_p $INPUT_DROPOUT --epochs $EPOCHS --steps_per_epoch $STEPS_PER_EPOCH --val_interval $VAL_INTERVAL --validate_dice $VALIDATE_DICE --num_workers $NUM_WORKERS"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi
