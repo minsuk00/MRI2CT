@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=48g
-#SBATCH --time=3-00:00:00
+#SBATCH --time=14-00:00:00
 #SBATCH --mail-user=minsukc@umich.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
@@ -30,7 +30,7 @@ EPOCHS=800
 STEPS_PER_EPOCH=500     # matches 9xmodnhn: 800*500*8 = 3.2M samples seen
 VAL_INTERVAL=20         # no-op here (no val set), kept for config parity
 NUM_WORKERS=4
-RESUME_ID=""  # Leave empty if not resuming
+RESUME_ID="krdhs2k0"  # wandb id of the launched run (job 51684715). Resubmitting this script resumes it past walltime. Clear to "" for fresh.
 TAGS="all_train,bs8" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---

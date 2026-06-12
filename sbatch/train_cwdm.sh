@@ -6,8 +6,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
-#SBATCH --mem=48g
-#SBATCH --time=14-00:00:00
+#SBATCH --mem=80g
+#SBATCH --time=10-00:00:00
 #SBATCH --mail-user=minsukc@umich.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log

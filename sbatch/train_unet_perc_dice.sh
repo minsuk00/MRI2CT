@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=48g
-#SBATCH --time=3-00:00:00
+#SBATCH --time=14-00:00:00
 #SBATCH --mail-user=minsukc@umich.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
@@ -35,8 +35,8 @@ STEPS_PER_EPOCH=500     # matches 9xmodnhn
 VAL_INTERVAL=40
 VALIDATE_DICE="False"   # exclude teacher dice from validation (val loss = L1 only; perceptual+ssim are not in val)
 NUM_WORKERS=4
-RESUME_ID=""  # FRESH run: re-train on the new dice impl + bone-w 0.4, ssim removed (can't resume the cancelled 91hdk0ka across a loss change).
-              # To continue past the 3-day walltime, set this to the NEW run's wandb id and resubmit.
+RESUME_ID="y5tqp2bt"  # wandb id of the launched run (job 51684713). Resubmitting this script resumes it
+                      # from checkpoint_last.pt past the 3-day walltime. Clear to "" to start a fresh run.
 TAGS="bs8,perceptual,dice" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
