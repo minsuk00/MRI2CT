@@ -36,6 +36,7 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from common.data import build_data_dicts, default_monai_cache_dir, get_cached_transforms, get_split_subjects
+from common.utils import dynamic_infer
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "autoencoder_v1.pt")
@@ -56,8 +57,8 @@ def load_autoencoder(device):
     autoencoder.eval()
     for p in autoencoder.parameters():
         p.requires_grad = False
-    # Match trainer: compile the encode path (fixed-size SW patches → compiles once).
-    autoencoder.encode_stage_2_inputs = torch.compile(autoencoder.encode_stage_2_inputs, mode="default")
+    # NOTE: no torch.compile — dynamic_infer runs small volumes (e.g. brain) whole-volume,
+    # so input shapes vary per subject and would force constant recompilation.
     return autoencoder
 
 
@@ -69,8 +70,11 @@ def load_scale_factor(device):
     return torch.tensor(sf, device=device)
 
 
-def encode_sliding_window(ct_norm, autoencoder, device, roi_size=(384, 352, 256), sw_batch_size=1, overlap=0.4):
-    """Mirror of MAISITrainer._encode_sliding_window (output on CPU, then .to(device))."""
+def encode_sliding_window(ct_norm, autoencoder, device, roi_size=(320, 320, 160), sw_batch_size=1, overlap=0.4):
+    """Encode CT -> latent. Uses dynamic_infer: whole-volume when the volume fits the
+    ROI (the common case here — never pads small brains), else sliding-window with the
+    ROI clamped to the volume. ROI [320,320,160] matches NV-Generate-CTMR's encoder.
+    """
     inferer = SlidingWindowInferer(
         roi_size=list(roi_size),
         sw_batch_size=sw_batch_size,
@@ -80,7 +84,7 @@ def encode_sliding_window(ct_norm, autoencoder, device, roi_size=(384, 352, 256)
         device=torch.device("cpu"),
     )
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        latent = inferer(ct_norm.to(device), autoencoder.encode_stage_2_inputs)
+        latent = dynamic_infer(inferer, autoencoder.encode_stage_2_inputs, ct_norm.to(device))
     return latent.to(device)
 
 

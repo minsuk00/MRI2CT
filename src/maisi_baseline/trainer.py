@@ -32,7 +32,7 @@ from common.data import (
     gpu_augment_batch,
 )
 from common.trainer_base import BaseTrainer, StepTimer
-from common.utils import count_parameters, unpad, visualize_lite
+from common.utils import count_parameters, dynamic_infer, unpad, visualize_lite
 
 
 class MAISITrainer(BaseTrainer):
@@ -282,9 +282,10 @@ class MAISITrainer(BaseTrainer):
         # ct_tensor is already in [0,1] mapping to [-1000,1000] HU from the cached pipeline.
         ct_norm = ct_tensor.clamp(0.0, 1.0)
 
-        # ROI [384, 352, 256]
-        # Final optimized ROI for A40: Covers ~85% of subjects in 1 patch.
-        roi_size = [384, 352, 256]
+        # ROI [320, 320, 160] (matches NV-Generate-CTMR's encoder). Used via
+        # dynamic_infer: whole-volume when the volume fits (never pads small brains),
+        # else sliding-window with the ROI clamped to the volume.
+        roi_size = [320, 320, 160]
         overlap = self.cfg.val_sw_overlap
 
         inferer = SlidingWindowInferer(
@@ -306,7 +307,7 @@ class MAISITrainer(BaseTrainer):
 
         t_sw_start = time.time()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            latent = inferer(ct_norm.to(self.device), self.autoencoder.encode_stage_2_inputs)
+            latent = dynamic_infer(inferer, self.autoencoder.encode_stage_2_inputs, ct_norm.to(self.device))
         t_sw_dur = time.time() - t_sw_start
 
         if n_patches > 1:

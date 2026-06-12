@@ -1,4 +1,5 @@
 import gc
+import math
 import random
 
 import numpy as np
@@ -7,6 +8,31 @@ import torch
 from fused_ssim import fused_ssim3d
 
 import wandb
+
+
+def dynamic_infer(inferer, model, images):
+    """Run `model` on `images`, using the sliding-window `inferer` ONLY when the
+    volume is larger than the ROI; otherwise run the whole volume in one pass.
+    When tiling, the ROI is clamped to the volume size so the inferer never pads
+    the input beyond its extent.
+
+    Mirrors NV-Generate-CTMR/scripts/utils.py:dynamic_infer. This guard avoids the
+    oversized-padding path (volume << ROI -> zero-pad to ROI), which corrupts small
+    volumes (e.g. brain): the air padding floods the VAE's GroupNorm statistics and
+    biases the whole reconstruction. `images`: (N, C, *spatial).
+    """
+    if torch.numel(images[0:1, 0:1, ...]) <= math.prod(inferer.roi_size):
+        return model(images)
+    spatial_dims = images.shape[2:]
+    orig_roi = inferer.roi_size
+    if len(orig_roi) != len(spatial_dims):
+        raise ValueError(f"ROI length ({len(orig_roi)}) != spatial dims ({len(spatial_dims)}).")
+    inferer.roi_size = [min(r, d) for r, d in zip(orig_roi, spatial_dims)]
+    try:
+        output = inferer(inputs=images, network=model)
+    finally:
+        inferer.roi_size = orig_roi
+    return output
 
 
 def apply_synchronized_cutout(mri, ct, cutout_obj, seg=None):
