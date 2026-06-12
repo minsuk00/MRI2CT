@@ -59,6 +59,11 @@ class AnatomixPerceptualLoss(nn.Module):
               dims, averaged. Compares feature *patterns* invariant to per-channel affine
               intensity; matches the cosine geometry anatomix was pretrained under. In [0, 2].
       "l1"  — mean L1 distance between feature maps (AFP-loss convention).
+
+    NOTE: when this perceptual loss is active (perceptual_w > 0), set ssim_w = 0.
+    Perceptual REPLACES SSIM as the structural-similarity term on top of L1 — using
+    both double-counts structure. (Our perceptual-vs-baseline arms differ by exactly
+    this swap: baseline = L1+SSIM+dice, perceptual = L1+perceptual+dice.)
     """
 
     CKPT = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_BN_v1_4.pth"

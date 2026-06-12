@@ -11,9 +11,12 @@ MRI2CT synthesizes CT images from MRI scans using deep learning. The main approa
 ```bash
 micromamba activate mrct      # main repo + amix/unet/maisi/baby_unet + TotalSegmentator
 micromamba activate koalai    # nnsyn fork (only for KoalAI baseline: convert/preprocess/train/predict)
+micromamba activate pyradplan # pyRadPlan dose-eval downstream task ONLY (pyradplan/ dir)
 ```
 
-The two envs are kept separate because both register a package named `nnunetv2`: `mrct` has upstream 2.5.2 (required by TotalSegmentator), `koalai` has the nnsyn fork. Don't pip-install across them.
+The two main envs are kept separate because both register a package named `nnunetv2`: `mrct` has upstream 2.5.2 (required by TotalSegmentator), `koalai` has the nnsyn fork. Don't pip-install across them.
+
+`pyradplan` is a third, isolated env for the pyRadPlan dose-evaluation downstream task (`pyradplan/`). It MUST stay separate: pyRadPlan requires `numpy>=2` (and drags in `numba`/`numpydantic` that force-upgrade numpy), which breaks `mrct`'s numpy-1.26 world (scikit-image / tptbox). Never `pip install pyRadPlan` into `mrct`. See `pyradplan/README.md`.
 
 Data lives on GPFS (read-only): `/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD/1.5mm_registered_flat_masked/`
 
@@ -84,7 +87,7 @@ python src/evaluate/compare_amix_features.py
 - `src/common/` — shared modules used by all trainers:
   - `config.py`: `DEFAULT_CONFIG` dict with all hyperparameters; `Config` (SimpleNamespace wrapper)
   - `data.py`: subject-discovery helpers (`get_subject_paths`, `get_split_subjects`, `get_region_key`) + MONAI 3-stage pipeline (`get_cached_transforms`, `get_random_crop`, `get_gpu_transforms`, `gpu_augment_batch`, `default_monai_cache_dir`, `build_data_dicts`). Used by all trainers and eval scripts. The legacy torchio version is preserved at `src/_archive/data_torchio.py` for reference.
-  - `loss.py`: `CompositeLoss` (L1 + SSIM + optional teacher Dice + optional bone Dice)
+  - `loss.py`: `CompositeLoss` (L1 + SSIM + optional Anatomix perceptual + optional teacher Dice + optional bone Dice). **When the perceptual loss is on (`perceptual_w > 0`), set `ssim_w = 0`** — perceptual replaces SSIM as the structural-similarity term on top of L1; using both double-counts structure. Dice loss is a per-class weighted macro-mean over **all** classes incl. background (bone class uses `dice_bone_w`, others `dice_w`).
   - `trainer_base.py`: `BaseTrainer` (seeding, WandB init, checkpoint resume, `_log_monitoring()` for RAM/VRAM/timings)
   - `utils.py`: `anatomix_normalize()`, `compute_metrics()`, `cleanup_gpu()`, `send_notification()`, `get_ram_info()` (parent + recursive children PSS via psutil)
 - `src/amix/` — anatomix translator trainer
