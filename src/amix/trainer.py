@@ -147,8 +147,9 @@ class Trainer(BaseTrainer):
             feat_norm = getattr(self.cfg, "feat_norm", "instance")
             # Always use bias=True so conv biases from the pretrained checkpoint transfer correctly
             self.feat_extractor = Unet(3, 1, 16, 5, 20, norm=feat_norm, interp="trilinear", pooling="Avg", use_bias=True).to(self.device)
-            # Optimize inference speed - Only compile if we aren't compiling the full step later
-            if self.cfg.compile_mode != "full":
+            # Compile each network individually only in "model" mode (in "full" it lives inside the
+            # compiled step; in None it stays eager). See _reports/compile_mode_benchmark.html
+            if self.cfg.compile_mode == "model":
                 print("[DEBUG] 🚀 Compiling Anatomix Feature Extractor...")
                 self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
 
@@ -160,7 +161,7 @@ class Trainer(BaseTrainer):
             self.cfg.res_mult = 16
             # v1_4: same depth as v1 (ndowns=4) but 2x channels (ngf=32), trained with BatchNorm
             self.feat_extractor = Unet(3, 1, 16, 4, 32, norm="batch", interp="nearest", pooling="Max").to(self.device)
-            if self.cfg.compile_mode != "full":
+            if self.cfg.compile_mode == "model":
                 print("[DEBUG] 🚀 Compiling Anatomix Feature Extractor...")
                 self.feat_extractor = torch.compile(self.feat_extractor, mode="default")
             ckpt = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_BN_v1_4.pth"
@@ -397,7 +398,7 @@ class Trainer(BaseTrainer):
                     step_loss += loss.item()
 
                     # Log patch (using the returned predictions)
-                    if self.cfg.wandb and step_idx == 0:
+                    if self.cfg.wandb and step_idx == 0 and epoch % self.cfg.viz_interval == 0:
                         subj_id = batch["subj_id"][0] if "subj_id" in batch else None
                         self._log_training_patch(mri, ct, pred, self.global_step, step_idx, seg=seg, pred_probs=pred_probs, subj_id=subj_id)
 
