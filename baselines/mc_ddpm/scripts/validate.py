@@ -355,9 +355,8 @@ def main():
         nib.save(nib.Nifti1Image(ct_np,   ct_affine), os.path.join(subj_dir, "target.nii.gz"))
 
         tqdm.write(
-            f"  {subj_id} | {elapsed:6.1f}s | paper MAE={met_paper['mae_hu']:6.1f}HU "
-            f"PSNR={met_paper['psnr']:5.2f} SSIM={met_paper['ssim']:.3f} | "
-            f"amix MAE={met_amix['mae_hu']:6.1f}HU PSNR={met_amix['psnr']:5.2f} SSIM={met_amix['ssim']:.3f}"
+            f"  {subj_id} | {elapsed:6.1f}s | amix MAE={met['mae_hu']:6.1f}HU "
+            f"PSNR={met['psnr']:5.2f} SSIM={met['ssim']:.3f}"
             + (f" | dice_all={record.get('dice_score_all', float('nan')):.3f} bone={record.get('dice_score_bone', float('nan')):.3f}" if teacher else "")
         )
 

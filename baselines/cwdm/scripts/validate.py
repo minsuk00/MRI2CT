@@ -257,9 +257,15 @@ def main():
                 affine = np.eye(4)
             subj_dir = os.path.join(args.output_dir, subj_id)
             pathlib.Path(subj_dir).mkdir(parents=True, exist_ok=True)
-            nib.save(nib.Nifti1Image(pred[0, 0].detach().cpu().numpy(), affine),
+            # Save in HU to match the cross-model contract (amix/unet/maisi/mcddpm all
+            # save HU). cWDM works in [0,1] over [-1024,1024] (span 2048); convert back.
+            # Masked-out background (pred*mask -> 0) maps to -1024 HU (air), like the others.
+            span = args.ct_range_hi - args.ct_range_lo
+            pred_hu = pred[0, 0].detach().cpu().numpy() * span + args.ct_range_lo
+            ct_hu = ct_gt[0, 0].detach().cpu().numpy() * span + args.ct_range_lo
+            nib.save(nib.Nifti1Image(pred_hu, affine),
                      os.path.join(subj_dir, 'sample.nii.gz'))
-            nib.save(nib.Nifti1Image(ct_gt[0, 0].detach().cpu().numpy(), affine),
+            nib.save(nib.Nifti1Image(ct_hu, affine),
                      os.path.join(subj_dir, 'target.nii.gz'))
 
     # Write TXT report
