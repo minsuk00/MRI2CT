@@ -97,6 +97,44 @@ def compute_dice(pred_logits, seg, *, mask=None, bone_idx=5, exclude_background=
     return out
 
 
+@torch.inference_mode()
+def compute_dice_hard(pred_logits, seg, *, bone_idx=5):
+    """Hard (argmax-label) per-class Dice, following the dice-score-3d convention
+    (ancestor-mithril/dice-score-3d). This is the standard *evaluation* Dice, as
+    opposed to the soft probability Dice in `get_class_dice` (a training loss).
+
+    Per foreground class c in 1..C-1, with A = {pred argmax == c}, B = {GT == c}:
+        |A| == |B| == 0  -> 1.0   (true-negative agreement; class absent from both)
+        |A| == 0 xor |B| == 0 -> 0.0
+        else             -> 2|A∩B| / (|A| + |B|)
+    `dice_score_all` = unweighted mean over the C-1 foreground classes;
+    `dice_score_bone` = the class-`bone_idx` score. Whole-volume (no body mask),
+    matching dice-score-3d.
+    """
+    pred_lab = pred_logits.argmax(dim=1)        # (B, D, H, W)
+    if seg.ndim == 5:
+        seg = seg.squeeze(1)                    # (B, D, H, W)
+    n_classes = pred_logits.shape[1]
+    fg_scores = []
+    out = {}
+    for c in range(1, n_classes):
+        a = pred_lab == c
+        b = seg == c
+        a_sum = int(a.sum().item())
+        b_sum = int(b.sum().item())
+        if a_sum == 0 and b_sum == 0:
+            s = 1.0
+        elif a_sum == 0 or b_sum == 0:
+            s = 0.0
+        else:
+            s = 2.0 * int((a & b).sum().item()) / (a_sum + b_sum)
+        fg_scores.append(s)
+        if c == bone_idx:
+            out["dice_score_bone"] = s
+    out["dice_score_all"] = float(np.mean(fg_scores))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint metadata (epoch / step / etc.) for logging
 # ---------------------------------------------------------------------------
