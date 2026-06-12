@@ -264,11 +264,15 @@ def main():
         seg = batch["seg"].to(device).long() if (dice_on and "seg" in batch) else None
         affine = batch["ct_affine"][0].cpu().numpy()
 
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         t0 = time.time()
         pred_latent = sample_latent(controlnet, unet, noise_scheduler, mr, spacing,
                                     args.num_inference_steps, device)
         pred_ct_norm = decode_latent(autoencoder, pred_latent, scale_factor,
                                      args.val_sw_overlap, args.val_sw_batch_size, device)
+        if device.type == "cuda":
+            torch.cuda.synchronize()  # CUDA is async; sync so time_sec reflects real GPU compute
         elapsed = time.time() - t0
 
         # HU + matched [0,1]

@@ -289,11 +289,15 @@ def main():
         original_shape = batch["original_shape"][0]
         ct_affine = batch["ct_affine"][0].cpu().numpy()
 
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         t0 = time.time()
         pred_hu_unpad = run_inference(
             model, diffusion, mri, original_shape, device, args.sw_batch_size,
             args.overlap, args.mc_runs,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize()  # CUDA is async; sync so time_sec reflects real GPU compute
         elapsed = time.time() - t0
 
         # GT in HU

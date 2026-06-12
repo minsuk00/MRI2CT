@@ -221,13 +221,19 @@ def main():
         orig_shape = batch["original_shape"][0].tolist()
         affine = batch["ct_affine"][0].cpu().numpy()
 
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         t0 = time.time()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred = sliding_window_inference(
-                inputs=mri, roi_size=(val_ps,) * 3,
-                sw_batch_size=val_sw_batch_size,
-                predictor=combined, overlap=val_sw_overlap, device=device,
-            )
+        # fp32 inference (no bf16 autocast): bf16's 7-bit mantissa quantizes a
+        # single-pass regressor's output to ~4-8 HU steps, which posterizes soft
+        # tissue when viewed in a narrow window (e.g. brain [-100,100] HU).
+        pred = sliding_window_inference(
+            inputs=mri, roi_size=(val_ps,) * 3,
+            sw_batch_size=val_sw_batch_size,
+            predictor=combined, overlap=val_sw_overlap, device=device,
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize()  # CUDA is async; sync so time_sec reflects real GPU compute
         elapsed = time.time() - t0
 
         # Unpad before metrics

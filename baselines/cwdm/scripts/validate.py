@@ -164,6 +164,8 @@ def main():
 
     for idx, batch in enumerate(loader):
         subj_id = batch['subj_id'][0] if isinstance(batch['subj_id'], (list, tuple)) else batch['subj_id']
+        if th.cuda.is_available():
+            th.cuda.synchronize()
         t0 = time.time()
 
         mri = batch['mri'].to(device).float()
@@ -237,6 +239,8 @@ def main():
                     record['body_dice_score_bone'] = dice_body['dice_score_bone']
             del pred_logits
 
+        if th.cuda.is_available():
+            th.cuda.synchronize()  # CUDA is async; sync so time_sec reflects real GPU compute
         record['time_sec'] = time.time() - t0
         per_subject.append({'subj_id': subj_id, 'metrics': record})
 

@@ -349,16 +349,17 @@ class BaselineTrainer(BaseTrainer):
             orig_shape = batch["original_shape"][0].tolist()
             subj_id = batch["subj_id"][0]
 
-            # Inference
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pred = sliding_window_inference(
-                    inputs=mri,
-                    roi_size=(val_ps, val_ps, val_ps),
-                    sw_batch_size=self.cfg.val_sw_batch_size,
-                    predictor=self.model,
-                    overlap=self.cfg.val_sw_overlap,
-                    device=self.device,
-                )
+            # fp32 inference (no bf16 autocast): bf16's 7-bit mantissa quantizes a
+            # single-pass regressor's output to ~4-8 HU steps, biasing the logged
+            # SSIM/MAE (and posterizing soft tissue in narrow-window regions).
+            pred = sliding_window_inference(
+                inputs=mri,
+                roi_size=(val_ps, val_ps, val_ps),
+                sw_batch_size=self.cfg.val_sw_batch_size,
+                predictor=self.model,
+                overlap=self.cfg.val_sw_overlap,
+                device=self.device,
+            )
 
             # Metrics
             pred_unpad = unpad(pred, orig_shape)
@@ -375,8 +376,8 @@ class BaselineTrainer(BaseTrainer):
                 pred_probs = self._run_teacher_sw(pred, val_ps)
 
             # Total Composite Loss for Validation
-            # Cast pred (bf16 from autocast SW inference) and ct (fp16 from cached storage) to fp32:
-            # nn.L1Loss on mixed bf16/fp16 inputs would otherwise rely on implicit type promotion.
+            # Cast ct (fp16 from cached storage) to fp32 to match pred:
+            # nn.L1Loss on mixed fp16/fp32 inputs would otherwise rely on implicit type promotion.
             l_val, l_comps = self.loss_fn(pred.float(), ct.float(), pred_probs=pred_probs, target_mask=seg, compute_perceptual=False)
             met["loss"] = l_val.item()
             for k, v in l_comps.items():
