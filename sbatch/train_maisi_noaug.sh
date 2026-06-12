@@ -6,8 +6,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
-#SBATCH --mem=48g
-#SBATCH --time=48:00:00
+#SBATCH --mem=80g
+#SBATCH --time=10-00:00:00
 #SBATCH --mail-user=minsukc@umich.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --output=/home/minsukc/MRI2CT/slurm_logs/%j_%x.log
@@ -21,13 +21,12 @@
 #   - Original NV-Generate-CTMR paper uses lr=1e-5 but on 58k volumes for
 #     mask→image; ablation bumps to 5e-4 for small-data MR→CT.
 # Single-A40 setup: BATCH_SIZE=1 × ACCUM_STEPS=8 = eff_bs 8 (matches paper 8-GPU DDP).
-# 30k opt steps × eff_bs=8 = 240k samples.
 PREFIX="maisi"
 SPLIT_FILE="splits/center_wise_split.txt"
-LR="1e-4"                   # lowered from 5e-4: original PolynomialLR decayed to ~0 by step 30k, so 5e-4 on resume = ~5x jump above the late-training effective LR. 1e-4 fine-tunes rather than soft-restarts.
+LR="1e-5"                   # lowered from 1e-4 on resume at ~ep3268 (SSIM~0.81/MAE~60): finer fine-tune. OVERRIDE_LR resets the optimizer LR to this value.
 BATCH_SIZE=1                # full-volume; cannot increase
 ACCUM_STEPS=8               # effective batch = 1 × 8 = 8 samples/optimizer step
-EPOCHS=1500                 # extended past original 600 (30k -> 75k opt steps); scheduler disabled so LR stays constant
+EPOCHS=8000                 # 8000*50=400k opt steps * eff_bs 8 = 3.2M volumes — matches amix/unet 3.2M-patch budget (was 1500=600k); scheduler disabled so LR stays constant
 STEPS_PER_EPOCH=50
 VAL_INTERVAL=50             # reduced val (1 subj/region = ~5) is cheap; fire often for a progress signal
 FULL_VAL="False"            # 1-subject-per-region val (~5 subjects) instead of all 207 — like cWDM. Full eval lives in src/maisi_baseline/validate.py.

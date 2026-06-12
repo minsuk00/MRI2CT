@@ -50,7 +50,7 @@ MAISI_CONFIG = {
     "wandb_tags": ["maisi"],
     "wandb_note": "MAISI Baseline ControlNet (On-the-fly VAE).",
     # Data
-    "augment": True,  # Enable standard augmentations
+    "augment": False,  # Default off (no-aug ablation recipe); set --augment True to enable
     # When set, the training side skips on-the-fly VAE encoding and pulls
     # `{subj_id}_ct_latent.pt` from this dir (pre-multiplied by scale_factor).
     # Run `python src/maisi_baseline/encode_all_volumes.py --output_dir <this>`
