@@ -47,6 +47,15 @@ evaluation_results
 *.nii.gz
 *.npy
 *.out
-*.html
 slurm_logs/
 /*.png
+
+# Elastix registration byproducts (dumped in repo root)
+/IterationInfo.*.txt
+/TransformParameters.*.txt
+
+# GPFS data symlink
+/dataset_peek
+
+# Test runtime logs (wandb/runs output)
+/tests/test_logs/
