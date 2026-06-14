@@ -1,0 +1,168 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>UNet perceptual-loss ablation — perc_ablation_20260603</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:2rem;max-width:1000px;color:#222}
+ table{border-collapse:collapse;margin:0.5rem 0 1.5rem}
+ th,td{border:1px solid #ccc;padding:4px 10px;text-align:right;font-variant-numeric:tabular-nums}
+ th{background:#f0f0f0} td:first-child{text-align:left}
+ small{color:#666} code{background:#f3f3f3;padding:1px 4px;border-radius:3px}
+ .note{background:#fff8e6;border-left:4px solid #e8b000;padding:8px 14px;margin:1rem 0}
+</style></head><body>
+<h1>U-Net perceptual-loss ablation</h1>
+<p>center-wise validation split · 207 subjects · all at the 200k-step (epoch 400) parity
+checkpoint · Track-A metrics + Hard Dice, identical definitions to full_eval_20260601.</p>
+<h3>Variants</h3><ul><li><b>no-perc (baseline)</b> (<code>9xmodnhn_ep400</code>): perceptual_w=0.0, dice_w=0.1, n=207</li><li><b>perceptual</b> (<code>06e850ny_ep400</code>): perceptual_w=0.5, dice_w=0.1, n=207</li><li><b>perceptual, no-dice</b> (<code>ye820cq0_ep400</code>): perceptual_w=0.5, dice_w=0.0, n=207</li></ul>
+<div class="note"><b>Confound caveat.</b> These runs vary on <i>two</i> axes (perceptual_w and dice_w).
+The clean perceptual contrast is <b>no-perc (perc 0, dice 0.1)</b> vs <b>perceptual (perc 0.5, dice 0.1)</b>
+— identical dice, differing only in perceptual loss. The <i>perceptual, no-dice</i> run isolates the dice
+contribution. Do not read the Hard-Dice gap to the no-dice run as a perceptual effect.</div>
+<h3>Overall — micro (subject-weighted)</h3>
+<table>
+<tr><th>variant</th>
+<th>body MAE (HU)</th>
+<th>body PSNR</th>
+<th>body SSIM</th>
+<th>Hard Bone Dice</th>
+<th>Hard Dice (all)</th>
+</tr>
+<tr><td style='text-align:left'>no-perc (baseline)<br><small>9xmodnhn_ep400</small></td>
+<td>33.7</td>
+<td>26.42</td>
+<td>0.898</td>
+<td>0.821</td>
+<td>0.731</td>
+</tr>
+<tr><td style='text-align:left'>perceptual<br><small>06e850ny_ep400</small></td>
+<td>33.5</td>
+<td>26.58</td>
+<td>0.899</td>
+<td style="background:#d8f5d8;font-weight:600">0.822</td>
+<td style="background:#d8f5d8;font-weight:600">0.734</td>
+</tr>
+<tr><td style='text-align:left'>perceptual, no-dice<br><small>ye820cq0_ep400</small></td>
+<td style="background:#d8f5d8;font-weight:600">33.5</td>
+<td style="background:#d8f5d8;font-weight:600">26.59</td>
+<td style="background:#d8f5d8;font-weight:600">0.900</td>
+<td>0.753</td>
+<td>0.651</td>
+</tr>
+</table>
+<h3>Overall — macro (equal region weight)</h3>
+<table>
+<tr><th>variant</th>
+<th>body MAE (HU)</th>
+<th>body PSNR</th>
+<th>body SSIM</th>
+<th>Hard Bone Dice</th>
+<th>Hard Dice (all)</th>
+</tr>
+<tr><td style='text-align:left'>no-perc (baseline)<br><small>9xmodnhn_ep400</small></td>
+<td>32.3</td>
+<td>26.69</td>
+<td>0.901</td>
+<td>0.821</td>
+<td>0.726</td>
+</tr>
+<tr><td style='text-align:left'>perceptual<br><small>06e850ny_ep400</small></td>
+<td>31.9</td>
+<td>26.89</td>
+<td>0.902</td>
+<td style="background:#d8f5d8;font-weight:600">0.822</td>
+<td style="background:#d8f5d8;font-weight:600">0.730</td>
+</tr>
+<tr><td style='text-align:left'>perceptual, no-dice<br><small>ye820cq0_ep400</small></td>
+<td style="background:#d8f5d8;font-weight:600">31.8</td>
+<td style="background:#d8f5d8;font-weight:600">26.91</td>
+<td style="background:#d8f5d8;font-weight:600">0.903</td>
+<td>0.753</td>
+<td>0.646</td>
+</tr>
+</table>
+<h3>Per-region — body MAE (HU) ↓</h3>
+<table>
+<tr><th>variant</th>
+<th>abdomen</th>
+<th>brain</th>
+<th>head_neck</th>
+<th>pelvis</th>
+<th>thorax</th>
+</tr>
+<tr><td style='text-align:left'>no-perc (baseline)</td>
+<td>24.6</td>
+<td style="background:#d8f5d8;font-weight:600">49.3</td>
+<td>28.8</td>
+<td>41.9</td>
+<td>17.1</td>
+</tr>
+<tr><td style='text-align:left'>perceptual</td>
+<td style="background:#d8f5d8;font-weight:600">23.3</td>
+<td>51.2</td>
+<td>28.3</td>
+<td>40.4</td>
+<td>16.2</td>
+</tr>
+<tr><td style='text-align:left'>perceptual, no-dice</td>
+<td>24.4</td>
+<td>50.8</td>
+<td style="background:#d8f5d8;font-weight:600">27.9</td>
+<td style="background:#d8f5d8;font-weight:600">39.9</td>
+<td style="background:#d8f5d8;font-weight:600">15.9</td>
+</tr>
+</table>
+<h3>Per-region — Hard Bone Dice ↑</h3>
+<table>
+<tr><th>variant</th>
+<th>abdomen</th>
+<th>brain</th>
+<th>head_neck</th>
+<th>pelvis</th>
+<th>thorax</th>
+</tr>
+<tr><td style='text-align:left'>no-perc (baseline)</td>
+<td style="background:#d8f5d8;font-weight:600">0.783</td>
+<td style="background:#d8f5d8;font-weight:600">0.861</td>
+<td>0.760</td>
+<td>0.926</td>
+<td>0.775</td>
+</tr>
+<tr><td style='text-align:left'>perceptual</td>
+<td>0.781</td>
+<td>0.859</td>
+<td style="background:#d8f5d8;font-weight:600">0.766</td>
+<td style="background:#d8f5d8;font-weight:600">0.930</td>
+<td style="background:#d8f5d8;font-weight:600">0.776</td>
+</tr>
+<tr><td style='text-align:left'>perceptual, no-dice</td>
+<td>0.664</td>
+<td>0.835</td>
+<td>0.720</td>
+<td>0.904</td>
+<td>0.642</td>
+</tr>
+</table>
+<h3>Paired Wilcoxon — per-subject body MAE</h3>
+<p><small>Shared subjects only. p&lt;0.05 ⇒ the two variants differ significantly; p≥0.05 ⇒ within noise.</small></p>
+<table>
+<tr><th></th>
+<th>no-perc (baseline)</th>
+<th>perceptual</th>
+<th>perceptual, no-dice</th>
+</tr>
+<tr><td style='text-align:left'>no-perc (baseline)</td>
+<td>—</td>
+<td style='background:#d8f5d8'>p=2.0e-03</td>
+<td style='background:#d8f5d8'>p=5.5e-04</td>
+</tr>
+<tr><td style='text-align:left'>perceptual</td>
+<td style='background:#d8f5d8'>p=2.0e-03</td>
+<td>—</td>
+<td style='background:#d8f5d8'>p=1.9e-03</td>
+</tr>
+<tr><td style='text-align:left'>perceptual, no-dice</td>
+<td style='background:#d8f5d8'>p=5.5e-04</td>
+<td style='background:#d8f5d8'>p=1.9e-03</td>
+<td>—</td>
+</tr>
+</table>
+<p><small>Best per column highlighted green. Generated by build_perc_ablation_report.py.</small></p>
+</body></html>

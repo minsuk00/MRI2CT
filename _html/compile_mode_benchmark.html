@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torch.compile Benchmark — MRI2CT amix / unet</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1d212c; --ink:#e6e9ef; --muted:#9aa3b2;
+    --line:#2a2f3a; --good:#37d399; --bad:#ff6b6b; --warn:#ffc857; --accent:#5aa9ff;
+    --best:#163a2b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:1040px;margin:0 auto;padding:32px 22px 80px;}
+  h1{font-size:26px;margin:0 0 4px;letter-spacing:.2px}
+  h2{font-size:19px;margin:38px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;margin:22px 0 8px;color:var(--accent)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px}
+  code{background:#11131a;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12.5px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line)}
+  .pill.good{color:var(--good);border-color:#1f5b46;background:#10241c}
+  .pill.bad{color:var(--bad);border-color:#5b2222;background:#241010}
+  .pill.warn{color:var(--warn);border-color:#5b4a1f;background:#241f10}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .tldr{background:linear-gradient(180deg,#16241d,#141a23);border:1px solid #1f5b46}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+  tr.best td{background:var(--best)}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .ok{color:var(--good)} .err{color:var(--bad)} .na{color:var(--muted)}
+  .bar{display:inline-block;height:10px;border-radius:3px;background:var(--accent);vertical-align:middle;margin-left:8px}
+  .legend{color:var(--muted);font-size:12.5px;margin-top:6px}
+  ul{margin:8px 0 8px 0;padding-left:20px} li{margin:5px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  .kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .foot{color:var(--muted);font-size:12px;margin-top:40px;border-top:1px solid var(--line);padding-top:14px}
+  .tag{font-size:11px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>torch.compile benchmark — MRI2CT translator training</h1>
+<p class="sub">Goal: does <code>compile_mode="full"</code> win, why, and what is actually best for the
+amix &amp; unet training step? &nbsp;•&nbsp; A40 (44&nbsp;GB) &nbsp;•&nbsp; torch 2.10.0+cu128, triton 3.6
+&nbsp;•&nbsp; batch=8, patch 128³, bf16 AMP, <code>dice_w=0.1</code> &nbsp;•&nbsp; amix extractor = <b>v1_4</b></p>
+
+<div class="card tldr">
+  <b>TL;DR —</b> <span class="pill good">best = <code>compile_mode="model"</code></span>
+  Per-submodel compile wins on <b>both</b> trainers. <code>"full"</code> is <b>not</b> best: it shatters into
+  8 sub-graphs — broken by the SSIM kernel and by <code>loss.backward()</code> living inside the compiled step — so it loses to
+  <code>"model"</code> by <b>1.24×</b> (unet) and <b>1.19×</b> (amix). CUDA-graph modes
+  (<code>max-autotune</code>, <code>reduce-overhead</code>) <b>fail</b> on this 3-model pipeline (OOM / graph
+  aliasing). Action: switch <b>amix</b> from <code>full</code> → <code>model</code> (~16&nbsp;% faster + 12&nbsp;GB
+  lighter); unet is already on <code>model</code>. All modes produce identical loss (correctness verified).
+</div>
+
+<h2>1. The pipeline — what gets compiled in each mode</h2>
+<p>The training step chains up to three networks plus a composite loss, then backpropagates. Only the
+translator is trained; the other nets are frozen.</p>
+
+<table>
+  <thead><tr><th>Component</th><th>Role</th><th>Trainable?</th><th>In amix?</th><th>In unet?</th></tr></thead>
+  <tbody>
+    <tr><td>Anatomix feature extractor <span class="tag">(v1_4: 4 downs, ngf 32, BatchNorm)</span></td>
+        <td>MRI → 16-ch features (translator input)</td><td>frozen, <code>no_grad</code></td><td>✅</td><td>—</td></tr>
+    <tr><td>U-Net <b>translator</b> <span class="tag">(4 downs, ngf 16)</span></td>
+        <td>features/MRI → CT (the model we train)</td><td class="ok">✅ trainable</td><td>✅</td><td>✅ (MRI→CT direct)</td></tr>
+    <tr><td>BabyU-Net <b>teacher</b> <span class="tag">(5 downs, ngf 20)</span></td>
+        <td>CT → organ seg (for Dice loss)</td><td>frozen, eval — but grad flows <i>through</i> it to pred</td><td>✅</td><td>✅</td></tr>
+    <tr><td>Anatomix <b>perceptual</b> loss extractor</td>
+        <td>perceptual feature L1</td><td class="na">OFF (<code>perceptual_w=0</code>)</td><td class="na">off</td><td class="na">off</td></tr>
+    <tr><td>Composite loss <span class="tag">(L1 + SSIM + Dice)</span></td>
+        <td>L1 + 0.1·SSIM + 0.1·Dice</td><td>—</td><td>✅</td><td>✅</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <thead><tr><th>compile_mode</th><th>feat extractor</th><th>translator</th><th>teacher</th><th>loss (SSIM/Dice)</th><th>backward</th></tr></thead>
+  <tbody>
+    <tr><td><code>none</code></td><td class="na">eager</td><td class="na">eager</td><td class="na">eager</td><td class="na">eager</td><td class="na">eager</td></tr>
+    <tr class="best"><td><code>model</code> <span class="pill good">best</span></td><td class="ok">compiled</td><td class="ok">compiled</td><td class="ok">compiled</td><td class="na">eager</td><td class="ok">compiled (per-submodel AOTAutograd)</td></tr>
+    <tr><td><code>model_maxautotune</code></td><td class="ok">compiled +cudagraph</td><td class="ok">"</td><td class="ok">"</td><td class="na">eager</td><td class="ok">compiled</td></tr>
+    <tr><td><code>model_reduceoverhead</code></td><td class="ok">compiled +cudagraph</td><td class="ok">"</td><td class="ok">"</td><td class="na">eager</td><td class="ok">compiled</td></tr>
+    <tr><td><code>regional</code></td><td colspan="3" class="ok" style="text-align:center">all three fused into ONE compiled forward graph</td><td class="na">eager</td><td class="na">eager</td></tr>
+    <tr><td><code>full</code> <span class="tag">(amix old default)</span></td><td colspan="5" class="warn" style="text-align:center">entire step compiled as one call → <b>shatters into 8 sub-graphs</b> (see §4)</td></tr>
+  </tbody>
+</table>
+
+<h2>2. Results — unet <span class="sub">(batch=8, patch 128³, bf16, dice_w=0.1)</span></h2>
+<table>
+  <thead><tr><th>mode</th><th>status</th><th class="num">steady ms/step</th><th class="num">vs best</th><th class="num">peak GB</th><th class="num">warmup s</th><th class="num">graph breaks</th><th class="num">loss(step0)</th></tr></thead>
+  <tbody>
+    <tr><td><code>none</code> (eager)</td><td class="err">OOM</td><td class="num na">—</td><td class="num na">—</td><td class="num err">&gt;44</td><td class="num na">—</td><td class="num na">—</td><td class="num na">—</td></tr>
+    <tr class="best"><td><code>model</code> <span class="pill good">best</span></td><td class="ok">ok</td><td class="num">1353<span class="bar" style="width:80px"></span></td><td class="num">1.00×</td><td class="num">31.2</td><td class="num">116</td><td class="num">0</td><td class="num">0.45339</td></tr>
+    <tr><td><code>model_reduceoverhead</code></td><td class="ok">ok</td><td class="num">1352<span class="bar" style="width:80px"></span></td><td class="num">1.00×</td><td class="num na">4.8 ⚠</td><td class="num">157</td><td class="num">0</td><td class="num">0.45339</td></tr>
+    <tr><td><code>full</code></td><td class="ok">ok</td><td class="num">1671<span class="bar" style="width:99px"></span></td><td class="num err">0.81×</td><td class="num">31.1</td><td class="num">179</td><td class="num warn">5</td><td class="num">0.45339</td></tr>
+    <tr><td><code>regional</code></td><td class="ok">ok</td><td class="num">1733<span class="bar" style="width:103px"></span></td><td class="num err">0.78×</td><td class="num">31.1</td><td class="num">178</td><td class="num">0</td><td class="num">0.45339</td></tr>
+    <tr><td><code>model_maxautotune</code></td><td class="err">OOM</td><td class="num na">—</td><td class="num na">—</td><td class="num err">&gt;44</td><td class="num na">—</td><td class="num na">—</td><td class="num na">—</td></tr>
+    <tr><td><code>full_customssim</code></td><td class="err">err</td><td colspan="5" class="na">custom-op API broke on torch 2.10 (experimental; redundant — see §4)</td></tr>
+  </tbody>
+</table>
+<p class="legend">unet is <b>already</b> on <code>model</code>. Eager OOMs at b=8 — compile is required just to fit.
+⚠ reduce-overhead's 4.8&nbsp;GB is an <i>under-measurement</i>: <code>max_memory_allocated()</code> doesn't count
+CUDA-graph private pools; it gives <b>no speedup</b> (compute-bound on 3D convs, not launch-bound). Stability
+re-runs: model 1353→1359, reduceoverhead 1352→1354.</p>
+
+<h2>3. Results — amix <span class="sub">(v1_4 extractor, batch=8, patch 128³, bf16, dice_w=0.1)</span></h2>
+<table>
+  <thead><tr><th>mode</th><th>status</th><th class="num">steady ms/step</th><th class="num">vs eager</th><th class="num">peak GB</th><th class="num">warmup s</th><th class="num">graph breaks</th><th class="num">loss(step0)</th></tr></thead>
+  <tbody>
+    <tr><td><code>none</code> (eager)</td><td class="ok">ok</td><td class="num">2201<span class="bar" style="width:120px"></span></td><td class="num">1.00×</td><td class="num warn">43.3</td><td class="num">46</td><td class="num">0</td><td class="num">0.44538</td></tr>
+    <tr class="best"><td><code>model</code> <span class="pill good">best</span></td><td class="ok">ok</td><td class="num">1644<span class="bar" style="width:90px"></span></td><td class="num ok">1.34×</td><td class="num">32.3</td><td class="num">103</td><td class="num">0</td><td class="num">0.44536</td></tr>
+    <tr><td><code>full</code> <span class="pill warn">current default</span></td><td class="ok">ok</td><td class="num">1956<span class="bar" style="width:107px"></span></td><td class="num">1.13×</td><td class="num">31.7</td><td class="num">102</td><td class="num warn">5</td><td class="num">0.44537</td></tr>
+    <tr><td><code>regional</code></td><td class="ok">ok</td><td class="num">2018<span class="bar" style="width:110px"></span></td><td class="num">1.09×</td><td class="num">31.7</td><td class="num">193</td><td class="num">0</td><td class="num">0.44536</td></tr>
+    <tr><td><code>model_maxautotune</code></td><td class="err">err</td><td colspan="5" class="na">CUDA-graph tensor-overwrite (feat output clobbered by later module sharing the graph pool)</td></tr>
+    <tr><td><code>model_reduceoverhead</code></td><td class="err">err</td><td colspan="5" class="na">same CUDA-graph tensor-overwrite</td></tr>
+    <tr><td><code>full_customssim</code></td><td class="err">err</td><td colspan="5" class="na">custom-op API broke on torch 2.10</td></tr>
+  </tbody>
+</table>
+<p class="legend">amix eager <i>just</i> fits (43.3/44.4&nbsp;GB). <code>model</code> = <b>1.34×</b> faster than eager AND
+12&nbsp;GB lighter, and <b>1.19×</b> faster than today's <code>full</code> default. Stability re-runs:
+model 1644→1644, full 1956→1963.</p>
+
+<h2>4. With perceptual loss enabled — does the winner change?</h2>
+<p>The repo's <code>AnatomixPerceptualLoss</code> (a 4th frozen v1_4 net; OFF by default at
+<code>perceptual_w=0</code>) is built <i>inside</i> <code>CompositeLoss</code>, so the model-level compile in
+<code>_setup_models</code> never reaches it — in <code>model</code> mode it runs <b>eager</b>; only <code>full</code>
+compiles it. Re-ran with perceptual on at <b>batch=4</b> (the extra net OOMs at b=8):</p>
+<div class="grid2">
+  <div class="card">
+    <h3>unet + perceptual (b=4)</h3>
+    <table>
+      <thead><tr><th>config</th><th class="num">ms/step</th><th class="num">peak GB</th></tr></thead>
+      <tbody>
+        <tr><td>none (eager)</td><td class="num">1142</td><td class="num">30.3</td></tr>
+        <tr><td>model <span class="tag">(perc eager — current code)</span></td><td class="num">907</td><td class="num">22.2</td></tr>
+        <tr class="best"><td>model + perc compiled ⚡</td><td class="num">845</td><td class="num">19.3</td></tr>
+        <tr><td>full</td><td class="num">940</td><td class="num">15.7 (min)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3>amix v1_4 + perceptual (b=4)</h3>
+    <table>
+      <thead><tr><th>config</th><th class="num">ms/step</th><th class="num">peak GB</th></tr></thead>
+      <tbody>
+        <tr><td>none (eager)</td><td class="num">1367</td><td class="num">30.7</td></tr>
+        <tr><td>model <span class="tag">(perc eager — current code)</span></td><td class="num">1050</td><td class="num">22.6</td></tr>
+        <tr class="best"><td>model + perc compiled ⚡</td><td class="num">989</td><td class="num">19.6</td></tr>
+        <tr><td>full</td><td class="num">1081</td><td class="num">16.1 (min)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<p><b>Same ranking holds:</b> <code>model</code> is fastest on both — <b>but only if the perceptual extractor is
+also compiled</b> (unet 907→845, amix 1050→989; ~6–7&nbsp;% + ~3&nbsp;GB that plain <code>model</code> leaves on
+the table). <code>full</code> is <i>not</i> fastest (940 / 1081&nbsp;ms) — though it does win on memory (15.7 /
+16.1&nbsp;GB) via whole-step recompute planning. Loss identical across modes (unet 0.4729, amix 0.4686).</p>
+<p class="legend"><b>Fix applied:</b> <code>src/common/trainer_base.py:_setup_loss</code> now compiles
+<code>perceptual.extractor</code> when <code>compile_mode=="model"</code> (dormant until <code>perceptual_w&gt;0</code>).
+If you ever want the lowest memory instead of the best speed with perceptual on, <code>full</code> is the trade.</p>
+
+<h2>5. Why <code>full</code> loses — the root cause</h2>
+<p>Tracing the compiled step with <code>torch._dynamo.explain</code> shows it never becomes one graph. It breaks
+at the loss every time:</p>
+<div class="grid2">
+  <div class="card">
+    <h3>unet/full → 8 graphs, 5 breaks</h3>
+    <ul>
+      <li><span class="pill bad">×3</span> <code>fused_ssim3d</code> — pybind11 C-extension Dynamo cannot trace
+          (<code>loss.py:112</code>, gb0007)</li>
+      <li><span class="pill bad">×1</span> <code>Tensor.backward()</code> called <i>inside</i> the compiled step —
+          fundamental: Dynamo can't trace backward (<code>bench full_step</code>, gb0123)</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>amix/full → 8 graphs, 5 breaks</h3>
+    <ul>
+      <li>Identical break pattern: <code>fused_ssim3d</code> ×3 + <code>Tensor.backward()</code> ×1.</li>
+      <li>The extra frozen feature-extractor adds ops (319 vs 227) but <b>zero new breaks</b> — the
+          <code>no_grad</code> extractor traces cleanly.</li>
+    </ul>
+  </div>
+</div>
+<p>So the "single fused graph" never exists. On top of the breaks, <code>full</code> wraps
+<code>loss.backward()</code> <i>inside</i> the compiled function, which Dynamo also can't trace. The result is
+graph-capture + cross-boundary dispatch overhead with little fusion payoff.</p>
+<p><b>Why <code>model</code> wins instead:</b> compiling each sub-net individually gives AOTAutograd a clean
+forward <i>and</i> backward graph per network, and the un-compilable SSIM/Dice ops simply run as normal eager
+ops between them — no graph to break. <b>Why <code>regional</code> (one fused forward, loss/backward eager) still
+loses:</b> fusing the three forwards into one graph doesn't beat per-submodel compile, and it leaves the
+backward fully eager — empirically slower than <code>model</code> on both trainers.</p>
+<p class="legend">Note: the old <code>compile_analysis.md</code> blamed only <code>fused_ssim3d</code> and claimed
+<code>full</code> was slower than eager. Corrected here: the second, equally fundamental break is
+<code>loss.backward()</code> living inside the compiled step (the Dice path does <i>not</i> break); and at the real
+batch=8 (no ×2 normalization) <code>full</code> actually <i>beats</i> eager for amix — it just loses to <code>model</code>.</p>
+
+<h2>6. Compile warm-up &amp; break-even</h2>
+<p>Warm-up is paid on <b>every</b> start (and every SLURM requeue). It is small next to a multi-hour run:</p>
+<ul>
+  <li><code>model</code>: one-time compile ≈ <b>100&nbsp;s cold</b> (≈ 40&nbsp;s when the inductor disk-cache is
+      already warm, e.g. after a requeue). For amix it saves ~557&nbsp;ms/step vs eager → pays back in
+      <b>~150&nbsp;steps</b> (&lt;½ an epoch at 500 steps/epoch).</li>
+  <li>Warm-up is noisy and cache-dependent (cold 100–190&nbsp;s, warm 37–55&nbsp;s); the numbers in the tables
+      above are first-run (cold) totals over 12 warm-up steps. <code>none</code> still shows ~46&nbsp;s
+      "warm-up" with no compile — that's the first-step <code>cudnn.benchmark</code> conv autotune.</li>
+  <li>Conclusion: warm-up does not change the ranking — <code>model</code> wins on steady-state and amortizes within the first epoch.</li>
+</ul>
+
+<h2>7. Recommendation</h2>
+<div class="card tldr">
+  <ul>
+    <li><b>amix</b>: change <code>compile_mode</code> <code>"full"</code> → <code>"model"</code>
+        — <b>1.19×</b> faster (1956→1644 ms/step) and 12&nbsp;GB lighter. <span class="tag">(src/amix/train.py)</span></li>
+    <li><b>unet</b>: keep <code>"model"</code> — already optimal; eager OOMs at b=8. <span class="tag">(src/unet_baseline/train.py)</span></li>
+    <li><b>Don't</b> use <code>max-autotune</code> / <code>reduce-overhead</code>: their CUDA-graphs are incompatible
+        with the frozen-feat → translator → teacher pipeline (OOM / tensor aliasing) and give no speedup anyway.</li>
+    <li><b>If you enable perceptual loss</b> (<code>perceptual_w&gt;0</code>): keep <code>model</code>, and the
+        perceptual extractor is now auto-compiled (trainer_base fix) — ~6–7&nbsp;% faster + ~3&nbsp;GB vs the old
+        eager-perceptual behaviour. Use <code>full</code> only if you need minimum VRAM over speed.</li>
+    <li>Correctness: step-0 loss identical across all working modes (unet 0.45339, amix 0.4454; +perc: 0.4729 / 0.4686) — the switch is safe.</li>
+  </ul>
+</div>
+
+<p class="foot">
+Method: each (trainer × mode) ran in a <b>fresh subprocess</b> (clean Dynamo/CUDA state), real models + real
+weights + the real <code>CompositeLoss</code>, fixed synthetic batch at true batch=8 (no normalization), CUDA-event
+timing (12 warm-up + 30 measured), peak via <code>max_memory_allocated</code>, breaks via
+<code>torch._dynamo.explain</code> + counters. Top-2 modes re-run for stability.
+Harness: <span class="kbd">~/compile_bench/{bench.py,run_all.py}</span> · raw JSON:
+<span class="kbd">~/compile_bench/results/</span>. Generated 2026-05-29.
+</p>
+
+</div>
+</body>
+</html>

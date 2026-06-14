@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training sample budget — MRI2CT baselines</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1d212c; --ink:#e6e9ef; --muted:#9aa3b2;
+    --line:#2a2f3a; --good:#37d399; --bad:#ff6b6b; --warn:#ffc857; --accent:#5aa9ff;
+    --best:#163a2b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:1040px;margin:0 auto;padding:32px 22px 80px;}
+  h1{font-size:26px;margin:0 0 4px;letter-spacing:.2px}
+  h2{font-size:19px;margin:38px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;margin:22px 0 8px;color:var(--accent)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px}
+  code{background:#11131a;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12.5px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line)}
+  .pill.good{color:var(--good);border-color:#1f5b46;background:#10241c}
+  .pill.bad{color:var(--bad);border-color:#5b2222;background:#241010}
+  .pill.warn{color:var(--warn);border-color:#5b4a1f;background:#241f10}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .tldr{background:linear-gradient(180deg,#16241d,#141a23);border:1px solid #1f5b46}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+  tr.ref td{background:#10241c}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .legend{color:var(--muted);font-size:12.5px;margin-top:6px}
+  ul{margin:8px 0 8px 0;padding-left:20px} li{margin:5px 0}
+  .foot{color:var(--muted);font-size:12px;margin-top:40px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Training sample budget — MRI2CT baselines</h1>
+<p class="sub">Goal: keep the <b>number of training samples</b> (patch / slab / volume) roughly matched across models —
+no foreground-voxel normalization, just raw sample counts. &nbsp;•&nbsp; numbers are the
+<b>actual</b> <code>info/samples_seen</code> pulled from each model's wandb run, not config defaults.</p>
+
+<div class="card tldr">
+  <b>TL;DR —</b> <span class="pill good">reference = amix / unet ≈ <code>3.2M</code> patches (128³)</span>
+  The real reference is <b>3.20M</b> 128³ patches (800 epochs × 500 steps × batch 8), <b>not</b> the 4.0M the
+  current <code>train.py</code> default (1000 epochs) would give. Against that:
+  <b>MC-DDPM</b> over-trained at 12.0M tiny 128×128×4 slabs (and was still cut off at ep 3004/7000);
+  <b>MAISI</b> (0.60M) and <b>cWDM</b> (0.32M, run <b>failed</b> well short of its 1.2M target) under-trained in
+  full-volume units. <b>KoalAI</b> is one model <i>per region</i> at 0.50M patches each — already in the same
+  ballpark as amix/unet's <b>per-region share</b> of 3.2M (0.56–1.11×). Caveat: a slab ≠ a patch ≠ a volume, so
+  raw counts across different units are not 1:1 — that asymmetry is the price of keeping this simple.
+</div>
+
+<h2>1. Actual samples seen (from wandb)</h2>
+<p>One "sample" = one item the network sees per forward pass, in whatever native unit the model uses.
+<code>samples_seen = steps × batch × patches_per_volume × accum</code> as logged by each trainer.</p>
+<table>
+  <thead><tr>
+    <th>Model</th><th>wandb id</th><th>state</th><th>sample unit</th><th>unit size</th>
+    <th class="num">samples seen</th><th class="num">vs 3.2M</th><th>scope</th>
+  </tr></thead>
+  <tbody>
+    <tr class="ref"><td><b>amix</b></td><td><code>6hjye9gp</code></td><td>finished</td><td>3D patch</td><td>128³</td>
+      <td class="num">3,200,000</td><td class="num">1.00×</td><td>1 model, all 5 regions</td></tr>
+    <tr class="ref"><td><b>unet</b></td><td><code>9xmodnhn</code></td><td>finished</td><td>3D patch</td><td>128³</td>
+      <td class="num">3,200,000</td><td class="num">1.00×</td><td>1 model, all 5 regions</td></tr>
+    <tr><td>MAISI</td><td><code>5hprtpwl</code></td><td>finished → <span class="pill warn">extending</span></td><td>full latent volume</td><td>whole vol</td>
+      <td class="num">600,000 → <b>3,200,000</b></td><td class="num">0.19× → 1.00×</td><td>1 model, all regions</td></tr>
+    <tr><td>cWDM</td><td><code>smg8thkr</code></td><td><span class="pill bad">failed</span></td>
+      <td>full wavelet volume</td><td>whole padded vol</td>
+      <td class="num">315,500</td><td class="num">0.10×</td><td>1 model, all regions</td></tr>
+    <tr><td>MC-DDPM</td><td><code>a3g28rez</code></td><td><span class="pill bad">failed</span></td>
+      <td>3D slab</td><td>128×128×<b>4</b></td>
+      <td class="num">12,019,208</td><td class="num">3.76×</td><td>1 model, all regions</td></tr>
+    <tr><td>KoalAI (synth)</td><td>per-region</td><td>nnU-Net</td><td>3D patch</td><td>~96×160×160<sup>†</sup></td>
+      <td class="num">500,000 / region</td><td class="num">see §2</td><td><b>1 model per region</b></td></tr>
+  </tbody>
+</table>
+<p class="legend">amix/unet/maisi/mcddpm read directly from <code>info/samples_seen</code> in the run summary.
+cWDM logs <code>info/global_step</code> (batch=1, so steps = samples). KoalAI is the fixed nnU-Net schedule
+<code>1000 epochs × 250 iters × batch 2 = 500k</code> patches per model (not run-verified per region; it's a
+deterministic schedule). MC-DDPM and cWDM runs ended in <code>failed</code> state — MC-DDPM at epoch 3004 of a
+7000 target, cWDM at 0.32M of a 1.2M target.<br>
+<sup>†</sup> KoalAI patch size is region-specific (nnU-Net auto-plan): abdomen/thorax 96×160×160,
+head-neck/brain 128×160×128, pelvis 112×112×192.</p>
+
+<h2>2. KoalAI — per-region share of the 3.2M reference</h2>
+<p>amix/unet train <b>one</b> model over all 427 training subjects, so each region only gets a <i>slice</i> of the
+3.2M budget — proportional to how many of those subjects belong to it. KoalAI trains a separate model per region,
+so the fair comparison is KoalAI's 0.5M against that per-region share, <b>not</b> against the full 3.2M.</p>
+<table>
+  <thead><tr>
+    <th>Region</th><th class="num">train subj</th><th class="num">share of 3.2M</th>
+    <th class="num">KoalAI / region</th><th class="num">ratio</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Abdomen</td><td class="num">65</td><td class="num">487,000</td><td class="num">500,000</td><td class="num">1.03×</td></tr>
+    <tr><td>Brain</td><td class="num">60</td><td class="num">450,000</td><td class="num">500,000</td><td class="num">1.11×</td></tr>
+    <tr><td>Head-Neck</td><td class="num">91</td><td class="num">682,000</td><td class="num">500,000</td><td class="num">0.73×</td></tr>
+    <tr><td>Pelvis</td><td class="num">120</td><td class="num">899,000</td><td class="num">500,000</td><td class="num">0.56×</td></tr>
+    <tr><td>Thorax</td><td class="num">91</td><td class="num">682,000</td><td class="num">500,000</td><td class="num">0.73×</td></tr>
+    <tr><td class="sub">avg</td><td class="num sub">85</td><td class="num sub">640,000</td><td class="num sub">500,000</td><td class="num sub">0.78×</td></tr>
+  </tbody>
+</table>
+<p>KoalAI at <b>0.5M patches/region</b> already sits inside 0.56–1.11× of the per-region share — close enough that
+no change is needed for a "similar samples" claim. To match the share exactly, bump KoalAI epochs from 1000 to
+<code>share / (250 × 2)</code> ≈ <b>1280</b> (avg) or <b>1364</b> (thorax / head-neck). Pelvis is the only region
+where amix/unet meaningfully out-sample KoalAI (1.8×).</p>
+
+<h2>3. What to change to match 3.2M</h2>
+<table>
+  <thead><tr><th>Model</th><th>now</th><th>target ≈3.2M samples</th><th>knob</th></tr></thead>
+  <tbody>
+    <tr><td>MAISI</td><td class="num">0.60M vol</td><td class="num">3.2M vol</td>
+      <td><span class="pill warn">configured</span> <code>EPOCHS 1500→8000</code> in <code>train_maisi_noaug.sh</code> (resume <code>5hprtpwl</code>, constant LR 1e-4, ~20d GPU)</td></tr>
+    <tr><td>cWDM</td><td class="num">0.32M vol (failed)</td><td class="num">3.2M vol</td>
+      <td>finish + extend iters to 3.2M (current target was only 1.2M)</td></tr>
+    <tr><td>MC-DDPM</td><td class="num">12.02M slab</td><td class="num">3.2M slab</td>
+      <td><code>total_epochs</code> 7000 → ~1870 (slabs are 1/32 a 128³ patch, so it's far less over-trained than it looks)</td></tr>
+    <tr><td>KoalAI</td><td class="num">0.5M / region</td><td class="num">per-region share (§2)</td>
+      <td>already ~0.78× avg; optional <code>num_epochs</code> 1000 → ~1280</td></tr>
+  </tbody>
+</table>
+
+<div class="card">
+  <b>Caveat (deliberately not normalized).</b> This report counts <i>samples</i>, not voxels. A 128×128×4 MC-DDPM
+  slab holds 1/32 the voxels of a 128³ amix patch, and a full MAISI/cWDM volume holds several patches' worth.
+  Matching raw sample counts across these units is the simple approximation you asked for — it does <b>not</b>
+  equalize gradient signal or compute. If a reviewer pushes on fairness, the honest line is "matched on sample
+  count, units differ," not "matched on data seen."
+</div>
+
+<p class="foot">Source: <code>info/samples_seen</code> / <code>info/global_step</code> from wandb runs
+<code>6hjye9gp 9xmodnhn 5hprtpwl smg8thkr a3g28rez</code> (project <code>minsuk-choi/mri2ct</code>);
+KoalAI from the nnU-Net 1000×250×2 schedule; region subject counts from
+<code>splits/center_wise_split.txt</code> (427 train).</p>
+
+</div>
+</body>
+</html>

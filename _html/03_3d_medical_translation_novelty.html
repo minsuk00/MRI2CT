@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Medical Image Translation: Methodological Novelty for Paired MR→CT (2021–2026)</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d2e;
+    --surface2: #242740;
+    --border: #2e3250;
+    --accent: #6c7ef8;
+    --accent2: #a78bfa;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --orange: #fb923c;
+    --text: #e2e8f0;
+    --text-muted: #94a3b8;
+    --text-dim: #64748b;
+    --code-bg: #0d1117;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+  }
+  .header {
+    background: linear-gradient(135deg, #1a1d2e 0%, #0f1117 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 48px 0 32px;
+    text-align: center;
+  }
+  .header .eyebrow {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: 12px;
+  }
+  .header h1 {
+    font-size: 2.1rem; font-weight: 700; line-height: 1.2; margin-bottom: 12px;
+    background: linear-gradient(90deg, #e2e8f0, #a78bfa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    max-width: 900px; margin-left: auto; margin-right: auto;
+  }
+  .header .subtitle { color: var(--text-muted); font-size: 0.95rem; max-width: 760px; margin: 0 auto; }
+  .meta-row { display: flex; justify-content: center; gap: 24px; margin-top: 20px; flex-wrap: wrap; }
+  .meta-item { display: flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--text-dim); }
+  .meta-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px 28px; margin-bottom: 40px;
+  }
+  .toc h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-dim); margin-bottom: 14px; }
+  .toc ol { list-style: none; counter-reset: toc; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 32px; }
+  .toc li { counter-increment: toc; font-size: 0.9rem; }
+  .toc li::before { content: counter(toc) ". "; color: var(--accent); font-weight: 600; }
+  .toc a { color: var(--text-muted); text-decoration: none; }
+  .toc a:hover { color: var(--accent2); }
+  section { margin-bottom: 44px; }
+  h2 {
+    font-size: 1.5rem; font-weight: 700; margin-bottom: 18px; padding-bottom: 10px;
+    border-bottom: 1px solid var(--border); color: var(--text);
+  }
+  h2 .num { color: var(--accent); font-weight: 700; margin-right: 10px; }
+  h3 { font-size: 1.1rem; font-weight: 650; margin: 24px 0 12px; color: var(--accent2); }
+  p { margin-bottom: 14px; color: var(--text); }
+  .summary {
+    background: linear-gradient(135deg, #1e2138 0%, #1a1d2e 100%);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 24px 28px; margin-bottom: 36px;
+  }
+  .summary p { font-size: 1.02rem; }
+  .finding {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px 24px; margin-bottom: 18px;
+  }
+  .finding-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .finding-head .claim { font-weight: 600; font-size: 1.02rem; flex: 1; min-width: 280px; }
+  .badge {
+    font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+    padding: 3px 9px; border-radius: 20px; white-space: nowrap;
+  }
+  .badge.high { background: rgba(52,211,153,0.15); color: var(--green); border: 1px solid rgba(52,211,153,0.3); }
+  .badge.medium { background: rgba(251,191,36,0.15); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+  .badge.low { background: rgba(248,113,113,0.15); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+  .evidence { color: var(--text-muted); font-size: 0.92rem; margin-bottom: 10px; }
+  blockquote {
+    border-left: 3px solid var(--accent2); background: var(--code-bg);
+    padding: 10px 16px; margin: 10px 0; border-radius: 0 6px 6px 0;
+    font-style: italic; color: var(--text-muted); font-size: 0.88rem;
+  }
+  .sources { font-size: 0.8rem; color: var(--text-dim); margin-top: 8px; }
+  .sources a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  .sources a:hover { text-decoration: underline; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-dim); text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.05em; }
+  td { color: var(--text-muted); }
+  .rank {
+    display: inline-block; width: 26px; height: 26px; line-height: 26px; text-align: center;
+    border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; font-size: 0.85rem; margin-right: 8px;
+  }
+  .novelty {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 22px 26px; margin-bottom: 22px; border-top: 3px solid var(--accent2);
+  }
+  .novelty h3 { margin-top: 0; display: flex; align-items: center; }
+  .novelty .row { margin-bottom: 10px; }
+  .novelty .label {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent);
+    font-weight: 700; display: block; margin-bottom: 2px;
+  }
+  .caveat-box {
+    background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.3);
+    border-radius: 10px; padding: 20px 24px;
+  }
+  .caveat-box h2 { border: none; color: var(--orange); }
+  ul.clean { list-style: none; }
+  ul.clean li { padding-left: 22px; position: relative; margin-bottom: 8px; color: var(--text-muted); }
+  ul.clean li::before { content: "▸"; position: absolute; left: 0; color: var(--accent); }
+  .footer { text-align: center; padding: 30px; color: var(--text-dim); font-size: 0.82rem; border-top: 1px solid var(--border); }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; color: var(--accent2); }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="eyebrow">Research Synthesis · Adversarially Verified</div>
+  <h1>3D Medical Image Translation: A Methodological Novelty Map for Paired MR→CT</h1>
+  <p class="subtitle">What is genuinely SOTA vs hype across regression, GAN, diffusion, bridge, and foundation-feature families — and where a defensible pure-ML novelty exists for paired MR→CT feeding downstream dose/segmentation tasks.</p>
+  <div class="meta-row">
+    <div class="meta-item"><span class="dot"></span>23 claims survived 3-vote verification</div>
+    <div class="meta-item"><span class="dot"></span>Scope: 2021–2026</div>
+    <div class="meta-item"><span class="dot"></span>Primary sources only</div>
+    <div class="meta-item"><span class="dot"></span>2026-06-13</div>
+  </div>
+</div>
+
+<div class="container">
+
+  <div class="summary">
+    <p><strong>Bottom line.</strong> The literature does <em>not</em> support the popular narrative that diffusion/transformer models are SOTA for MR→CT: the SynthRAD2023 winner (Task 1, MRI→CT) was a regression CNN+transformer U-Net hybrid, diffusion was "rarely adopted" and underperformed, and field surveys that claim "superior performance" for transformer/diffusion self-disclaim the benchmark basis as region-specific and incomparable — fully consistent with your finding that a plain 3D U-Net beats MAISI/MC-DDPM/cWDM/koalAI. The single strongest, multiply-confirmed <em>methodological</em> opening is the <strong>metric–objective mismatch</strong>: across two primary challenge reports and an independent dosimetry study, image-similarity metrics (MAE/PSNR/SSIM) correlate only weakly with downstream dose accuracy (avg |ρ|≈0.40 photon / 0.47 proton) and even mis-rank models (rank-1 vs rank-6 differ 10 HU in MAE yet are identical on gamma pass rate). Uncertainty quantification for sCT is an under-explored minority (~13% of RT-AI UQ studies) and <em>no</em> study has tied UQ to downstream decisions — a clean, open gap. Misregistration-robust learning (RegGAN and successors) and unpaired bridges (SelfRDB, UNSB) are real but already-crowded axes, and unpaired is hard to defend as novelty when you hold deformably-registered paired data. The most defensible directions therefore reframe <em>what is optimized and what is reported</em> (downstream-decision-aware training + calibrated uncertainty) rather than swapping the generative backbone.</p>
+  </div>
+
+  <div class="toc">
+    <h3>Contents</h3>
+    <ol>
+      <li><a href="#families">Method families: SOTA vs hype</a></li>
+      <li><a href="#paired">Paired vs unpaired vs misregistration-robust</a></li>
+      <li><a href="#bridges">Diffusion bridges, wavelet & latent diffusion</a></li>
+      <li><a href="#metrics">Pixel metrics mis-rank downstream</a></li>
+      <li><a href="#uq">Uncertainty & decision-aware gaps</a></li>
+      <li><a href="#novelty">Ranked novelty directions</a></li>
+      <li><a href="#caveats">Caveats & open questions</a></li>
+    </ol>
+  </div>
+
+  <!-- ============ SECTION 1 ============ -->
+  <section id="families">
+    <h2><span class="num">1.</span>Method families — what genuinely wins, and where the hype is</h2>
+    <p>Four DL families dominate medical image translation: U-Nets, GANs, Transformers, and Diffusion models. Surveys narrate transformers/diffusion as the "recent SOTA wave," but the primary evidence for MR→CT does not bear this out — and the surveys themselves disclaim the comparison.</p>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">The SynthRAD2023 MRI→CT (Task 1) winner was a regression CNN+transformer U-Net hybrid, not diffusion or GAN; diffusion was "rarely adopted" and underperformed (SSIM ~0.82).</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">SMU-MedVision won Task 1 with a hybrid 3D patch-based CNN+Swin-transformer U-Net (RDSformer skip blocks, masked MAE + VGG19 perceptual loss): MAE 74.47 HU, SSIM ~0.877. The Task-1 top-5 were all CNN/transformer regression nets (nnU-Net #2, Swin UNETR #3, ShuffleUNet #4); the only GAN (2.5D pix2pix) ranked #5. Std and which-phase metric attribution wobble across sources, but the ranking and methodology are unambiguous.</div>
+      <blockquote>"hybrid 3D patch-based CNN and transformer Unet network … SSIM: 0.877±0.036 MAE: 74.47±22.87 HU"</blockquote>
+      <div class="sources">Source (primary): <a href="https://arxiv.org/html/2403.08447v1">arXiv:2403.08447v1 — SynthRAD2023 Challenge Report</a> · vote 2-1</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">Surveys frame transformers/diffusion as "superior performance," but the same survey disclaims this as region-specific and benchmark-incomparable — the hype rests on weak, non-uniform evidence.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Dayarathna et al. (Med Image Anal 2024) confirm the four-family taxonomy and the "superior performance" framing (citing only Li 2023 + Lyu &amp; Wang 2022, a narrative not a head-to-head). Critically the same survey states cross-method comparison is "challenging … rendering their results incomparable," and that superiority is region-dependent: transformers/DDPMs better in brain, cGAN better in pelvis. So there is <em>no</em> blanket transformer/diffusion &gt; all hierarchy — consistent with a plain U-Net beating diffusion on a fixed multi-region paired benchmark.</div>
+      <blockquote>"U-Nets, GANs, Transformers, and Diffusion-based architectures dominate the discourse … novel transformer and Diffusion-based networks have shown superior performance"</blockquote>
+      <div class="sources">Source (primary): <a href="https://www.sciencedirect.com/science/article/pii/S1361841523003067">Dayarathna et al., Med Image Anal 92 (2024) 103046</a> · vote 2-1</div>
+    </div>
+    <p style="color:var(--text-muted);font-size:0.92rem;"><strong>Implication for novelty.</strong> Swapping in a fancier generative backbone is the most crowded and least defensible axis: the regression U-Net is already the de-facto SOTA on intensity/structural metrics, and "diffusion is better" is unsupported for MR→CT.</p>
+  </section>
+
+  <!-- ============ SECTION 2 ============ -->
+  <section id="paired">
+    <h2><span class="num">2.</span>Paired vs unpaired vs misregistration-robust learning</h2>
+    <p>This is a real but <strong>already-mature</strong> axis. Given you hold deformably-registered 1.5 mm paired data, unpaired learning is hard to defend as a primary novelty.</p>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">Plain Pix2Pix needs well-aligned pairs (often unachievable due to motion/anatomy change); RegGAN reframes misaligned targets as noisy labels + a joint registration net (loss-correction) — making misregistration-robust paired training a viable alternative to Pix2Pix/CycleGAN.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">RegGAN (NeurIPS 2021 spotlight) is the canonical misregistration-robust baseline. Two distinct verified claims [8,9] support this: the Pix2Pix limitation and the noisy-label/registration-net solution. With strong deformable registration (your 1.5 mm setup) well-aligned pairs <em>are</em> largely achievable — a caveat that weakens misregistration as your headline novelty.</div>
+      <blockquote>"The Pix2Pix mode … requires paired and well pixel-wise aligned images, which may not always be achievable due to respiratory motion or anatomy change."</blockquote>
+      <div class="sources">Source (primary): <a href="https://arxiv.org/abs/2110.06465">arXiv:2110.06465 — RegGAN, NeurIPS 2021</a> · merged claims 8 + 9 · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">Misregistration is a recognized core obstacle and an active, crowded line — RegGAN-style registration/noisy-label methods plus several 2022–2025 successors — not a wide-open gap.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Confirmed by the field survey [11] and by follow-ups: QACL closed-loop registration (2022), registration-guided consistency + disentanglement (MICCAI 2025), whole-body spatial/semantic alignment (2024), fRegGAN, DA-GAN. One successor critiques RegGAN for letting the synthesis net "cheat" by generating images spatially aligned to the misaligned target, then enforces geometry-preserving constraints — and reports a modest gain on SynthRAD2023 pelvis (MAE 47.47 vs RegGAN 50.22 HU, ~5.5% rel.).</div>
+      <blockquote>"prior methods … allow[] synthetic networks to directly generate spatially aligned images with the misaligned target image during training"</blockquote>
+      <div class="sources">Sources (primary): <a href="https://www.sciencedirect.com/science/article/pii/S1361841523003067">Med Image Anal 2024 survey</a>; <a href="https://arxiv.org/html/2407.07660">arXiv:2407.07660 — registration-guided consistency &amp; disentanglement</a> · merged claims 11 + 13 + 14 · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">Unpaired CycleGAN relaxes alignment but documents a structural-consistency cost; an entire genre of fixes exists precisely because vanilla unpaired translation shifts anatomy — paired data retains a structural-fidelity advantage.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Survey [12] plus independent corroboration (Structure-Constrained CycleGAN, ContourDiff which beats CycleGAN on spatial overlap IoU 0.505 vs 0.251). Unpaired methods need specialized structural-preservation machinery to <em>approach</em> paired fidelity — they do not erase the gap. The claim is appropriately hedged (unpaired is "not strictly superior"), so holding paired data is a genuine asset, not a constraint to be relaxed away.</div>
+      <blockquote>"While CycleGANs mitigate the need for well-aligned images, ensuring the structural consistency of synthesized images … remains challenging."</blockquote>
+      <div class="sources">Source (primary): <a href="https://www.sciencedirect.com/science/article/pii/S1361841523003067">Med Image Anal 2024 survey</a> · vote 2-1</div>
+    </div>
+  </section>
+
+  <!-- ============ SECTION 3 ============ -->
+  <section id="bridges">
+    <h2><span class="num">3.</span>Diffusion bridges, wavelet & latent diffusion — the frontier backbones</h2>
+    <p>The most novel generative formulations (Schrödinger/diffusion bridges, wavelet diffusion, latent diffusion) all exist for medical translation already. They report 2D-slice or single-region wins, not multi-region downstream superiority — important context for "what would I have to beat."</p>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">SelfRDB (diffusion bridge) directly learns a source→target transform (vs noise→target), with a monotonically-increasing-variance "soft prior" and self-consistent recursive estimation; it beats DDMs/I2SB/pix2pix on a tiny paired pelvic MRI→CT set.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Med Image Anal 2025. Verified method description [6] and benchmark [7]: T2→CT 28.58 dB/93.28% SSIM, T1→CT 27.86 dB/92.69%, beating DDMs by 1.42 dB, I2SB by 2.35 dB, pix2pix by 3.08 dB. <strong>Caveat:</strong> 15 subjects, 2D axial slices, self-reported — not a multi-region 3D downstream benchmark. Diffusion-bridge formulation for MR→CT is already published.</div>
+      <blockquote>"it directly learns a source-to-target transformation of high task relevance … convergence was assumed when the relative change in x_0 … fell below 1%."</blockquote>
+      <div class="sources">Source (primary): <a href="https://arxiv.org/pdf/2405.06789">arXiv:2405.06789 — SelfRDB, Med Image Anal 2025</a> · merged claims 6 + 7 · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">cWDM runs diffusion in the wavelet (DWT) domain to synthesize full-resolution 3D volumes directly, avoiding slice/patch artifacts; it treats paired translation as conditional generation.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Verified [3,4]. The "avoid artifacts" benefit is design rationale, not a head-to-head ablation; primary app is MRI→MRI (BraTS) but authors note CT↔MR applicability. You already run cWDM as a baseline — it is beaten by your U-Net, which is itself a publishable observation.</div>
+      <blockquote>"This approach allows us to directly apply our model to full-resolution volumes, avoiding artifacts caused by slice- or patch-wise data processing."</blockquote>
+      <div class="sources">Source (primary): <a href="https://arxiv.org/abs/2411.17203">arXiv:2411.17203 — cWDM, BraTS 2024</a> · merged claims 3 + 4 · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">A 3D Wavelet Latent Diffusion Model (3D-WLDM) for whole-body MR→CT exists — latent-space diffusion + wavelet residual module + structure/modality disentanglement + dual skip-attention.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">arXiv:2507.11557 (2025). Descriptive (not a SOTA claim). Establishes that "wavelet + latent + disentanglement + attention" combinations for 3D MR→CT are <em>already taken</em>. The architectural-stacking lane is crowded.</div>
+      <div class="sources">Source (primary): <a href="https://arxiv.org/abs/2507.11557">arXiv:2507.11557 — 3D-WLDM</a> · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">UNSB casts unpaired translation as a neural Schrödinger-bridge / optimal-transport problem (adversarial + regularization), iteratively refining via SDE steps and outperforming all one-step GAN baselines (e.g. CUT).</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">ICLR 2024 [15,16]. Multi-step SDE refinement; beats one-step GANs on natural-image I2I (horse2zebra etc.), self-reported, not MR→CT. Relevant as the OT/bridge state-of-the-art you would invoke if you pursued an unpaired or OT angle.</div>
+      <blockquote>"adversarial learning and regularization to learn an optimal transport mapping which successfully generalizes beyond observed data"</blockquote>
+      <div class="sources">Source (primary): <a href="https://github.com/cyclomon/UNSB">github.com/cyclomon/UNSB</a>; arXiv:2305.15086 (ICLR 2024) · merged claims 15 + 16 · vote 3-0</div>
+    </div>
+  </section>
+
+  <!-- ============ SECTION 4 ============ -->
+  <section id="metrics">
+    <h2><span class="num">4.</span>Pixel metrics mis-rank models for downstream tasks — the strongest gap</h2>
+    <p>This is the most multiply-confirmed methodological opening in the entire corpus: image-quality metrics do not predict — and actively mis-rank — downstream dose and segmentation outcomes. Three independent primary sources converge.</p>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">In SynthRAD2023, image-similarity metrics (MAE/PSNR/SSIM) show no significant correlation with dose accuracy (avg |ρ|≈0.40 photon, 0.47 proton), motivating dose as a separate downstream criterion.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">SynthRAD2023 report (1,080 patients, photon+proton). Within-group image correlations are strong (|ρ| 0.88–0.96) but cross-group image→dose is weak. SynthRAD2025 independently corroborates ("only moderately" correlated; DVH metrics near-zero correlation with everything else).</div>
+      <blockquote>"no significant correlation was found between image similarity metrics and dose accuracy, emphasizing the need for dose evaluation when assessing … sCT"</blockquote>
+      <div class="sources">Sources (primary): <a href="https://arxiv.org/html/2403.08447v1">arXiv:2403.08447</a> (+ SynthRAD2025 corroboration) · merged claims 1 + 17 · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">Image metrics actively mis-rank: rank-1 (MAE 49.95) vs rank-6 (MAE 60.65) differ ~10 HU yet have near-identical photon gamma pass rates (99.49% vs 99.57%).</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">A concrete, verbatim mis-ranking example from the SynthRAD2023 report (Task 2 / CBCT→CT, correctly not misattributed to MRI→CT). The authors conclude "higher image similarity did not automatically lead to an improved dose distribution."</div>
+      <blockquote>"a large difference in MAE of 49.95±11.78 and 60.65±12.56, while a subtle difference in photon gamma pass rates of 99.49±1.65 and 99.57±1.07"</blockquote>
+      <div class="sources">Source (primary): <a href="https://arxiv.org/html/2403.08447v1">arXiv:2403.08447v1</a> · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">Geometric segmentation overlap also poorly predicts dosimetry: Dice–dose Pearson correlation was only −0.11 (mean OAR dose) and −0.13 (Dmax 1%) in brain RT; authors urge revising metrics toward clinically-oriented endpoints.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Poel et al., Med Image Anal 2021 (12 GBM cases) [18,19,20]. <strong>Domain caveat:</strong> this measures contour-Dice→dose, not sCT-image-metric→dose — adjacent evidence, state it carefully. Larger OARs correlate somewhat better than small ones. Reinforces that both image <em>and</em> geometric overlap metrics are misaligned with clinical endpoints.</div>
+      <blockquote>"The Pearson correlation coefficient between the mean OAR dose effect and the Dice was −0.11." · "they advocate that current metrics for image segmentation in RT require revision toward clinically-oriented approaches"</blockquote>
+      <div class="sources">Source (primary): <a href="https://www.sciencedirect.com/science/article/pii/S1361841521002073">Poel et al., Med Image Anal 2021 (PMID 34293536)</a> · merged claims 18 + 19 + 20 · vote 3-0 / 2-1</div>
+    </div>
+  </section>
+
+  <!-- ============ SECTION 5 ============ -->
+  <section id="uq">
+    <h2><span class="num">5.</span>Uncertainty & decision-aware translation — an under-explored gap</h2>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">UQ in RT-AI is dominated by auto-contouring (~50% of studies); image synthesis is a small minority (~13%), and dose/outcome prediction barely represented — calibrated UQ for sCT is under-explored.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Huet-Dastarac et al., Radiother Oncol 2024 (PRISMA-ScR, 56 studies). Numbers verified exactly. Minor interpretive leap: the review's "dose prediction" = DL dose-distribution models, not sCT-downstream dose eval specifically.</div>
+      <blockquote>Auto-contouring "50%" of studies; image synthesis "13%"; dose/outcome prediction "relatively few manuscripts"</blockquote>
+      <div class="sources">Source (primary): <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC11118597/">PMC11118597 — AI UQ in RT, scoping review 2024</a> · vote 3-0</div>
+    </div>
+
+    <div class="finding">
+      <div class="finding-head">
+        <span class="claim">No reviewed study examined whether UQ estimates actually influence clinician trust or downstream decisions — decision-aware use of uncertainty is an open methodological gap.</span>
+        <span class="badge high">High</span>
+      </div>
+      <div class="evidence">Same scoping review; corroborated by a 2024 RSNA exchange conceding the open question. Caveat: scope is radiotherapy, not MR→CT-specific. This is the cleanest "nobody has done X" statement in the corpus.</div>
+      <blockquote>"none of the studies we reviewed explicitly investigated the influence of UQ estimates on end-user trust or decision making"</blockquote>
+      <div class="sources">Source (primary): <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC11118597/">PMC11118597</a> · vote 3-0</div>
+    </div>
+  </section>
+
+  <!-- ============ SECTION 6 ============ -->
+  <section id="novelty">
+    <h2><span class="num">6.</span>Ranked methodological novelty directions</h2>
+    <p>Ranked by defensibility for a top-ML venue given a paired, multi-region, downstream-coupled setup with a strong U-Net baseline. The unifying logic: the generative-backbone axis is saturated and your U-Net already wins it, so novelty must come from <em>reframing the objective and the evaluation</em>, where the verified evidence shows a genuine, multiply-confirmed gap.</p>
+
+    <div class="novelty">
+      <h3><span class="rank">1</span>Downstream-decision-aware training &amp; evaluation of sCT</h3>
+      <div class="row"><span class="label">ML claim</span>When the deployed metric (radiotherapy dose / segmentation) is provably decorrelated from the training surrogate (MAE/SSIM), optimizing and selecting models on the surrogate is mis-specified; a decision-aware objective that backpropagates a differentiable (or surrogate) downstream loss yields models that are <em>downstream-optimal</em>, not pixel-optimal.</div>
+      <div class="row"><span class="label">Why MR→CT is the decisive testbed</span>It is the rare translation task with a hard, quantitative, clinically-meaningful downstream metric (dose via pyRadPlan + TotalSegmentator Dice), and the mis-ranking is <em>documented</em> (|ρ|≈0.40; rank-1 vs rank-6 identical gamma).</div>
+      <div class="row"><span class="label">Concrete method</span>Differentiable dose-aware loss (HU→stopping-power/HLUT→dose forward pass) and/or a frozen-task-network loss (organ Dice), combined with downstream-aligned model selection. Evaluate on dose+Dice as primary, pixel metrics as secondary.</div>
+      <div class="row"><span class="label">How it beats the U-Net</span>The U-Net is pixel-optimal; you show it is <em>not</em> dose-optimal and that a decision-aware objective moves it along the dose axis where pixel metrics cannot.</div>
+      <div class="row"><span class="label">Prior art to beat</span>SynthRAD reports (diagnose the gap but don't train on it); task-aware/segmentation-guided losses; the Poel et al. critique. Net: prior work <em>names</em> the gap; nobody closes it via the training objective.</div>
+      <div class="row"><span class="label">Risk</span>Differentiable dose is hard (HLUT is homogeneous-dose-caveated per your pyRadPlan notes); gains may be small if the U-Net is already near the dose ceiling. Mitigate with surrogate task-network losses.</div>
+    </div>
+
+    <div class="novelty">
+      <h3><span class="rank">2</span>Calibrated, decision-aware uncertainty for sCT</h3>
+      <div class="row"><span class="label">ML claim</span>A translation model should emit calibrated voxelwise uncertainty that is <em>useful for a downstream decision</em> (e.g., flag voxels whose HU uncertainty materially changes dose), closing the verified "no study links UQ to decisions" gap.</div>
+      <div class="row"><span class="label">Why MR→CT is decisive</span>UQ-for-synthesis is only ~13% of RT-AI UQ work and decision-linkage is literally absent; MR→CT has a downstream decision (dose) to validate calibration <em>against</em>.</div>
+      <div class="row"><span class="label">Concrete method</span>Heteroscedastic / one-to-many conditional generation producing predictive HU distributions; propagate uncertainty through the dose/seg pipeline; report calibration (e.g., dose-error coverage) not just pixel NLL.</div>
+      <div class="row"><span class="label">How it beats the U-Net</span>Deterministic U-Net gives a point estimate with no error bars; you add calibrated, downstream-validated uncertainty — a capability, not just a metric bump.</div>
+      <div class="row"><span class="label">Prior art to beat</span>RT-AI UQ scoping review (gap), generic heteroscedastic/MC-dropout synthesis. Novelty = decision-linked calibration target.</div>
+      <div class="row"><span class="label">Risk</span>Calibration claims need careful, leakage-free evaluation; multi-center shift complicates calibration. Strong fit with your multi-center OOD splits.</div>
+    </div>
+
+    <div class="novelty">
+      <h3><span class="rank">3</span>Multi-region / cross-anatomy generalization as the objective</h3>
+      <div class="row"><span class="label">ML claim</span>Region-specific superiority (transformers in brain, cGAN in pelvis — survey-confirmed) means no single backbone generalizes; an explicitly anatomy-conditioned or region-robust training scheme can dominate across all five regions where specialists trade off.</div>
+      <div class="row"><span class="label">Why MR→CT is decisive</span>SynthRAD spans 5 regions with documented region-dependent winners and multi-center domain shift (your pelvis T1/T2 sequence-shift memo is a concrete failure mode).</div>
+      <div class="row"><span class="label">Concrete method</span>Region/sequence-conditioned normalization or experts; OOD-robust training validated on your center-wise (OOD) vs random (i.i.d.) folds.</div>
+      <div class="row"><span class="label">How it beats the U-Net</span>Show the plain U-Net's per-region variance and that region-aware training reduces worst-region error without per-region tuning.</div>
+      <div class="row"><span class="label">Prior art</span>Region-specific challenge entries; koalAI per-region models. Novelty = single model that beats specialists across regions on downstream metrics.</div>
+      <div class="row"><span class="label">Risk</span>Could read as engineering rather than ML novelty unless framed as a domain-generalization contribution with theory/ablations.</div>
+    </div>
+
+    <div class="novelty">
+      <h3><span class="rank">4</span>Misregistration-robust paired training (lower priority — crowded)</h3>
+      <div class="row"><span class="label">ML claim</span>Joint synthesis+registration with task-specific geometry constraints beats both plain paired and registration-guided GAN baselines.</div>
+      <div class="row"><span class="label">Status</span>Real obstacle but <em>mature/crowded</em> (RegGAN → QACL → reg-consistency+disentanglement → fRegGAN/DA-GAN). Your 1.5 mm deformable registration already mitigates it, weakening the motivation. Best used as a <em>component</em>, not the headline.</div>
+      <div class="row"><span class="label">Risk</span>Hard to claim novelty; incremental MAE gains (~5%) reported by successors are not top-venue-defining.</div>
+      <div class="sources" style="margin-top:6px;">Backbone swaps (diffusion bridge / wavelet / latent) are explicitly <em>not</em> recommended as a primary direction: SelfRDB/cWDM/3D-WLDM/UNSB already occupy this space and your U-Net already beats diffusion baselines.</div>
+    </div>
+  </section>
+
+  <!-- ============ CAVEATS ============ -->
+  <section id="caveats">
+    <h2><span class="num">7.</span>Caveats &amp; open questions</h2>
+    <div class="caveat-box">
+      <h2 style="font-size:1.1rem;margin-bottom:12px;">Caveats &amp; time-sensitivity</h2>
+      <ul class="clean">
+        <li><strong>Metric values wobble by challenge phase.</strong> SMU-MedVision's headline MAE/SSIM differ across phases/sources (74.47 vs 58.83 HU); the ranking and methodology are robust, the exact numbers are not.</li>
+        <li><strong>Dice–dose decorrelation is contour-Dice, not image-metric→dose.</strong> Poel et al. measures segmentation-overlap→dose (brain, n=12); adjacent to but not identical to "sCT pixel metrics mis-rank dose." State the distinction.</li>
+        <li><strong>Bridge/diffusion wins are 2D-slice / single-region / self-reported.</strong> SelfRDB (15 subjects, 2D), UNSB (natural images), cWDM (MRI→MRI). None is a multi-region 3D MR→CT downstream benchmark.</li>
+        <li><strong>UQ gap evidence is one radiotherapy-scoped review.</strong> Strong but single-source for the "no decision-linkage" claim; not an exhaustive field census.</li>
+        <li><strong>Survey "superior performance" framing self-disclaims its benchmark basis</strong> — region-specific and "incomparable." Cite it as evidence <em>against</em> blanket diffusion supremacy, not for it.</li>
+        <li><strong>Two claims were refuted</strong> and excluded: that downstream evaluation is only "sparsely reported" (it is increasingly standard in challenges), and a specific "commuting registration" formulation detail.</li>
+        <li><strong>Differentiable dose is constrained.</strong> Your own pyRadPlan note flags the HLUT homogeneous-dose caveat — a real engineering risk for Direction 1.</li>
+      </ul>
+    </div>
+    <h3>Open questions</h3>
+    <ul class="clean">
+      <li>Does a decision-aware (dose/seg) objective actually move a near-ceiling U-Net on dose, or is the dose error floor set by registration/HLUT rather than the translator?</li>
+      <li>Can voxelwise HU uncertainty be calibrated <em>against dose error</em> across multi-center OOD shift, or does domain shift break calibration?</li>
+      <li>For MR→CT specifically (not Task 2/CBCT, not contour-Dice), what is the measured image-metric→dose correlation on <em>your</em> 5-region paired set — does the SynthRAD mis-ranking reproduce in-house?</li>
+      <li>Would a single region-conditioned model beat per-region specialists (koalAI-style) on pooled downstream metrics, or does region-specialization win on its home turf?</li>
+    </ul>
+  </section>
+
+  <div class="footer">
+    Synthesized from 23 adversarially verified claims (3-vote). Confidence reflects source primacy and vote unanimity. Primary sources only; no marketing material cited.
+  </div>
+</div>
+</body>
+</html>
