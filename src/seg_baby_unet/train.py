@@ -7,8 +7,7 @@ import time
 import warnings
 from collections import defaultdict
 
-os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
-
+# os.environ["WANDB_IGNORE_GLOBS"] = "*.pt;*.pth"
 import matplotlib.pyplot as plt
 import monai
 import nibabel as nib
@@ -48,9 +47,9 @@ warnings.filterwarnings("ignore", message=".*Dynamo detected a call to a `functo
 
 # Add 'src' directory to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from anatomix.segmentation.segmentation_utils import load_model_v1_1, worker_init_fn
+from anatomix.segmentation.segmentation_utils import load_model_v1_1, load_model_v2, worker_init_fn
 
-from common.data import get_region_key
+from common.data import get_region_key, get_split_subjects
 from common.utils import count_parameters
 
 # ==========================================
@@ -60,38 +59,61 @@ SEG_CONFIG = {
     ##### System
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD_combined/1.5x1.5x1.5mm",
+    "root_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD/1.5mm_registered_flat_masked",
     "log_dir": "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/wandb_logs",
     "project_name": "mri2ct",
     "wandb": True,
-    "wandb_note": "Finetuning Anatomix on CADS Segmentation (11 classes) - CT Input - 1.5mm - Full Logic Parity",
+    "wandb_note": "CADS 35-class Segmentation - U-Net V2 (num_downs=4, ngf=36) - Scratch",
     ##### Classes
-    "n_classes": 12,
+    "n_classes": 35,
     "class_names": [
         "Background",
-        "Subcutaneous tissue",
-        "Muscle",
-        "Abdominal cavity",
+        "Brain - other",
+        "CSF",
+        "Eyes & optic pathway",
+        "Face & oral soft tissue",
+        "Gray matter",
+        "Head & neck glands",
+        "Skull",
+        "White matter",
+        "Airway",
+        "Breast",
+        "Esophagus",
+        "Heart",
+        "Lungs",
         "Thoracic cavity",
-        "Bones",
-        "Gland structure",
-        "Pericardium",
-        "Prosthetic breast implant",
-        "Mediastinum",
+        "Abdominal cavity",
+        "Adrenals",
+        "Bowel",
+        "Gallbladder",
+        "Kidneys",
+        "Liver",
+        "Pancreas",
+        "Spleen",
+        "Stomach",
+        "Bladder",
+        "Prostate & seminal vesicle",
+        "Blood vessels",
+        "Bone - other",
+        "Limb & girdle bones",
+        "Spine",
+        "Thoracic cage",
+        "Gland - other",
+        "Muscle",
         "Spinal cord",
-        "Brain",
+        "Subcutaneous tissue",
     ],
     ##### Data
+    "split_file": "/home/minsukc/MRI2CT/splits/center_wise_split.txt",
     "patch_size": 128,
-    "batch_size": 8,
+    "batch_size": 4,  # V2 model (ngf=36) OOMs at BS=8 on A40; BS=4 -> ~25GB
     "lr": 3e-4,
-    "n_epochs": 750,
-    "iters_per_epoch": 250,
-    "val_interval": 5,
+    "n_epochs": 1000,
+    "iters_per_epoch": 500,  # doubled to keep samples/epoch constant after halving batch_size
+    "val_interval": 20,
     "model_save_interval": 1,
     ##### Model
-    # "anatomix_weights_path": "/home/minsukc/MRI2CT/anatomix/model-weights/anatomix.pth",
-    "anatomix_weights_path": "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_v1_2.pth",
+    "anatomix_weights_path": "scratch",
     "finetune": True,
     "compile_mode": "model",  # Options: None, "model", "full"
     "few_shot": False,
@@ -139,7 +161,7 @@ class SegTrainer:
         self.start_epoch = 0
         self.global_step = 0
         self.local_run_dir = None  # set in _setup_wandb once run ID is known
-        self.session_dir = None    # per-resume subdir: <local_run_dir>/sessions/<run_name>/
+        self.session_dir = None  # per-resume subdir: <local_run_dir>/sessions/<run_name>/
 
         self._setup_wandb()
         self._setup_data()
@@ -163,6 +185,10 @@ class SegTrainer:
 
             wandb_id = None if self.cfg.get("diverge_wandb_branch", False) else self.cfg.get("resume_wandb_id")
 
+            # Tag by split so the two concurrent runs are distinguishable on wandb
+            split_tag = os.path.splitext(os.path.basename(self.cfg.get("split_file") or "default"))[0]
+            run_tags = ["cads35", "unet_v2", split_tag]
+
             wandb.init(
                 project=self.cfg["project_name"],
                 name=run_name,
@@ -170,6 +196,7 @@ class SegTrainer:
                 dir=self.cfg["log_dir"],
                 notes=self.cfg["wandb_note"],
                 id=wandb_id,
+                tags=run_tags,
                 resume="allow" if not self.cfg.get("diverge_wandb_branch", False) else None,
             )
             tqdm.write(f"[SegTrainer] 📡 WandB Initialized. Run ID: {wandb.run.id}")
@@ -216,6 +243,7 @@ class SegTrainer:
 
         def get_epoch(path):
             try:
+                # Handle standard epoch checkpoints like seg_baby_unet_epoch_X.pth
                 return int(os.path.basename(path).split("epoch_")[-1].split(".")[0])
             except Exception:
                 return -1
@@ -229,12 +257,17 @@ class SegTrainer:
                 return
             resume_path = target_ckpts[-1]
         else:
-            # Prefer latest epoch; fall back to best if no epoch checkpoints
-            epoch_ckpts = [c for c in all_ckpts if get_epoch(c) >= 0]
-            if epoch_ckpts:
-                resume_path = epoch_ckpts[-1]
+            # Look specifically for the 'last' checkpoint to resume from the latest state
+            last_ckpts = [c for c in all_ckpts if "last.pth" in os.path.basename(c)]
+            if last_ckpts:
+                resume_path = last_ckpts[0]
             else:
-                resume_path = max(all_ckpts, key=os.path.getmtime)
+                # Fall back to highest epoch or latest modified
+                epoch_ckpts = [c for c in all_ckpts if get_epoch(c) >= 0]
+                if epoch_ckpts:
+                    resume_path = epoch_ckpts[-1]
+                else:
+                    resume_path = max(all_ckpts, key=os.path.getmtime)
 
         tqdm.write(f"[RESUME] 📥 Loading: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=self.device, weights_only=False)
@@ -265,21 +298,32 @@ class SegTrainer:
             self.global_step = self.start_epoch * self.cfg["iters_per_epoch"]
 
     def _setup_data(self):
-        print(f"[SegTrainer] 📂 Scanning data in {self.cfg['root_dir']}...")
+        print(f"[SegTrainer] 📂 Scanning data in {self.cfg['root_dir']} using split {self.cfg.get('split_file')}...")
 
         def get_file_list(split_name):
-            split_dir = os.path.join(self.cfg["root_dir"], split_name)
-            if not os.path.exists(split_dir):
+            split_file = self.cfg.get("split_file")
+            if not split_file or not os.path.exists(split_file):
+                print(f"[SegTrainer] ⚠️ Warning: Split file not found: {split_file}")
+                return []
+
+            try:
+                subjects = get_split_subjects(split_file, split_name)
+            except Exception as e:
+                print(f"[SegTrainer] ⚠️ Warning: Failed to read split file: {e}")
                 return []
 
             data_dicts = []
-            for subj in sorted(os.listdir(split_dir)):
-                subj_path = os.path.join(split_dir, subj)
+            for subj in subjects:
+                subj_path = os.path.join(self.cfg["root_dir"], subj)
                 if not os.path.isdir(subj_path):
                     continue
 
                 img_path = os.path.join(subj_path, "ct.nii.gz")
-                seg_path = os.path.join(subj_path, "cads_ct_seg.nii.gz")
+                seg_path = os.path.join(subj_path, "cads_grouped_35_labels_seg.nii.gz")
+
+                # Handle alternative naming if it hasn't been gzipped
+                if not os.path.exists(img_path):
+                    img_path = os.path.join(subj_path, "ct.nii")
 
                 if os.path.exists(img_path) and os.path.exists(seg_path):
                     data_dicts.append({"image": img_path, "label": seg_path, "subj_id": subj})
@@ -385,15 +429,20 @@ class SegTrainer:
                 num_workers=2,
             )
         else:
-            # High-Performance Caching: Use Local NVMe RAID (/tmp_data) to eliminate GPFS spikes.
+            # High-Performance Caching: Use node-local /tmp to eliminate GPFS spikes.
             user_id = os.environ.get("USER", "default")
-            local_nvme = "/tmp_data"
+            local_nvme = "/tmp"
+
+            # Per-split cache dir: different splits share subjects + transform -> same hash.
+            # Two concurrent jobs on one node sharing a cache dir would race-write the same
+            # *.pt and corrupt it. Scoping the dir by split keeps each job's cache isolated.
+            split_tag = os.path.splitext(os.path.basename(self.cfg.get("split_file") or "default"))[0]
 
             if os.path.exists(local_nvme) and os.access(local_nvme, os.W_OK):
-                cache_dir = os.path.join(local_nvme, f"mri2ct_cache_{user_id}")
+                cache_dir = os.path.join(local_nvme, f"mri2ct_cache_{user_id}_{split_tag}")
                 storage_type = "LOCAL NVMe"
             else:
-                cache_dir = os.path.join(os.path.dirname(self.cfg["root_dir"]), "persistent_cache_seg_v2")
+                cache_dir = os.path.join(os.path.dirname(self.cfg["root_dir"]), f"persistent_cache_seg_v2_{split_tag}")
                 storage_type = "GPFS (Networked)"
 
             os.makedirs(cache_dir, exist_ok=True)
@@ -441,11 +490,11 @@ class SegTrainer:
         )
 
     def _setup_model(self):
-        tqdm.write("[SegTrainer] 🏗️ Building Model (Anatomix)...")
+        tqdm.write("[SegTrainer] 🏗️ Building Model (Anatomix V2)...")
         # compile_model=True only if "model" mode is selected.
         # If "full", we skip model-level compile and compile the entire step.
         load_compile = self.cfg.get("compile_mode") == "model"
-        self.model = load_model_v1_1(
+        self.model = load_model_v2(
             pretrained_ckpt=self.cfg["anatomix_weights_path"],
             n_classes=self.cfg["n_classes"] - 1,
             device=self.device,
@@ -596,12 +645,13 @@ class SegTrainer:
 
             if (epoch + 1) % self.cfg["val_interval"] == 0:
                 val_loss = self.validate(epoch)
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    self.save_checkpoint(epoch, best=True)
-                    tqdm.write(f"✅ Epoch {epoch + 1} - New Best Dice Loss: {val_loss:.4f}")
-                else:
-                    tqdm.write(f"✅ Epoch {epoch + 1} - Validation Dice Loss: {val_loss:.4f}")
+                if val_loss is not None:
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        self.save_checkpoint(epoch, best=True)
+                        tqdm.write(f"✅ Epoch {epoch + 1} - New Best Dice Loss: {val_loss:.4f}")
+                    else:
+                        tqdm.write(f"✅ Epoch {epoch + 1} - Validation Dice Loss: {val_loss:.4f}")
 
             if (epoch + 1) % self.cfg["model_save_interval"] == 0:
                 self.save_checkpoint(epoch)
@@ -609,6 +659,9 @@ class SegTrainer:
         self.save_checkpoint(self.cfg["n_epochs"] - 1)
 
     def validate(self, epoch):
+        if len(self.val_ds) == 0:
+            return None
+
         self.model.eval()
         val_loss = 0.0
         val_steps = 0
@@ -622,7 +675,9 @@ class SegTrainer:
                 subj_id = val_data["subj_id"][0]
 
                 roi_size = (crop_size, crop_size, crop_size)
-                sw_batch_size = 16
+                # sw_batch_size must stay small: the V2 model (ngf=36) overflows int32
+                # tensor indexing at 16 patches (16x72x128^3 skip-concat > 2^31). 4 fits in ~27GB.
+                sw_batch_size = 4
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     val_outputs = sliding_window_inference(
                         val_images,
@@ -680,26 +735,36 @@ class SegTrainer:
     def save_checkpoint(self, epoch, best=False):
         save_dir = self.local_run_dir if (self.cfg["wandb"] and self.local_run_dir) else os.path.join(self.cfg["log_dir"], "models")
         os.makedirs(save_dir, exist_ok=True)
-        filename = "seg_baby_unet_best.pth" if best else f"seg_baby_unet_epoch_{epoch}.pth"
-        save_path = os.path.join(save_dir, filename)
 
         # Save non-compiled weights if applicable
         model_state = self.model.state_dict()
         if hasattr(self.model, "_orig_mod"):
             model_state = self.model._orig_mod.state_dict()
 
-        torch.save(
-            {
-                "epoch": epoch,
-                "global_step": self.global_step,
-                "model_state_dict": model_state,
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
-                "config": self.cfg,
-            },
-            save_path,
-        )
-        tqdm.write(f"[SAVE] 💾 Checkpoint saved: {save_path}")
+        state_dict = {
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "model_state_dict": model_state,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+            "config": self.cfg,
+        }
+
+        if best:
+            save_path = os.path.join(save_dir, "seg_baby_unet_best.pth")
+            torch.save(state_dict, save_path)
+            tqdm.write(f"[SAVE] 💾 Best Checkpoint saved: {save_path}")
+
+        # Overwrite the 'last' checkpoint every epoch, regardless of whether it was 'best'
+        last_path = os.path.join(save_dir, "seg_baby_unet_last.pth")
+        torch.save(state_dict, last_path)
+        tqdm.write(f"[SAVE] 💾 Last Checkpoint updated: {last_path}")
+
+        # Save historical numbered checkpoint every 200 epochs
+        if (epoch + 1) % 200 == 0:
+            hist_path = os.path.join(save_dir, f"seg_baby_unet_epoch_{epoch + 1}.pth")
+            torch.save(state_dict, hist_path)
+            tqdm.write(f"[SAVE] 💾 Historical Checkpoint saved: {hist_path}")
 
 
 if __name__ == "__main__":
@@ -709,14 +774,19 @@ if __name__ == "__main__":
     parser.add_argument("--n_epochs", type=int, default=SEG_CONFIG["n_epochs"])
     parser.add_argument("--iters_per_epoch", type=int, default=SEG_CONFIG["iters_per_epoch"])
     parser.add_argument("--num_workers", type=int, default=SEG_CONFIG["num_workers"])
+    parser.add_argument("--val_interval", type=int, default=SEG_CONFIG["val_interval"])
     parser.add_argument("--resume_id", type=str, default=None)
+    parser.add_argument("--split_file", type=str, default=None)
     args = parser.parse_args()
 
     SEG_CONFIG["n_epochs"] = args.n_epochs
     SEG_CONFIG["iters_per_epoch"] = args.iters_per_epoch
     SEG_CONFIG["num_workers"] = args.num_workers
+    SEG_CONFIG["val_interval"] = args.val_interval
     if args.resume_id:
         SEG_CONFIG["resume_wandb_id"] = args.resume_id
+    if args.split_file:
+        SEG_CONFIG["split_file"] = args.split_file
     try:
         trainer = SegTrainer(SEG_CONFIG)
         trainer.train()
