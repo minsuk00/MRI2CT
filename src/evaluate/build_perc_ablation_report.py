@@ -28,6 +28,18 @@ VARIANTS = {
     # perceptual on/off, identical dice 0.1. 9xmodnhn is the no-perc sibling.
     "9xmodnhn_ep200": ("no-perc (baseline)", 0.0, 0.1),
     "91hdk0ka_ep200": ("perceptual (ncc)", 0.1, 0.1),
+    # 2026-06-17 anatomix-injection 3-way (center-wise, ep200 / ~100k-step parity).
+    # Isolates WHERE anatomix is injected: nowhere -> training loss -> model backbone.
+    "nbn71048_ep200": ("unet-dice (no anatomix)", 0.0, 0.1),
+    "y5tqp2bt_ep200": ("unet-perc (anatomix loss)", 0.1, 0.1),
+    "827la6dp_ep200": ("amix v1.4 (anatomix backbone)", 0.0, 0.1),
+}
+
+# Optional richer per-variant legend text (overrides the perceptual_w/dice_w line).
+NOTES = {
+    "nbn71048_ep200": "plain U-Net · L1 + SSIM + Dice · anatomix used <b>nowhere</b>",
+    "y5tqp2bt_ep200": "plain U-Net · L1 + anatomix-NCC perceptual(0.1) + Dice · SSIM off · anatomix in the <b>loss</b>",
+    "827la6dp_ep200": "anatomix-feature translator · L1 + SSIM + Dice (perceptual_w=0) · anatomix in the <b>architecture</b>",
 }
 REGIONS = ["abdomen", "brain", "head_neck", "pelvis", "thorax"]
 # (column, label, higher_is_better)
@@ -187,16 +199,30 @@ def main():
     tags = present + extra
     n = {t: len({r["subj_id"] for r in rows if r["model"] == t}) for t in tags}
 
+    def _legend_desc(t):
+        if t in NOTES:  # NOTES is trusted HTML (contains <b>); do not escape
+            return NOTES[t]
+        return (f"perceptual_w={VARIANTS.get(t,(None,'?','?'))[1]}, "
+                f"dice_w={VARIANTS.get(t,(None,'?','?'))[2]}")
     legend = "".join(
         f"<li><b>{html.escape(VARIANTS.get(t, (t,))[0])}</b> "
-        f"(<code>{html.escape(t)}</code>): perceptual_w={VARIANTS.get(t,(None,'?','?'))[1]}, "
-        f"dice_w={VARIANTS.get(t,(None,'?','?'))[2]}, n={n[t]}</li>"
+        f"(<code>{html.escape(t)}</code>): {_legend_desc(t)}, n={n[t]}</li>"
         for t in tags)
 
-    # The 3-run ep400 ablation varied perceptual_w AND dice_w, so it needs a
-    # confound caveat. A clean single-axis contrast (no dice_w==0 variant) does not.
+    # 2026-06-17 anatomix-injection 3-way gets its own framing + caveat.
+    is_injection = any(t in NOTES for t in tags)
     has_no_dice = any(VARIANTS.get(t, (None, None, None))[2] == 0.0 for t in tags)
-    caveat = ("""<div class="note"><b>Confound caveat.</b> These runs vary on <i>two</i> axes (perceptual_w and dice_w).
+    if is_injection:
+        caveat = ("""<div class="note"><b>What this ablation isolates.</b> All three share the L1 + Dice base and
+the same center-wise data/budget (ep200 ≈ 100k steps), and differ only in <i>where anatomix is injected</i>:
+<b>nowhere</b> (unet-dice) → as a training <b>loss</b> (unet-perc, NCC on frozen anatomix decoder features) →
+as the model <b>backbone</b> (amix, a translator that operates on frozen anatomix features, no perceptual loss).
+<br><b>Caveat:</b> unet-dice→unet-perc <i>swaps</i> SSIM for the perceptual term (repo rule: perceptual on ⇒ ssim_w=0),
+so that step is a substitution, not a pure addition; amix keeps SSIM. Each variant is a separate training run, so a
+small part of any gap is run-to-run noise — the per-subject Wilcoxon below tests whether the body-MAE difference is
+consistent across subjects.</div>""")
+    else:
+        caveat = ("""<div class="note"><b>Confound caveat.</b> These runs vary on <i>two</i> axes (perceptual_w and dice_w).
 The clean perceptual contrast is <b>no-perc (perc 0, dice 0.1)</b> vs <b>perceptual (perc 0.5, dice 0.1)</b>
 — identical dice, differing only in perceptual loss. The <i>perceptual, no-dice</i> run isolates the dice
 contribution. Do not read the Hard-Dice gap to the no-dice run as a perceptual effect.</div>""" if has_no_dice
@@ -224,8 +250,9 @@ noise — but the per-subject Wilcoxon (below) tests whether the body-MAE differ
                             "body MAE / SSIM / Hard Bone Dice. brain &amp; head_neck use a narrow "
                             "[-100,100] HU window; others [-1024,1024].</small></p>" + "\n".join(imgs))
 
+    h1 = "Anatomix-injection ablation" if is_injection else "U-Net perceptual-loss ablation"
     body = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>UNet perceptual-loss ablation — {html.escape(os.path.basename(args.eval_root))}</title>
+<title>{html.escape(h1)} — {html.escape(os.path.basename(args.eval_root))}</title>
 <style>
  body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:2rem;max-width:1000px;color:#222}}
  table{{border-collapse:collapse;margin:0.5rem 0 1.5rem}}
@@ -234,9 +261,9 @@ noise — but the per-subject Wilcoxon (below) tests whether the body-MAE differ
  small{{color:#666}} code{{background:#f3f3f3;padding:1px 4px;border-radius:3px}}
  .note{{background:#fff8e6;border-left:4px solid #e8b000;padding:8px 14px;margin:1rem 0}}
 </style></head><body>
-<h1>U-Net perceptual-loss ablation</h1>
+<h1>{html.escape(h1)}</h1>
 <p>center-wise validation split · {n.get(tags[0], '?')} subjects · all at the {html.escape(args.step_label)} parity
-checkpoint · Track-A metrics + Hard Dice, identical definitions to full_eval_20260601.</p>
+checkpoint · Track-A metrics + Hard Dice, identical definitions to full_eval.</p>
 <h3>Variants</h3><ul>{legend}</ul>
 {caveat}
 {table_block("Overall — micro (subject-weighted)", tags, rows, HEADLINE, "micro")}
