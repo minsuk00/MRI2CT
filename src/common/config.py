@@ -89,6 +89,7 @@ DEFAULT_CONFIG = {
     "perceptual_w": 0.0,  # Anatomix v1_4 perceptual loss weight (0 = off)
     "perceptual_layers": None,  # comma-separated decoder layer indices; None -> [38,45,52,65]
     "perceptual_metric": "ncc",  # "ncc" (normalized cross-correlation, default) or "l1"
+    "perceptual_separable": True,  # LNCC box-sum via separable 1-D convs (exact, ~3.5x faster); False = dense
     "wandb_tags": [],
     "wandb_note": "test_run",
     "resume_wandb_id": None,
