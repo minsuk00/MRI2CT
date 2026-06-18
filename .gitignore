@@ -15,7 +15,6 @@ data/
 /inference/
 dataset
 CADS/
-maisi-mr-to-ct/
 pyproject.toml
 .vscodde/
 _archive/
@@ -35,9 +34,10 @@ evaluation_results
 
 # Vendored external repos with their own .git (re-clonable upstream, not tracked here)
 /PortPy/
-/NV-Generate-CTMR/
 /batchaug/
 /MRNet_Knee_1.5mm/
+/baselines/NV-Generate-CTMR/
+/baselines/maisi-mr-to-ct/
 /baselines/koalAI/
 /baselines/koalAI-seg/
 /baselines/vs-ddpm/
@@ -49,6 +49,9 @@ evaluation_results
 *.out
 slurm_logs/
 /*.png
+
+# Reference papers (kept locally, not in git history)
+/baselines/*.pdf
 
 # Elastix registration byproducts (dumped in repo root)
 /IterationInfo.*.txt

@@ -16,7 +16,7 @@ from maisi_baseline.trainer import MAISITrainer
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "autoencoder_v1.pt")
 DIFFUSION_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "diff_unet_3d_rflow-ct.pt")
-NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "NV-Generate-CTMR", "configs", "config_network_rflow.json")
+NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "baselines", "NV-Generate-CTMR", "configs", "config_network_rflow.json")
 
 # ==========================================
 # CONFIGURATION

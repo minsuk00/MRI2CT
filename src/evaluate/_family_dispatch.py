@@ -83,7 +83,7 @@ MCDDPM_CT_SPAN_PAPER = MCDDPM_CT_CLIP[1] - MCDDPM_CT_CLIP[0]  # 2674
 # MAISI assets.
 MAISI_AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "autoencoder_v1.pt")
 MAISI_DIFFUSION_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "diff_unet_3d_rflow-ct.pt")
-MAISI_NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "NV-Generate-CTMR", "configs", "config_network_rflow.json")
+MAISI_NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "baselines", "NV-Generate-CTMR", "configs", "config_network_rflow.json")
 
 # Anatomix feature-extractor weights for the amix family.
 AMIX_CKPTS = {

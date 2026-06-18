@@ -5,7 +5,7 @@ Checkpoint paths (via ckpt/ symlink → GPFS):
   CT VAE:  ckpt/nv-generate-ct/models/autoencoder_v1.pt
   MR VAE:  ckpt/nv-generate-mr/models/autoencoder_v2.pt
 
-Architecture defined in NV-Generate-CTMR/configs/config_network_rflow.json.
+Architecture defined in baselines/NV-Generate-CTMR/configs/config_network_rflow.json.
 Both CT and MR share the same architecture; the MR VAE was additionally trained on MRI.
 """
 

@@ -16,7 +16,7 @@ def dynamic_infer(inferer, model, images):
     When tiling, the ROI is clamped to the volume size so the inferer never pads
     the input beyond its extent.
 
-    Mirrors NV-Generate-CTMR/scripts/utils.py:dynamic_infer. This guard avoids the
+    Mirrors baselines/NV-Generate-CTMR/scripts/utils.py:dynamic_infer. This guard avoids the
     oversized-padding path (volume << ROI -> zero-pad to ROI), which corrupts small
     volumes (e.g. brain): the air padding floods the VAE's GroupNorm statistics and
     biases the whole reconstruction. `images`: (N, C, *spatial).
