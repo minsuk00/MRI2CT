@@ -55,9 +55,10 @@ class AnatomixPerceptualLoss(nn.Module):
     shape (B, 1, D, H, W). Gradients flow through pred only.
 
     metric:
-      "ncc" — (default) 1 − normalized cross-correlation per (batch, channel) over spatial
-              dims, averaged. Compares feature *patterns* invariant to per-channel affine
-              intensity; matches the cosine geometry anatomix was pretrained under. In [0, 2].
+      "ncc" — (default) 1 − local squared normalized cross-correlation (LNCC): squared
+              Pearson correlation within sliding 7³ box windows, averaged over windows,
+              channels, and samples. Compares local feature *patterns* invariant to a
+              per-window affine change (incl. sign); a strong spatial-structure term. In [0, 1].
       "l1"  — mean L1 distance between feature maps (AFP-loss convention).
 
     NOTE: when this perceptual loss is active (perceptual_w > 0), set ssim_w = 0.
@@ -87,20 +88,64 @@ class AnatomixPerceptualLoss(nn.Module):
         print(f"[DEBUG] AnatomixPerceptualLoss (v1_4) metric={self.metric} decoder layers {self.layers}")
 
     @staticmethod
-    def _ncc_loss(p, t, eps=1e-5):
-        """1 - normalized cross-correlation, per (batch, channel) over spatial dims, averaged.
+    def _ncc_loss(pred, target, *, kernel_size=7, eps=1e-5):
+        """Local zero-normalized cross-correlation (LNCC) loss for 2D or 3D features.
 
-        p, t: (B, C, D, H, W). Centers each feature map, normalizes by the centered norm
-        (Pearson correlation), so it's invariant to per-channel affine intensity shifts.
-        Returns a scalar in [0, 2] (0 = perfectly correlated).
+        Slides a rectangular box window over the spatial dimensions and, within each
+        window, computes the *squared* Pearson correlation between ``pred`` and
+        ``target`` per (sample, channel). The result is averaged over all windows,
+        channels, and samples, and returned as ``1 - mean(ncc)``.
+
+        Because the correlation is computed locally and is squared, the loss is
+        invariant to a per-window affine change (mean shift and rescaling, including
+        sign) of either input within the image patch.
+
+        Args:
+            pred:        Raw (un-normalized) features, shape ``(N, C, H, W)`` for 2D
+                         or ``(N, C, D, H, W)`` for 3D.
+            target:      Reference features, same shape as ``pred``.
+            kernel_size: Side length of the cubic/square box window. Uses ``same``
+                         padding, so the output covers every input location.
+            eps:         Small constant added to variances and the correlation ratio
+                         for numerical stability.
+
+        Returns:
+            Scalar tensor in ``[0, 1]``. ``0`` means every local window is perfectly
+            correlated (up to affine scaling); larger values mean weaker local
+            agreement.
         """
-        dims = (2, 3, 4)
-        pc = p - p.mean(dim=dims, keepdim=True)
-        tc = t - t.mean(dim=dims, keepdim=True)
-        num = (pc * tc).sum(dim=dims)
-        den = torch.sqrt((pc * pc).sum(dim=dims) * (tc * tc).sum(dim=dims) + eps)
-        ncc = num / (den + eps)  # (B, C) in [-1, 1]
-        return 1.0 - ncc.mean()
+        C = pred.shape[1]
+        ndim = pred.dim() - 2  # number of spatial dims (2 or 3)
+        if ndim not in (2, 3):
+            raise ValueError(f"expected 4D or 5D input, got {pred.dim()}D")
+        conv = F.conv2d if ndim == 2 else F.conv3d
+        n_win = kernel_size**ndim
+        pad = kernel_size // 2
+
+        # Force fp32 with autocast disabled: this LNCC computes variance/covariance via
+        # the unstable "sum of squares minus square of sums" identity (a difference of two
+        # large, near-equal box sums). Under the bf16 autocast used in training, conv3d
+        # would downcast and that subtraction suffers catastrophic cancellation -> garbage
+        # variances clamp to eps and the squared-correlation ratio blows up (~1e7). Merely
+        # .float()-ing the inputs is not enough: autocast re-downcasts conv operands, so we
+        # must disable it for this block. Same precision guard as get_class_dice() above.
+        with torch.autocast(device_type=pred.device.type, enabled=False):
+            pred = pred.float()
+            target = target.float()
+            kernel = pred.new_ones(C, 1, *([kernel_size] * ndim))  # per-channel box sum
+
+            def box(x):
+                return conv(x, kernel, padding=pad, groups=C)  # group=C -> no cross-channel mixing
+
+            t, p = target, pred
+            t_sum, p_sum = box(t), box(p)
+            t2_sum, p2_sum = box(t * t), box(p * p)
+            tp_sum = box(t * p)
+            cross = tp_sum - p_sum * t_sum / n_win  # n_win * local covariance
+            t_var = (t2_sum - t_sum * t_sum / n_win).clamp_min(eps)
+            p_var = (p2_sum - p_sum * p_sum / n_win).clamp_min(eps)
+            ncc = (cross * cross + eps) / (t_var * p_var + eps)  # squared correlation
+            return 1.0 - ncc.mean()
 
     def _dist(self, p, t):
         return self.dist(p, t) if self.metric == "l1" else self._ncc_loss(p, t)
