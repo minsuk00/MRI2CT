@@ -98,8 +98,9 @@ save(fig, "fig4_bone_joint_hist.png")
 # 5 — 1D HU distributions in bone: GT raw vs pred
 gt_marg = H.sum(axis=1); pred_marg = H.sum(axis=0)
 fig, ax = plt.subplots(figsize=(8, 4.2))
-ax.plot(GTC, gt_marg / gt_marg.sum(), color=C_BONE, lw=1.8, label="GT (raw) in bone")
-ax.plot(PRC, pred_marg / pred_marg.sum(), color="#111827", lw=1.8, label="pred in true bone")
+_gw, _pw = GTE[1] - GTE[0], PRE[1] - PRE[0]  # true density: divide each by its own bin width
+ax.plot(GTC, gt_marg / gt_marg.sum() / _gw, color=C_BONE, lw=1.8, label="GT (raw) in bone")
+ax.plot(PRC, pred_marg / pred_marg.sum() / _pw, color="#111827", lw=1.8, label="pred in true bone")
 ax.axvline(s.gt_bone_mean.mean(), color=C_BONE, ls=":", lw=1)
 ax.axvline(s.pred_bone_mean.mean(), color="#111827", ls=":", lw=1)
 ax.axvline(1024, color="lime", lw=1, label="GT clip = 1024")

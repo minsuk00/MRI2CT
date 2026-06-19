@@ -144,13 +144,14 @@ save(fig, "bf6_locmag.png")
 # F7 — loss imbalance
 fig, ax = plt.subplots(figsize=(6, 4.2))
 loss = st["loss"]
-ax.bar(["voxel share", "L1-error share"], [loss["bone_vox_pct"], loss["bone_l1_share_pct"]],
+bone_err_share = st["tissue"]["bone"]["err_share_pct"]   # clipped frame (the frame the L1 optimizes)
+ax.bar(["voxel share", "error share"], [loss["bone_vox_pct"], bone_err_share],
        color=["#94a3b8", SC_COL["bone"]])
-for i, v in enumerate([loss["bone_vox_pct"], loss["bone_l1_share_pct"]]):
+for i, v in enumerate([loss["bone_vox_pct"], bone_err_share]):
     ax.annotate(f"{v:.1f}%", (i, v), ha="center", va="bottom", fontsize=10)
-ax.set_ylabel("% of body")
+ax.set_ylabel("% of body (clipped frame)")
 ax.set_title(f"Bone is {loss['bone_vox_pct']:.0f}% of voxels: tiny weight in the uniform L1 loss\n"
-             f"(it is {loss['bone_l1_share_pct']:.0f}% of the error, {loss['leverage_ratio']:.1f}x its voxel share)")
+             f"(it is {bone_err_share:.0f}% of the error, {bone_err_share/loss['bone_vox_pct']:.1f}x its voxel share)")
 save(fig, "bf7_loss_imbalance.png")
 
 # F8 — ceiling vs regression-to-mean (pooled pred-bone HU dist via bone marginal of 05 npz)
@@ -161,8 +162,9 @@ GTE = bh["gt_edges"]
 prc = (PRE[:-1] + PRE[1:]) / 2
 gtc = (GTE[:-1] + GTE[1:]) / 2
 pred_marg = H.sum(axis=0); gt_marg = H.sum(axis=1)
-ax.plot(gtc, gt_marg / gt_marg.sum(), color=SC_COL["bone"], lw=1.6, label="GT bone HU")
-ax.plot(prc, pred_marg / pred_marg.sum(), color="#111827", lw=1.6, label="pred in true bone")
+_gw, _pw = GTE[1] - GTE[0], PRE[1] - PRE[0]  # true density: divide each by its own bin width
+ax.plot(gtc, gt_marg / gt_marg.sum() / _gw, color=SC_COL["bone"], lw=1.6, label="GT bone HU")
+ax.plot(prc, pred_marg / pred_marg.sum() / _pw, color="#111827", lw=1.6, label="pred in true bone")
 ax.axvline(1024, color="lime", lw=1.4, label="sigmoid cap = 1024 HU")
 ax.axvline(sev := st["severity"]["pred_bone_max_mean"], color="purple", ls="--", lw=1.2,
            label=f"mean pred max = {sev:.0f} HU")

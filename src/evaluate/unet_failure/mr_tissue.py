@@ -63,8 +63,12 @@ def main():
     ps["region"] = ps.subj_id.map(reg)
     subs = ps.groupby("region").head(10).subj_id.tolist()
     res = [r for r in Pool(8).map(work, subs) if r]
-    pool = {k: np.concatenate([r[k] for r in res if r.get(k) is not None])
-            for k in ["air", "soft", "bone", "cort"]}
+    pool = {}
+    for k in ["air", "soft", "bone", "cort"]:
+        arrs = [r[k] for r in res if r.get(k) is not None]
+        pool[k] = np.concatenate(arrs) if arrs else np.array([])  # guard: tissue absent in all sampled subjects
+    if any(len(pool[k]) == 0 for k in ["air", "soft", "bone", "cort"]):
+        raise SystemExit("[mr_tissue] a tissue class was empty across all sampled subjects; widen the subject set")
     np.savez(os.path.join(RUN, "mr_tissue_pool.npz"), **pool)
 
     bins = np.linspace(0, 1, 41)

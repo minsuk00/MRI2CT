@@ -79,7 +79,7 @@ def main():
     # ---- loss imbalance ----
     loss = {
         "bone_vox_pct": float(100 * b.n_bone.sum() / b.n_body.sum()),
-        "bone_l1_share_pct": float(100 * b.aerr_sum_bone.sum() / b.total_aerr.sum()),
+        "bone_l1_share_pct": float(100 * b.aerr_sum_bone.sum() / b.total_aerr.sum()),  # raw frame
     }
     loss["leverage_ratio"] = loss["bone_l1_share_pct"] / loss["bone_vox_pct"]
 

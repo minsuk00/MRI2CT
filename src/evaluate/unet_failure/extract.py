@@ -126,6 +126,7 @@ def process_subject(subj):
 
     row = {
         "subj_id": subj, "region": region, "n_body": int(body.sum()), "n_total": int(gt.size),
+        "n_labeled": int((segb > 0).sum()),   # CADS coverage: body voxels with a label 1..34
         "mae_raw": _mean(aerr_r), "mae_clip": _mean(aerr_c),
         "total_aerr_sum_raw": float(aerr_r.sum()), "total_aerr_sum_clip": float(aerr_c.sum()),
     }

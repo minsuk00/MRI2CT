@@ -101,8 +101,8 @@ worst-predicted tissue ({tis['bone']['pv_mae']:.0f} HU MAE, {tis['bone']['pv_mae
 the only one with a large systematic undershoot. <b>For the aggregate pixel score, no</b> — fixing <b>air</b> or
 <b>soft</b> helps PSNR/MAE more than bone, because they are far more numerous (air {air_psnr:+.2f} dB vs bone
 {bone_psnr:+.2f} dB).<br>
-<b>2. Are the big wins air AND soft (not just bone)?</b> Yes — <b>air and soft are the two biggest aggregate wins and
-they are roughly tied</b>; bone is third (about half their size).<br>
+<b>2. Are the big wins air AND soft (not just bone)?</b> Yes — <b>air and soft are the two biggest aggregate wins</b>
+(tied on body-MAE ~13.5 HU each; air leads on PSNR, +2.78 vs +1.53 dB); bone is third (about half their size).<br>
 <b>3. Why does the model undershoot, and why only bone?</b> The L1 loss pulls every tissue toward the central
 (median) value given the MR. Soft sits at that center (≈unbiased), air is the low extreme (slight over-shoot), and
 bone is the high, skewed tail (large under-shoot). Bone is hit hardest because it is both <b>far in the tail</b> and
@@ -166,9 +166,9 @@ that rank relates to CT HU, per tissue (rank-based / scale-invariant).</p>
 <p>The oracle gain = the error currently held by each tissue. Because air (27%) and soft (68%) hold far more voxels,
 they hold more total error than rare bone (5%), even though each bone voxel is worse:</p>
 {T_oracle}
-<p><b>Air and soft are roughly tied as the biggest aggregate wins; bone is about half their size; cortical/skull move
-the clipped score the least</b> (the clip hides their error). So "biggest" depends on whether you weight per-voxel /
-clinical accuracy (bone) or the aggregate pixel metric (air ≈ soft).</p>
+<p><b>Air and soft are the biggest aggregate wins (tied on body-MAE; air leads on PSNR); bone is about half their size;
+cortical/skull move the clipped score the least</b> (the clip hides their error). So "biggest" depends on whether you
+weight per-voxel / clinical accuracy (bone) or the aggregate pixel metric (air/soft).</p>
 <div class="grid">
 {img('q1_air_paradox.png','Air wins the aggregate not because it is hard, but because it is common AND moderately wrong. Bone is worst per-voxel but rare.')}
 {img('bf1_oracle.png','Oracle gain from perfecting one tissue, in three metrics. Air/soft lead PSNR and both MAEs; bone is mid-pack; cortical/skull are tiny on the clipped metrics.')}
@@ -219,9 +219,10 @@ that <b>looks like air</b>. <b>Trabecular bone</b> shows its marrow (fat/water),
 not like its true high HU. So MR brightness does not encode mineral density. Proof, on your data: bone's MR-brightness
 distribution <b>overlaps soft tissue by {mst['overlap_bone_soft']:.2f}</b> and cortical overlaps air by
 {mst['overlap_cort_air']:.2f} (1.0 = indistinguishable). A given MR brightness maps to many CT densities.</p>
-<p>Quantitatively, MR explains only <b>{mr['rho2_bone']*100:.0f}%</b> of bone-HU variance (vs {mr['rho2_soft']*100:.0f}%
-for soft), and knowing the MR removes only <b>{mr['mr_reduction_bone']:.0f}%</b> of the bone-HU spread (std
-{mr['marg_std_bone']:.0f}→{mr['cond_std_bone']:.0f} HU). Bone HU is also intrinsically
+<p>Quantitatively, knowing the MR removes only <b>{mr['mr_reduction_bone']:.0f}%</b> of the bone-HU spread (std
+{mr['marg_std_bone']:.0f}→{mr['cond_std_bone']:.0f} HU; for soft it removes {mr['mr_reduction_soft']:.0f}%) — i.e. MR
+barely narrows the uncertainty about a bone voxel's HU. (The squared rank correlation between MR and HU, a coarser
+rank-based measure, is also low in bone: {mr['rho2_bone']:.2f} vs {mr['rho2_soft']:.2f} for soft.) Bone HU is also intrinsically
 ~{mr['ctstd_bone_mean']/mr['ctstd_soft_mean']:.0f}× wider than soft (std {mr['ctstd_bone_mean']:.0f} vs
 {mr['ctstd_soft_mean']:.0f} HU): a wide target the MR cannot resolve is exactly what an L1 model collapses to the
 mean. (Consistent with the prior cross-model result that even the uncapped diffusion baselines undershoot bone.)</p>
@@ -234,7 +235,9 @@ mean. (Consistent with the prior cross-model result that even the uncapped diffu
 <h2>7. Supporting causes</h2>
 <h3>Bone is rare → negligible weight in the uniform loss</h3>
 <p>Bone is {loss['bone_vox_pct']:.0f}% of body voxels under a uniform L1, so it contributes little gradient, even
-though it holds {loss['bone_l1_share_pct']:.0f}% of the error ({loss['leverage_ratio']:.1f}× its voxel share).</p>
+though it holds {tis['bone']['err_share_pct']:.0f}% of the error in the clipped frame the loss actually optimizes
+({tis['bone']['err_share_pct']/loss['bone_vox_pct']:.1f}× its voxel share; {loss['bone_l1_share_pct']:.0f}% in the raw
+frame).</p>
 {img('bf7_loss_imbalance.png','Bone’s share of voxels vs its share of the error — under-weighted relative to its error contribution.')}
 <h3>It is a density-magnitude failure, not a localization failure</h3>
 <p>The model mostly knows <i>where</i> bone is (shape Dice {lm['overall']['shape_dice']:.2f}); the error is the HU

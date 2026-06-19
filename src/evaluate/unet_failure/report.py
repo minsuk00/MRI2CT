@@ -22,6 +22,8 @@ pla = pd.read_csv(os.path.join(RUN, "per_label_agg.csv"), index_col=0)
 bvn = pd.read_csv(os.path.join(RUN, "bone_vs_nonbone.csv"), index_col=0)
 oracle = pd.read_csv(os.path.join(RUN, "oracle.csv"), index_col=0)
 recon = pd.read_csv(os.path.join(RUN, "recon.csv"), index_col=0).reindex(REG)
+_ps = pd.read_csv(os.path.join(RUN, "per_subject.csv"))
+cads_coverage = float(100 * _ps.n_labeled.sum() / _ps.n_body.sum())   # % of body voxels with a CADS label
 
 
 def b64(name):
@@ -199,6 +201,15 @@ the mean. This is the densest, most dose-relevant tissue and it is exactly what 
 <p>The four worst-predicted structures are all bone (<b>skull, thoracic_cage, limb_girdle, bone_other</b>), with spine
 close behind; the best-predicted are brain white/gray matter and abdominal organs. Prevalence (n subjects with the
 label) is shown so single-subject labels are not over-read.</p>
+<div class="warn"><b>Math caveat (per-label MAE does NOT average to the reported MAE).</b> The 35 CADS labels cover only
+<b>{cads_coverage:.0f}%</b> of body voxels; the remaining ~{100-cads_coverage:.0f}% is <code>seg==0</code> inside the
+body, which is almost entirely unlabeled internal air (sinus / bowel gas / cavities CADS has no label for; the external
+background is masked to −1024 and excluded). So voxel-averaging these per-label MAEs gives the MAE over the
+<i>labeled</i> {cads_coverage:.0f}% (≈67.8 HU), <b>not</b> the body MAE (≈72.4 HU body-voxel-mean), and definitely not
+the leaderboard <code>body_mae_hu</code> (≈34 HU, which additionally divides by the full padded volume, ×0.40). The
+only decomposition that reconstructs the body MAE exactly is the air/soft/bone HU split, which tiles 100% of the body
+(verified by the mass-conservation gate). Per-label numbers below are per-structure body-voxel-mean MAEs, valid on
+their own but not additive to the headline number.</div>
 {T_label}
 <div class="grid">
 {img('fig10_label_mae.png','Per-CADS-label MAE (red = bone). Bone labels occupy the top of the ranking; brain/organ labels the bottom.')}
