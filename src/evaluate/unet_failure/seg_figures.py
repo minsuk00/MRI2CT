@@ -72,6 +72,17 @@ def f1_f2_f3(lab):
     ax.axvline(0, color="k", lw=0.6)
     save(fig, "f3_hu_bias.png")
 
+    # F3b: per-label MAE (absolute HU error)
+    d = lab.sort_values("mae", ascending=False)
+    fig, ax = plt.subplots(figsize=(8, 10))
+    colors = ["#dc2626" if b else "#9ca3af" for b in d.is_bone]
+    ax.barh(np.arange(len(d))[::-1], d.mae, color=colors)
+    ax.set_yticks(np.arange(len(d))[::-1])
+    ax.set_yticklabels(d.index, fontsize=8)
+    ax.set_xlabel("mean absolute HU error inside GT ROI  (|pred - GT|)")
+    ax.set_title("Mean absolute HU error per CADS label  (red = bone)")
+    save(fig, "f3b_hu_mae.png")
+
 
 def f4_scatter(pl):
     # per region x bone-label: mean gap vs mean bias

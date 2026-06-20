@@ -195,8 +195,17 @@ organs). Air is not a CADS class and is covered separately by HU in §5.</p>
 {img("f8_dice_dist.png", "Per-subject bone-union Dice across all subjects: real-CT ceiling (light) vs synthetic CT (dark). The entire distribution moves down on the sCT.")}
 
 <h2>2. Bone: localization or density?</h2>
-<p>The density error inside true ROIs is segmenter-independent and shows bone undershoot directly:</p>
-{img("f3_hu_bias.png", "Mean HU bias inside each GT ROI (pred − GT). Bone (red) undershoots strongly; soft tissue is near zero.")}
+<p>The density error inside true ROIs is segmenter-independent (GT CADS ROI only) and shows bone undershoot directly.
+Each value is the per-subject mean HU error, averaged across subjects (macro; not voxel-weighted).</p>
+{img("f3_hu_bias.png", "Mean signed HU bias inside each GT CADS ROI (pred − GT). Bone (red) undershoots; soft tissue is near zero.")}
+{img("f3b_hu_mae.png", "Mean absolute HU error |pred − GT| inside each GT CADS ROI. Bone (red) has the largest absolute errors.")}
+<p>Full per-label table (signed bias and absolute MAE, with segmentability for reference):</p>
+{T_label}
+<p><b>Note on "bone-other".</b> The CADS bone union is {{skull, spine, thoracic cage, limb/girdle, bone-other}}.
+"Bone-other" is a residual class with mean GT HU ≈ 34 (soft-tissue range, present in all 207 subjects), so it barely
+undershoots (bias +8) but has large two-sided error (MAE 212). The undershoot is concentrated in <i>dense cortical</i>
+bone — skull −154, thoracic cage −180, limb/girdle −173, spine −105 HU (GT 307–646) — and the bone-union mean (−106)
+is diluted by bone-other.</p>
 <p>Across regions, bone Dice drop and HU bias are correlated, but correlation is not the mechanism — §6 shows the
 segmenter drop is not actually caused by the HU magnitude.</p>
 {img("f4_loc_vs_density.png", "Per region × bone label: segmenter Dice drop (ceiling − sCT) vs HU bias inside the bone ROI. The two co-vary across regions, but the verification in §6 shows they are driven by different, separable defects.")}
