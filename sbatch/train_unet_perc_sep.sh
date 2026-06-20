@@ -36,7 +36,7 @@ STEPS_PER_EPOCH=1000     # doubled from 500 to keep samples_seen constant at bs4
 VAL_INTERVAL=40
 VALIDATE_DICE="False"    # exclude teacher dice from validation (val loss = L1 only)
 NUM_WORKERS=4
-RESUME_ID=""             # fresh run; set to the minted wandb id to resume past walltime
+RESUME_ID="mwrwxvvu"     # resume run mwrwxvvu (epoch 37) after Jun-18 /home disk-full crash
 TAGS="bs4,perceptual,dice,lncc,separable" # Comma-separated extra WandB tags
 
 # --- Self-Submission Logic ---
