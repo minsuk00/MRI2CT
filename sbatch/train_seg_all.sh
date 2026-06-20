@@ -18,7 +18,7 @@ SPLIT_FILE="/home/minsukc/MRI2CT/splits/all_train_split.txt"
 EPOCHS=1000
 ITERS_PER_EPOCH=500  # BS=4 (V2 model OOMs at 8); doubled from 250 to keep samples/epoch
 NUM_WORKERS=4
-RESUME_ID="0spre924" # set to wandb id to resume
+RESUME_ID="amd1l9g1" # set to wandb id to resume
 
 # --- Self-Submission Logic ---
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -48,7 +48,7 @@ cd /home/minsukc/MRI2CT
 
 SCRIPT="src/seg_baby_unet/train.py"
 
-CMD="python $SCRIPT --split_file $SPLIT_FILE --n_epochs $EPOCHS --iters_per_epoch $ITERS_PER_EPOCH --num_workers $NUM_WORKERS"
+CMD="python $SCRIPT --split_file $SPLIT_FILE --n_epochs $EPOCHS --iters_per_epoch $ITERS_PER_EPOCH --num_workers $NUM_WORKERS --hist_interval 100"
 if [ ! -z "$RESUME_ID" ]; then
     CMD="$CMD --resume_id $RESUME_ID"
 fi

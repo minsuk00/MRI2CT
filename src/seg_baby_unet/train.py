@@ -112,6 +112,7 @@ SEG_CONFIG = {
     "iters_per_epoch": 500,  # doubled to keep samples/epoch constant after halving batch_size
     "val_interval": 20,
     "model_save_interval": 1,
+    "hist_save_interval": 200,  # numbered snapshot every N epochs (all_train uses 100 via CLI)
     ##### Model
     "anatomix_weights_path": "scratch",
     "finetune": True,
@@ -761,7 +762,7 @@ class SegTrainer:
         tqdm.write(f"[SAVE] 💾 Last Checkpoint updated: {last_path}")
 
         # Save historical numbered checkpoint every 200 epochs
-        if (epoch + 1) % 200 == 0:
+        if (epoch + 1) % self.cfg.get("hist_save_interval", 200) == 0:
             hist_path = os.path.join(save_dir, f"seg_baby_unet_epoch_{epoch + 1}.pth")
             torch.save(state_dict, hist_path)
             tqdm.write(f"[SAVE] 💾 Historical Checkpoint saved: {hist_path}")
@@ -777,12 +778,14 @@ if __name__ == "__main__":
     parser.add_argument("--val_interval", type=int, default=SEG_CONFIG["val_interval"])
     parser.add_argument("--resume_id", type=str, default=None)
     parser.add_argument("--split_file", type=str, default=None)
+    parser.add_argument("--hist_interval", type=int, default=SEG_CONFIG["hist_save_interval"])
     args = parser.parse_args()
 
     SEG_CONFIG["n_epochs"] = args.n_epochs
     SEG_CONFIG["iters_per_epoch"] = args.iters_per_epoch
     SEG_CONFIG["num_workers"] = args.num_workers
     SEG_CONFIG["val_interval"] = args.val_interval
+    SEG_CONFIG["hist_save_interval"] = args.hist_interval
     if args.resume_id:
         SEG_CONFIG["resume_wandb_id"] = args.resume_id
     if args.split_file:
