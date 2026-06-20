@@ -156,7 +156,7 @@ save(fig, "bf7_loss_imbalance.png")
 
 # F8 — ceiling vs regression-to-mean (pooled pred-bone HU dist via bone marginal of 05 npz)
 fig, ax = plt.subplots(figsize=(8, 4.2))
-bh = np.load(os.path.join(RUN, "bone_hist.npz"))  # from 05 extract: GT x pred over bone
+bh = np.load(os.path.join(RUN, "cads_bone_calib.npz"))  # GT x pred over CADS-bone voxels
 H, PRE = bh["hist"], bh["pred_edges"]
 GTE = bh["gt_edges"]
 prc = (PRE[:-1] + PRE[1:]) / 2
@@ -250,8 +250,8 @@ fig.suptitle("Air carries the most error not because it is hard, but because it 
              "Bone is worst per-voxel (241 HU) but rare (5%). All voxels are INSIDE the body (lung/gas/sinus), not background.", y=1.08, fontsize=10)
 save(fig, "q1_air_paradox.png")
 
-# q2 — regression-to-mean calibration (true bone HU -> mean predicted HU)
-z = np.load(os.path.join(RUN, "bone_hist.npz"))
+# q2 — regression-to-mean calibration (true bone HU -> mean predicted HU), CADS bone
+z = np.load(os.path.join(RUN, "cads_bone_calib.npz"))
 H, GTE, PRE = z["hist"], z["gt_edges"], z["pred_edges"]
 gtc = (GTE[:-1] + GTE[1:]) / 2
 prc = (PRE[:-1] + PRE[1:]) / 2

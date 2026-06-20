@@ -36,11 +36,16 @@ def work(s):
         body = canon(f"{DATA}/{s}/mask.nii") > 0
     except Exception:
         return None
-    gtb, mrb = gt[body], mr[body]
+    try:
+        seg = canon(f"{DATA}/{s}/cads_grouped_35_labels_seg.nii.gz", np.int16)
+    except Exception:
+        return None
+    gtb, mrb, segb = gt[body], mr[body], seg[body]
+    bone_b = np.isin(segb, [7, 27, 28, 29, 30])       # CADS bone labels
     rk = (rankdata(mrb) - 1) / max(len(mrb) - 1, 1)   # MR percentile-rank within this subject's body
     out = {}
     for nm, msk in [("air", gtb < -300), ("soft", (gtb >= -300) & (gtb <= 200)),
-                    ("bone", gtb > 200), ("cort", gtb > 1024)]:
+                    ("bone", bone_b), ("cort", bone_b & (gtb > 1024))]:
         if msk.sum() < 50:
             out[nm] = None
             continue

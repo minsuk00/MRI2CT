@@ -150,13 +150,20 @@ def main():
     ps05 = pd.read_csv(os.path.join(RUN, "per_subject.csv"))  # 05 extraction has air/soft tissue cols
     tv, te = ps05.n_body.sum(), ps05.total_aerr_sum_clip.sum()
     tissue = {}
-    for t in ["air", "soft", "bone"]:
+    for t in ["air", "soft"]:   # air/soft are HU reference classes
         tissue[t] = {
             "vox_pct": float(100 * ps05[f"n_{t}"].sum() / tv),
             "pv_mae": float(ps05[f"mae_{t}_clip"].mean()),
             "bias": float(ps05[f"bias_{t}_clip"].mean()),
             "err_share_pct": float(100 * ps05[f"aerr_sum_{t}_clip"].sum() / te),
         }
+    # BONE row = CADS bone labels (clipped frame), NOT an HU threshold
+    tissue["bone"] = {
+        "vox_pct": float(100 * b.n_bone.sum() / b.n_body.sum()),
+        "pv_mae": float(b.mae_bone.mean()),
+        "bias": float(b.bias_bone_clip.mean()),
+        "err_share_pct": float("nan"),   # CADS bone overlaps soft-HU, so not part of the HU tiling
+    }
     region_air = {r: {"air_pct": float(100 * ps05[ps05.region == r].n_air.sum() / ps05[ps05.region == r].n_body.sum()),
                       "air_pv_mae": float(ps05[ps05.region == r].mae_air_clip.mean())} for r in REG}
 

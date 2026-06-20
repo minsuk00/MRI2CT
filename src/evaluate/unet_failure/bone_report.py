@@ -123,12 +123,14 @@ undershoots, and why only bone · 6. Does MR contain bone information? · 7. Sup
 HU), the raw ground-truth CT (<code>ct.nii</code>, full HU to ~2900), the 35-label CADS segmentation, and the body
 mask (<code>mask.nii</code>). <b>All metrics are computed only over voxels inside the body mask</b> (the black
 background outside the patient is excluded entirely).</p>
-<h3>Tissue classes (by ground-truth HU, inside the body)</h3>
-<ul>
-<li><b>air</b>: HU &lt; −300 → lung, bowel gas, sinuses, trachea (gas <i>inside</i> the patient)</li>
-<li><b>soft</b>: −300…+200 → muscle, fat, organs, fluid</li>
-<li><b>bone</b>: &gt; +200 → all skeleton; with <b>cortical</b> = &gt; +1024 (dense) and <b>mid/trabecular</b> = 200…1024</li>
-</ul>
+<h3>How bone is defined (CADS labels, not an HU cutoff)</h3>
+<p><b>Bone = the CADS bone-label segmentation</b>: the union of <b>skull (7), other-bone (27),
+limb &amp; girdle (28), spine (29), thoracic cage (30)</b>. This is the anatomical bone segmentation, not an HU
+threshold, so it includes low-density marrow and partial-volume edges. <b>Cortical</b> = the &gt;1024 HU subset
+<i>within</i> these CADS bone labels (CADS has no cortical-vs-trabecular label, so HU is used only for that one
+density sub-split). All metrics are over body-mask voxels; the background outside the patient is excluded.</p>
+<p>For the metric-decomposition oracle only, two reference tissue classes are taken by GT HU: <b>air</b> (HU &lt; −300:
+lung/gas/sinus) and <b>soft</b> (−300…+200: muscle/fat/organs).</p>
 <h3>The metrics, and exactly what each means</h3>
 <ul>
 <li><b>HU (Hounsfield Unit)</b> = the CT intensity scale (air ≈ −1000, water = 0, cortical bone +1000…+3000). It is a

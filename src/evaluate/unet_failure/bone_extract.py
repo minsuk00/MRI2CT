@@ -28,7 +28,11 @@ VOL_ROOT = os.path.join(EVAL, "volumes/unet")
 PER_SUBJECT_CSV = os.path.join(EVAL, "metrics/per_subject.csv")
 OUT = os.path.join(REPO, "evaluation_results/unet_failure_20260619")
 SKULL_LABEL = 7
-SOFT_HI, BONE_HI, CAP = 200.0, 200.0, 1024.0
+# Bone is the CADS bone-label segmentation (skull, other-bone, limb&girdle, spine, thoracic cage),
+# NOT an HU threshold. cortical = the >1024 HU subset WITHIN these labels (CADS has no
+# cortical-vs-trabecular label, so HU is used only for that sub-split).
+BONE_LABELS = np.array([7, 27, 28, 29, 30], dtype=np.int16)
+SOFT_HI, CAP = 200.0, 1024.0
 AIR_HI = -300.0
 RNG = np.random.RandomState(0)
 SUBSAMPLE = 200_000  # per-subject cap for Spearman / MR-CT hist
@@ -38,6 +42,9 @@ MR_BINS = 50
 HU_BINS = 120
 MR_EDGES = np.linspace(0.0, 1.0, MR_BINS + 1)
 HU_EDGES = np.linspace(-1024.0, 2600.0, HU_BINS + 1)
+# GT x pred calibration histogram over CADS-bone voxels (for the regression-to-mean figure)
+CAL_GT_EDGES = np.linspace(-200.0, 3000.0, 257)
+CAL_PR_EDGES = np.linspace(-1024.0, 1200.0, 257)
 
 
 def get_region_key(subj_id):
@@ -80,14 +87,14 @@ def process(subj):
         mr = canon(os.path.join(sdir, "moved_mr.nii"))
         pred = canon(os.path.join(VOL_ROOT, subj, "sample.nii.gz"))
     except Exception as e:
-        return None, None, None, f"{subj}: load {e}"
+        return None, None, None, None, f"{subj}: load {e}"
     if not (gt.shape == seg.shape == body.shape == mr.shape == pred.shape):
-        return None, None, None, f"{subj}: shape mismatch"
+        return None, None, None, None, f"{subj}: shape mismatch"
 
     air = gt < AIR_HI
     soft = (gt >= AIR_HI) & (gt <= SOFT_HI)
-    bone = gt > BONE_HI
-    cort = gt > CAP
+    bone = np.isin(seg, BONE_LABELS)          # CADS bone labels (anatomical bone)
+    cort = bone & (gt > CAP)                   # cortical = >1024 HU within CADS bone
     skull = seg == SKULL_LABEL
 
     # ---- comparative oracle (fix one tissue at a time) ----
@@ -103,11 +110,11 @@ def process(subj):
         row[f"{nm}_bmae"], row[f"{nm}_psnr"] = mae, psnr
         row[f"{nm}_smae"] = smae(pf, gt, body)
 
-    gtb, pb, mrb = gt[body], pred[body], mr[body]
+    gtb, pb, mrb, segb = gt[body], pred[body], mr[body], seg[body]
     err = pb - gtb
     aerr = np.abs(err)
-    bone_b = gtb > BONE_HI
-    cort_b = gtb > CAP
+    bone_b = np.isin(segb, BONE_LABELS)       # CADS bone within body
+    cort_b = bone_b & (gtb > CAP)             # cortical subset (>1024 HU) within CADS bone
     soft_b = (gtb >= AIR_HI) & (gtb <= SOFT_HI)
 
     # ---- universality of undershoot ----
@@ -129,8 +136,10 @@ def process(subj):
     })
 
     # ---- localization vs magnitude (on full grid) ----
-    pred_bone_full = body & (pred > BONE_HI)
-    gt_bone_full = body & (gt > BONE_HI)
+    # pred has no labels, so "model's bone" = where it predicts bone-density HU (>200);
+    # ground-truth bone = CADS bone labels.
+    pred_bone_full = body & (pred > SOFT_HI)
+    gt_bone_full = bone
     inter = (pred_bone_full & gt_bone_full).sum()
     row["shape_dice"] = float(2 * inter / max(pred_bone_full.sum() + gt_bone_full.sum(), 1))
     row["missed_frac"] = float((gt_bone_full & ~pred_bone_full).sum() / max(gt_bone_full.sum(), 1))
@@ -166,7 +175,12 @@ def process(subj):
         return h
     h_bone = hist2d(bone_b)
     h_soft = hist2d(soft_b)
-    return row, h_bone, h_soft, None
+    # GT x pred calibration over CADS-bone voxels (regression-to-mean figure)
+    if bone_b.any():
+        h_cal, _, _ = np.histogram2d(gtb[bone_b], pb[bone_b], bins=[CAL_GT_EDGES, CAL_PR_EDGES])
+    else:
+        h_cal = np.zeros((len(CAL_GT_EDGES) - 1, len(CAL_PR_EDGES) - 1))
+    return row, h_bone, h_soft, h_cal, None
 
 
 def main():
@@ -186,14 +200,16 @@ def main():
     rows, errs = [], []
     hb = np.zeros((MR_BINS, HU_BINS))
     hs = np.zeros((MR_BINS, HU_BINS))
+    hcal = np.zeros((len(CAL_GT_EDGES) - 1, len(CAL_PR_EDGES) - 1))
     with Pool(args.workers) as pool:
-        for i, (row, h_bone, h_soft, err) in enumerate(pool.imap_unordered(process, subs)):
+        for i, (row, h_bone, h_soft, h_cal, err) in enumerate(pool.imap_unordered(process, subs)):
             if err:
                 errs.append(err)
                 continue
             rows.append(row)
             hb += h_bone
             hs += h_soft
+            hcal += h_cal
             if (i + 1) % 25 == 0:
                 print(f"  {i+1}/{len(subs)} done", flush=True)
 
@@ -201,6 +217,8 @@ def main():
     out.to_csv(os.path.join(args.out, "bone_subject.csv"), index=False)
     np.savez(os.path.join(args.out, "mrct_hist.npz"), bone=hb, soft=hs,
              mr_edges=MR_EDGES, hu_edges=HU_EDGES)
+    np.savez(os.path.join(args.out, "cads_bone_calib.npz"), hist=hcal,
+             gt_edges=CAL_GT_EDGES, pred_edges=CAL_PR_EDGES)
     print(f"[bone_extract] wrote bone_subject.csv ({len(out)} rows), mrct_hist.npz", flush=True)
     if errs:
         print(f"[bone_extract] {len(errs)} errors:", *errs[:10], sep="\n  ")
