@@ -65,3 +65,6 @@ slurm_logs/
 
 # GPFS data symlinks (external paired MR-CT datasets)
 /dataset_external
+
+# GPFS symlink: external-dataset sCT inference (CFB-GBM / Gold Atlas / Learn2Reg)
+/external_inference
