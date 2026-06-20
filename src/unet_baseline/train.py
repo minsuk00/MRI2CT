@@ -522,6 +522,7 @@ if __name__ == "__main__":
     parser.add_argument("--perceptual_layers", type=str, help="Comma-separated decoder layer indices (default: 38,45,52,65)")
     parser.add_argument("--perceptual_metric", type=str, choices=["l1", "ncc"], help="Perceptual feature distance: 'l1' (default) or 'ncc'")
     parser.add_argument("--perceptual_separable", type=str, choices=["True", "False"], help="LNCC box-sum via separable 1-D convs (default True, exact & faster); False = dense conv")
+    parser.add_argument("--perceptual_fused", type=str, choices=["True", "False"], help="Use the fused_lncc CUDA kernel for the ncc metric (default False; drop-in for the Python box-conv)")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -580,6 +581,8 @@ if __name__ == "__main__":
         BASELINE_CONFIG["perceptual_metric"] = args.perceptual_metric
     if args.perceptual_separable is not None:
         BASELINE_CONFIG["perceptual_separable"] = args.perceptual_separable == "True"
+    if args.perceptual_fused is not None:
+        BASELINE_CONFIG["perceptual_fused"] = args.perceptual_fused == "True"
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

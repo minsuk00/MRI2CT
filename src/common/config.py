@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
     "perceptual_layers": None,  # comma-separated decoder layer indices; None -> [38,45,52,65]
     "perceptual_metric": "ncc",  # "ncc" (normalized cross-correlation, default) or "l1"
     "perceptual_separable": True,  # LNCC box-sum via separable 1-D convs (exact, ~3.5x faster); False = dense
+    "perceptual_fused": False,  # use the fused_lncc CUDA kernel for the ncc metric (drop-in for the Python box-conv)
     "wandb_tags": [],
     "wandb_note": "test_run",
     "resume_wandb_id": None,

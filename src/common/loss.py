@@ -70,7 +70,7 @@ class AnatomixPerceptualLoss(nn.Module):
     CKPT = "/home/minsukc/MRI2CT/anatomix/model-weights/best_val_net_G_BN_v1_4.pth"
     DEFAULT_LAYERS = [38, 45, 52, 65]
 
-    def __init__(self, layers=None, device="cuda", metric="ncc", separable=True, compile_lncc=False):
+    def __init__(self, layers=None, device="cuda", metric="ncc", separable=True, compile_lncc=False, fused=False):
         super().__init__()
         from anatomix.model.network import Unet
 
@@ -90,7 +90,13 @@ class AnatomixPerceptualLoss(nn.Module):
         # torch.compile (convs stay on cuDNN); numerically equivalent up to fp reordering (~1e-7).
         self.separable = separable
         self._lncc = torch.compile(self._ncc_loss) if compile_lncc else self._ncc_loss
-        print(f"[DEBUG] AnatomixPerceptualLoss (v1_4) metric={self.metric} layers {self.layers} separable={self.separable} compiled={compile_lncc}")
+        # fused: use the fused_lncc CUDA kernel for the ncc metric instead of the Python box-conv.
+        # Drop-in (same squared-LNCC, kernel_size=7, smooth 1e-5); overrides separable/compile.
+        self.fused = fused and self.metric == "ncc"
+        if self.fused:
+            from fused_lncc import fused_lncc_loss
+            self._fused_lncc = fused_lncc_loss
+        print(f"[DEBUG] AnatomixPerceptualLoss (v1_4) metric={self.metric} layers {self.layers} separable={self.separable} compiled={compile_lncc} fused={self.fused}")
 
     @staticmethod
     def _ncc_loss(pred, target, *, kernel_size=7, eps=1e-5, separable=True):
@@ -145,19 +151,20 @@ class AnatomixPerceptualLoss(nn.Module):
                 # because the grouped 3-D conv is memory-bound.
                 axis_kernels, axis_pads = [], []
                 for a in range(ndim):
-                    ksz = [1] * ndim
-                    ksz[a] = kernel_size
-                    axis_kernels.append(pred.new_ones(C, 1, *ksz))  # 1-D ones-kernel along axis a
+                    ksz = [1] * ndim  # [1, 1, 1]
+                    ksz[a] = kernel_size  # [7, 1, 1], then [1, 7, 1], then [1, 1, 7]
+                    axis_kernels.append(pred.new_ones(C, 1, *ksz))  # 1-D ones-kernel along axis a. same device/dtype as pred, shape (C,1,7,1,1) etc.
                     ap = [0] * ndim
                     ap[a] = pad
                     axis_pads.append(tuple(ap))
+                    # (C,1,7,1,1) + (C,1,1,7,1) + (C,1,1,1,7)
 
                 def box(x):
                     for k, ap in zip(axis_kernels, axis_pads):
                         x = conv(x, k, padding=ap, groups=C)  # group=C -> no cross-channel mixing
                     return x
             else:
-                kernel = pred.new_ones(C, 1, *([kernel_size] * ndim))  # per-channel box sum
+                kernel = pred.new_ones(C, 1, *([kernel_size] * ndim))  # per-channel box sum (C,1,7,7,7)
 
                 def box(x):
                     return conv(x, kernel, padding=pad, groups=C)  # group=C -> no cross-channel mixing
@@ -173,7 +180,12 @@ class AnatomixPerceptualLoss(nn.Module):
             return 1.0 - ncc.mean()
 
     def _dist(self, p, t):
-        return self.dist(p, t) if self.metric == "l1" else self._lncc(p, t, separable=self.separable)
+        if self.metric == "l1":
+            return self.dist(p, t)
+        if self.fused:
+            # fp32 cast mirrors _ncc_loss's autocast-disabled fp32 guard (and the kernel rejects fp16).
+            return self._fused_lncc(p.float(), t.float(), kernel_size=7)
+        return self._lncc(p, t, separable=self.separable)
 
     def forward(self, pred, target):
         with torch.no_grad():

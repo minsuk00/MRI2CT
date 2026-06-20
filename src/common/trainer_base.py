@@ -799,12 +799,13 @@ class BaseTrainer:
                 layers = [int(x) for x in layers.split(",") if x.strip()]
             metric = getattr(self.cfg, "perceptual_metric", "ncc")
             separable = getattr(self.cfg, "perceptual_separable", True)
+            fused = getattr(self.cfg, "perceptual_fused", False)
             # Compile the LNCC kernel under the same condition we compile the extractor
             # ("model" mode); in "full" mode the whole step is already compiled.
             compile_lncc = getattr(self.cfg, "compile_mode", None) == "model"
             perceptual = AnatomixPerceptualLoss(
                 layers=layers, device=self.device, metric=metric,
-                separable=separable, compile_lncc=compile_lncc,
+                separable=separable, compile_lncc=compile_lncc, fused=fused,
             )
             # The perceptual extractor lives inside CompositeLoss, so the model-level compile in
             # _setup_models never reaches it. Compile it here in "model" mode (benchmark: ~6% faster,
