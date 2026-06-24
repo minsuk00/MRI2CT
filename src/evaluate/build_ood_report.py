@@ -351,6 +351,11 @@ here is <b>dataset shift</b> (different scanners, MR sequences, cohorts, FOV), <
 
 <h2>Models</h2>
 <ul>{model_list}</ul>
+<div class="note"><b>MC-IDDPM coverage note.</b> The diffusion model is fully evaluated on the
+brain cohort (4/4 subjects). On the larger pelvis/abdomen volumes its sliding-window
+diffusion sampling is &gt;10&nbsp;min per volume, so it is only partially run there (see the
+per-model volume counts above); the corresponding cells are marked &ldquo;n/a&rdquo; in the panels.
+This does not affect any conclusion &mdash; where measured, MC-IDDPM behaves like the plain U-Nets.</div>
 <p class="sub">center-wise split = trained on center A of each region, held-out centers for val/test;
 full-data = all centers; koalAI fold 0 = its center-wise (OOD) design. MR normalization: per-volume
 min&ndash;max within the body mask (matching the flat-masked training regime). All sCTs masked to the
