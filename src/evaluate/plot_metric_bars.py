@@ -17,9 +17,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-MODELS = ["amix", "unet", "maisi", "mcddpm", "cwdm", "koalAI"]
+MODELS = ["amix", "unet", "maisi", "mcddpm", "cwdm", "koalAI", "amix_bw4", "unet_bw4"]
 COLORS = {"amix": "#5aa9ff", "unet": "#37d399", "maisi": "#ffc857",
-          "mcddpm": "#c792ea", "cwdm": "#ff8a65", "koalAI": "#ff6b6b"}
+          "mcddpm": "#c792ea", "cwdm": "#ff8a65", "koalAI": "#ff6b6b",
+          "amix_bw4": "#2d6fb3", "unet_bw4": "#1f9e76"}
 REGIONS = ["abdomen", "brain", "head_neck", "pelvis", "thorax"]
 
 

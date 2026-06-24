@@ -27,7 +27,7 @@ KOALAI_DS_ID = {"abdomen": 960, "thorax": 962, "head_neck": 964, "brain": 966, "
 KOALAI_TRAINER = "nnUNetTrainer_nnsyn_loss_map__nnUNetResEncUNetLPlans__3d_fullres"
 
 # Models whose validate output is a flat per-subject tree.
-FLAT_MODELS = ["amix", "unet", "maisi"]
+FLAT_MODELS = ["amix", "unet", "maisi", "amix_bw4", "unet_bw4"]
 # Models whose validate output is sharded (raw/<model>/shard_*_of_*/<subj>/...).
 SHARDED_MODELS = ["mcddpm", "cwdm"]
 

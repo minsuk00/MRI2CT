@@ -244,6 +244,15 @@ def main():
     micro = {r["model"]: r for r in overall if r["agg"] == "micro"}
     macro = {r["model"]: r for r in overall if r["agg"] == "macro"}
 
+    # ---- optional per-eval-root metadata overrides ----
+    meta_path = os.path.join(args.eval_root, "report_meta.json")
+    meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
+    # An eval root with extra model columns (e.g. old + new side by side) can set
+    # "model_order" in report_meta.json to control row order across every table.
+    if meta.get("model_order"):
+        global MODEL_ORDER
+        MODEL_ORDER = meta["model_order"]
+
     # headline ranking by Track-A body MAE, MACRO (equal region weight — avoids the
     # larger regions dominating; regions differ a lot in size + OOD difficulty).
     def _rank(agg):
@@ -252,10 +261,6 @@ def main():
         return " &lt; ".join(f"<b>{m}</b> ({v:.0f}HU)" for v, m in r) if r else "(pending)"
     rank_str = _rank(macro)
     rank_str_micro = _rank(micro)
-
-    # ---- optional per-eval-root metadata overrides ----
-    meta_path = os.path.join(args.eval_root, "report_meta.json")
-    meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
 
     # ---- checkpoint table ----
     ck_rows = "".join(

@@ -43,7 +43,7 @@ from nnunetv2.analysis.image_metrics import ImageMetricsCompute  # noqa: E402
 DATA_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD/1.5mm_registered_flat_masked"
 TEACHER = "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth"
 KOALAI_NATIVE = "/home/minsukc/MRI2CT/evaluation_results/koalai_native/fold0"
-ALL_MODELS = ["amix", "unet", "maisi", "mcddpm", "cwdm", "koalAI"]
+ALL_MODELS = ["amix", "unet", "maisi", "mcddpm", "cwdm", "koalAI", "amix_bw4", "unet_bw4"]
 REGIONS = ["abdomen", "brain", "head_neck", "pelvis", "thorax"]
 
 

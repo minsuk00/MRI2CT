@@ -25,9 +25,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from src.common.data import get_region_key, get_split_subjects  # noqa: E402
 
 SYNTHRAD_ROOT = "/gpfs/accounts/jjparkcv_root/jjparkcv98/minsukc/MRI2CT/SynthRAD/1.5mm_registered_flat_masked"
-MODELS = ["amix", "unet", "maisi", "mcddpm", "cwdm", "koalAI"]
+MODELS = ["amix", "unet", "maisi", "mcddpm", "cwdm", "koalAI", "amix_bw4", "unet_bw4"]
 DISPLAY = {"amix": "Amix", "unet": "UNet", "maisi": "MAISI", "mcddpm": "MC-DDPM",
-           "cwdm": "cWDM", "koalAI": "KoalAI"}
+           "cwdm": "cWDM", "koalAI": "KoalAI",
+           "amix_bw4": "Amix·b.4", "unet_bw4": "UNet·b.4"}
 REGIONS = ["abdomen", "brain", "head_neck", "pelvis", "thorax"]
 HU_WINDOWS = {"brain": (-100, 100), "head_neck": (-100, 100),
               "abdomen": (-1024, 1024), "thorax": (-1024, 1024), "pelvis": (-1024, 1024)}
