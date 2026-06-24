@@ -39,7 +39,7 @@ DATASET_LABEL = {
 }
 DATASET_ORDER = ["cfb_gbm", "gold_atlas", "learn2reg"]
 # CT display window per region (lo, hi) HU
-CT_WIN = {"cfb_gbm": (-1000, 1500), "gold_atlas": (-1024, 1024), "learn2reg": (-1024, 1024)}
+CT_WIN = {"cfb_gbm": (-100, 100), "gold_atlas": (-1024, 1024), "learn2reg": (-1024, 1024)}
 
 
 def b64fig(fig):

@@ -212,6 +212,8 @@ def main():
     ap.add_argument("--models", nargs="+", default=list(MODELS))
     ap.add_argument("--mcddpm_subjects", type=int, default=2,
                     help="cap MC-IDDPM (slow) to the first N subjects per dataset")
+    ap.add_argument("--skip_existing", action="store_true",
+                    help="skip a (model, subject, seq) whose sct NIfTI already exists")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -251,13 +253,17 @@ def main():
                     if not os.path.exists(mr_path):
                         nib.save(nib.Nifti1Image(np.where(body > 0, mr, 0.0).astype(np.float32), aff), mr_path)
 
+                    sct_path = os.path.join(out_dir, f"sct_{mname}_{seq}.nii.gz")
+                    if args.skip_existing and os.path.exists(sct_path):
+                        print(f"  [{dataset}/{sid}/{seq}] skip (exists)")
+                        continue
+
                     x, orig = prep_tensor(mr, body, family, device)
                     pred = infer_for_family(family, bundle, cfg, x, voxel_sizes, device)
                     pred = unpad(pred.float(), orig)
                     pred_hu = to_hu(family, pred).cpu().numpy().squeeze()
                     pred_hu = np.where(body > 0, pred_hu, -1024.0)
 
-                    sct_path = os.path.join(out_dir, f"sct_{mname}_{seq}.nii.gz")
                     nib.save(nib.Nifti1Image(np.round(pred_hu).astype(np.int16), aff), sct_path)
 
                     row = dict(model=mname, label=label, family=family, split=split,
