@@ -80,7 +80,7 @@ def caption(m):
             f"SR-MAE {g('synthrad_mae','{:.0f}')} MS-SSIM {g('synthrad_ms_ssim','{:.3f}')}")
 
 
-def render(region, subj, eval_root, metrics, num_slices, out_dir):
+def render(region, subj, eval_root, metrics, num_slices, out_dir, suffix=""):
     vmin, vmax = HU_WINDOWS.get(region, (-1000, 1000))
     mri_p = sorted(glob(os.path.join(SYNTHRAD_ROOT, subj, "moved_mr*.nii*")))
     if not mri_p:
@@ -123,7 +123,7 @@ def render(region, subj, eval_root, metrics, num_slices, out_dir):
                 ax.set_title(ttl, fontsize=8)
     fig.suptitle(f"{region}  —  {subj}   |   CT window [{vmin}, {vmax}] HU", fontsize=13, y=0.965)
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, f"{region}.png")
+    out = os.path.join(out_dir, f"{region}{suffix}.png")
     fig.savefig(out, dpi=110, bbox_inches="tight"); plt.close(fig)
     print(f"[viz] wrote {out}")
     return out
@@ -137,6 +137,10 @@ def main():
     ap.add_argument("--num_slices", type=int, default=4)
     ap.add_argument("--subjects", nargs="*", default=None,
                     help="Explicit subject IDs (one per region) instead of median pick.")
+    ap.add_argument("--models", nargs="+", default=None,
+                    help="Subset/order of model columns (default: all). E.g. amix unet amix_bw4 unet_bw4.")
+    ap.add_argument("--out_suffix", default="",
+                    help="Suffix appended to each figure filename, e.g. _bonew -> abdomen_bonew.png.")
     args = ap.parse_args()
 
     subjects = get_split_subjects(args.split_file, args.split_name)
@@ -146,6 +150,8 @@ def main():
     # Restrict columns to models that actually have volumes in this eval root, so a
     # subset eval (e.g. just unet + koalAI) doesn't render blank model columns.
     global MODELS
+    if args.models:
+        MODELS = args.models
     MODELS = [m for m in MODELS
               if glob(os.path.join(args.eval_root, "volumes", m, "*", "sample.nii.gz"))]
 
@@ -156,7 +162,7 @@ def main():
     for region in REGIONS:
         subj = picks.get(region) or pick_subject(region, subjects, metrics)
         if subj:
-            render(region, subj, args.eval_root, metrics, args.num_slices, out_dir)
+            render(region, subj, args.eval_root, metrics, args.num_slices, out_dir, args.out_suffix)
 
 
 if __name__ == "__main__":

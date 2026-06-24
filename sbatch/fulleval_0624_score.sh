@@ -47,6 +47,10 @@ python src/evaluate/plot_metric_bars.py --eval_root "$EVAL"
 # 4b) Qualitative figures (1 representative subject per region x 8 models).
 python src/evaluate/visualize_full_eval.py --eval_root "$EVAL"
 
+# 4c) Focused old-vs-new panels: MRI | GT | amix/unet bw0.3 | amix/unet bw0.4.
+python src/evaluate/visualize_full_eval.py --eval_root "$EVAL" \
+    --models amix unet amix_bw4 unet_bw4 --out_suffix _bonew
+
 # 5) Self-contained HTML report (+ repo copy).
 python src/evaluate/build_eval_report.py --eval_root "$EVAL" \
     --repo_copy _html/full_eval_20260624.html

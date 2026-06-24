@@ -310,6 +310,17 @@ def main():
             figs += (f'<div class="fig"><img src="data:image/png;base64,{b64img(p)}"/>'
                      f'<div class="cap">{reg}: MRI · GT CT · all models (representative subject, median amix-PSNR).</div></div>')
 
+    # Optional focused old-vs-new qualitative panels (figures/<region>_bonew.png),
+    # rendered only for the amix/unet bw0.3-vs-bw0.4 columns. Appended in its own
+    # section when present (see fulleval_0624_score.sh --out_suffix _bonew).
+    figs_bonew = ""
+    for reg in REGIONS:
+        p = os.path.join(fdir, f"{reg}_bonew.png")
+        if os.path.exists(p):
+            figs_bonew += (f'<div class="fig"><img src="data:image/png;base64,{b64img(p)}"/>'
+                           f'<div class="cap">{reg}: MRI · GT CT · amix/unet bone-weight 0.3 (old) vs 0.4 (new), '
+                           f'same representative subject.</div></div>')
+
     # ---- error-bar figures (mean ± std over subjects) ----
     def embed(name, cap=""):
         p = os.path.join(fdir, name)
@@ -431,6 +442,12 @@ load excluded); cWDM = DDIM-100, MC-DDPM = 50-step DDIM over 3D slabs (both full
 
 <h2>Qualitative comparison</h2>
 {figs or '<p class="sub">(figures pending)</p>'}
+
+{('<h2>Bone-weight comparison — amix/unet 0.3 vs 0.4</h2>'
+  '<p class="sub">MRI · GT CT · amix (bw0.3) · unet (bw0.3) · amix·b.4 (bw0.4) · unet·b.4 (bw0.4), '
+  'same representative subject per region as above. Note the bw0.4 runs also use the '
+  'background-inclusive Dice loss, so old-vs-new differs by two coupled changes, not the weight alone.</p>'
+  + figs_bonew) if figs_bonew else ''}
 
 <h2>Training configuration — original (paper/code) vs ours</h2>
 {train_cfg or '<p class="sub">(training_config.html not found)</p>'}
