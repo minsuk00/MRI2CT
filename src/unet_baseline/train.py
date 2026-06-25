@@ -128,7 +128,7 @@ class BaselineTrainer(BaseTrainer):
 
     def _setup_data(self):
         load_seg = getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "validate_dice", False)
-        cache_dir = default_monai_cache_dir()
+        cache_dir = default_monai_cache_dir(ct_range=tuple(getattr(self.cfg, "ct_range", (-1024, 1024))))
         os.makedirs(cache_dir, exist_ok=True)
         print(f"[Baseline] 💾 MONAI cache dir: {cache_dir}")
 
@@ -137,6 +137,7 @@ class BaselineTrainer(BaseTrainer):
             res_mult=self.cfg.res_mult,
             enforce_ras=getattr(self.cfg, "enforce_ras", False),
             mri_norm=getattr(self.cfg, "mri_norm", "minmax"),
+            ct_range=tuple(getattr(self.cfg, "ct_range", (-1024, 1024))),
             load_seg=load_seg,
             use_float16_storage=getattr(self.cfg, "use_float16_storage", False),
         )
@@ -165,6 +166,7 @@ class BaselineTrainer(BaseTrainer):
         self.gpu_transforms = get_gpu_transforms(
             augment=self.cfg.augment,
             has_seg=load_seg,
+            renorm_ct=getattr(self.cfg, "aug_renorm_ct", False),
         )
 
         # Val: same cached transforms, no augmentation (sliding-window inference on full volumes).
@@ -183,7 +185,7 @@ class BaselineTrainer(BaseTrainer):
             num_downs=self.cfg.num_downs,
             ngf=self.cfg.ngf,
             norm=getattr(self.cfg, "norm", "batch"),
-            final_act="sigmoid",
+            final_act=getattr(self.cfg, "final_activation", "sigmoid"),
         ).to(self.device)
 
         # 1. Model-level compile (only if specifically requested)
@@ -219,7 +221,7 @@ class BaselineTrainer(BaseTrainer):
             # Dice Loss Calculation
             pred_probs = None
             if (getattr(self.cfg, "dice_w", 0) > 0 or getattr(self.cfg, "dice_bone_w", 0) > 0) and self.teacher_model is not None and seg is not None:
-                pred_probs = self.teacher_model(pred)
+                pred_probs = self.teacher_model(self._pred_for_teacher(pred))
 
             loss, comps = self.loss_fn(pred, ct, pred_probs=pred_probs, target_mask=seg)
             loss = loss / self.cfg.accum_steps
@@ -369,12 +371,13 @@ class BaselineTrainer(BaseTrainer):
 
             mask_unpad = self._get_body_mask_unpad(batch, orig_shape)
 
-            met, body_met = self._compute_val_metrics(pred_unpad, ct_unpad, mask_unpad)
+            _ct_lo, _ct_hi = getattr(self.cfg, "ct_range", (-1024, 1024))
+            met, body_met = self._compute_val_metrics(pred_unpad, ct_unpad, mask_unpad, hu_range=_ct_hi - _ct_lo)
 
             # Validation Dice & Probabilities
             pred_probs = None
             if getattr(self.cfg, "validate_dice", False) and self.teacher_model is not None and seg is not None:
-                pred_probs = self._run_teacher_sw(pred, val_ps)
+                pred_probs = self._run_teacher_sw(self._pred_for_teacher(pred), val_ps)
 
             # Total Composite Loss for Validation
             # Cast ct (fp16 from cached storage) to fp32 to match pred:
@@ -509,6 +512,10 @@ if __name__ == "__main__":
     parser.add_argument("--steps_per_epoch", type=int, help="Number of steps per epoch")
     parser.add_argument("--num_workers", type=int, help="Number of workers for the data queue")
     parser.add_argument("--norm", type=str, choices=["batch", "instance", "none"], help="Normalization type for U-Net (batch, instance, or none)")
+    parser.add_argument("--final_activation", type=str, choices=["sigmoid", "none", "tanh"], help="Final activation of the U-Net output (default sigmoid; 'none' = linear)")
+    parser.add_argument("--aug_renorm_ct", type=str, choices=["True", "False"], help="Legacy CT aug: include CT in the per-patch ScaleIntensity renorm (default False; True = pre-fix behavior, for reference runs)")
+    parser.add_argument("--ct_range_lo", type=float, help="Lower HU clip for the CT target/prediction (default -1024)")
+    parser.add_argument("--ct_range_hi", type=float, help="Upper HU clip for the CT target/prediction (default 1024)")
     parser.add_argument("--tags", type=str, help="Comma-separated extra WandB tags (e.g. 'thorax,high bone dice')")
     parser.add_argument("--dice_bone_w", type=float, help="Bone-specific dice loss weight")
     parser.add_argument("--ssim_w", type=float, help="SSIM loss weight (0=off)")
@@ -542,6 +549,17 @@ if __name__ == "__main__":
         BASELINE_CONFIG["dice_w"] = args.dice_w
     if args.dice_bone_w is not None:
         BASELINE_CONFIG["dice_bone_w"] = args.dice_bone_w
+    if args.final_activation is not None:
+        BASELINE_CONFIG["final_activation"] = args.final_activation
+    if args.aug_renorm_ct is not None:
+        BASELINE_CONFIG["aug_renorm_ct"] = args.aug_renorm_ct == "True"
+    if args.ct_range_lo is not None or args.ct_range_hi is not None:
+        _lo, _hi = BASELINE_CONFIG.get("ct_range", DEFAULT_CONFIG["ct_range"])
+        if args.ct_range_lo is not None:
+            _lo = args.ct_range_lo
+        if args.ct_range_hi is not None:
+            _hi = args.ct_range_hi
+        BASELINE_CONFIG["ct_range"] = (_lo, _hi)
     if args.ssim_w is not None:
         BASELINE_CONFIG["ssim_w"] = args.ssim_w
     if args.resume_id is not None:

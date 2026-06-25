@@ -396,6 +396,7 @@ def get_gpu_transforms(
     contrast_gamma_range: tuple = (0.5, 2.0),
     randconv_prob: float = 0.5,
     randconv_kernel_sizes: tuple = (1, 3, 5),
+    renorm_ct: bool = False,
 ):
     """Random GPU-side augmentation pipeline using `batchaug` (batched, fused).
 
@@ -462,7 +463,14 @@ def get_gpu_transforms(
             kernel_sizes=randconv_kernel_sizes,
             mixing=True,
         ),
-        B.ScaleIntensityd(keys=["mri", "ct"]),
+        # Renorm MRI to [0,1] after its intensity augs (bias field, noise, contrast,
+        # RandConv, ...) push it out of range. CT is NOT renormed by default: it only
+        # gets the geometric augs (flip/rotate/affine/elastic), which keep it in [0,1],
+        # so a per-patch min-max here would instead distort the fixed HU->[0,1] target
+        # (stretch a no-dense-bone abdomen/pelvis patch up to 1, or cancel a widened
+        # -1024..3500 range entirely). `renorm_ct=True` restores the legacy behavior
+        # (CT included in the per-patch renorm) for reference/ablation runs only.
+        B.ScaleIntensityd(keys=["mri", "ct"] if renorm_ct else ["mri"]),
     ]
 
     return B.Compose(transforms=transforms, lazy=True, mode=mode_dict)
@@ -580,12 +588,19 @@ def gpu_augment_batch(batch, gpu_transforms, device):
     return out
 
 
-def default_monai_cache_dir() -> str:
-    """Local NVMe cache dir shared across all trainers.
+def default_monai_cache_dir(ct_range=None) -> str:
+    """Local NVMe cache dir for PersistentDataset.
 
-    Different trainers (different mri_norm/ct_range/res_mult) produce different
-    transform-spec hashes, so PersistentDataset writes them to separate files
-    in this single dir without collision.
+    The training PersistentDatasets use hash_transform=None, so the cache key is
+    only the data dict (file paths) and does NOT include transform params like
+    ct_range. A non-default ct_range therefore gets its OWN cache dir, so a
+    widened-range run (e.g. -1024..3500) can't silently reuse the default
+    -1024..1024 cached CT targets. Default (None / (-1024,1024)) keeps the
+    original shared path so existing caches stay valid.
     """
     user_id = os.environ.get("USER", "default")
-    return os.path.join("/tmp", f"mri2ct_{user_id}_monai_cache")
+    base = os.path.join("/tmp", f"mri2ct_{user_id}_monai_cache")
+    if ct_range is not None and tuple(ct_range) != (-1024, 1024):
+        lo, hi = ct_range
+        base = f"{base}_ct{int(lo)}_{int(hi)}"
+    return base

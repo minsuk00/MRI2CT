@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "use_float16_storage": True,  # Halves PersistentDataset cache size (~104GB->55GB) and warmup time. mri/ct in [0,1] don't need fp32.
     "enforce_ras": True,
     "mri_norm": "minmax",  # "minmax" or "percentile" (0.0–99.5, same as MAISI)
+    "ct_range": (-1024, 1024),  # HU clip range mapped to [0,1] for the CT target / prediction
     # Training
     "lr": 3e-4,
     "scheduler_type": "cosine",  # "plateau", "cosine", None

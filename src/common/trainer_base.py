@@ -657,6 +657,16 @@ class BaseTrainer:
             out[f"dice_score_{class_slug(i, names[i])}"] = class_dices[i].item()
         return out
 
+    def _pred_for_teacher(self, pred):
+        """Rescale a prediction from cfg.ct_range [0,1] to the teacher's native
+        (-1024, 1024) -> [0,1] convention (clipping), so the frozen teacher (trained
+        on that range) segments it correctly. No-op when ct_range == (-1024, 1024)."""
+        lo, hi = getattr(self.cfg, "ct_range", (-1024, 1024))
+        if (lo, hi) == (-1024, 1024):
+            return pred
+        pred_hu = pred * (hi - lo) + lo
+        return ((pred_hu + 1024.0) / 2048.0).clamp(0.0, 1.0)
+
     def _run_teacher_sw(self, inputs, val_ps):
         """Run sliding-window inference with self.teacher_model under bf16 autocast."""
         from monai.inferers import sliding_window_inference
@@ -768,7 +778,8 @@ class BaseTrainer:
 
         pred_np = pred_unpad.float().cpu().numpy().squeeze()
         if not already_hu:
-            pred_np = (pred_np * 2048.0) - 1024.0
+            lo, hi = getattr(self.cfg, "ct_range", (-1024, 1024))
+            pred_np = pred_np * (hi - lo) + lo
 
         # Pulled from the cached pipeline as a plain tensor under "ct_affine"
         # (PersistentDataset's weights_only=True save strips MetaTensor.affine).
