@@ -27,7 +27,7 @@ from common.data import (
 )
 from common.utils import apply_synchronized_cutout, clean_state_dict, get_ram_info, log_model_summary, set_seed, unpad
 
-VIZ_METRIC_KEYS = ("ssim", "psnr", "mae_hu", "dice_score_all", "dice_score_bone")
+VIZ_METRIC_KEYS = ("ssim", "psnr", "mae_hu", "dice_score_all")
 
 
 class StepTimer:
@@ -593,7 +593,7 @@ class BaseTrainer:
     def _save_val_ranking(self, subject_ids, val_metrics):
         """Write per-subject val metrics sorted by MAE (best→worst). Overwrites each val run."""
         mae_vals = val_metrics["mae_hu"]
-        extra_keys = [k for k in ("ssim", "psnr", "dice_score_all", "dice_score_bone") if k in val_metrics]
+        extra_keys = [k for k in ("ssim", "psnr", "dice_score_all") if k in val_metrics]
         rows = sorted(zip(subject_ids, mae_vals, *[val_metrics[k] for k in extra_keys]), key=lambda x: x[1])
 
         if self.local_run_dir:
@@ -637,23 +637,24 @@ class BaseTrainer:
         return viz_metrics, viz_body
 
     def _compute_dice_metrics(self, pred_probs, seg, orig_shape, mask_unpad=None, target_met=None):
-        """Compute dice_score_all / dice_score_bone from teacher pred_probs + seg.
+        """Compute dice_score_all + per-class dice_score_{idx}_{name} from teacher pred_probs + seg.
 
         If pred_probs/seg are pre-unpadded (passed already at orig_shape), pass orig_shape=None.
         Returns the updated `target_met` dict (or a fresh dict). When mask_unpad is given, dices
         are body-masked via get_class_dice's mask kwarg.
         """
+        from common.labels import CADS_35_CLASS_NAMES, class_slug
         from common.loss import get_class_dice
 
         if orig_shape is not None:
             pred_probs = unpad(pred_probs, orig_shape)
             seg = unpad(seg, orig_shape)
-        bone_idx = getattr(self.cfg, "dice_bone_idx", 5)
-        class_dices, bone_dice = get_class_dice(pred_probs, seg, mask=mask_unpad, bone_idx=bone_idx)
+        class_dices = get_class_dice(pred_probs, seg, mask=mask_unpad)
         out = target_met if target_met is not None else {}
         out["dice_score_all"] = class_dices.mean().item()
-        if bone_dice is not None:
-            out["dice_score_bone"] = bone_dice.item()
+        names = getattr(self.cfg, "class_names", None) or CADS_35_CLASS_NAMES
+        for i in range(1, min(class_dices.shape[0], len(names))):  # skip background (idx 0)
+            out[f"dice_score_{class_slug(i, names[i])}"] = class_dices[i].item()
         return out
 
     def _run_teacher_sw(self, inputs, val_ps):
@@ -678,11 +679,11 @@ class BaseTrainer:
         when cfg.dice_w==0 (preserving original behavior of swallowing the
         exception unless dice loss is required).
         """
-        from anatomix.segmentation.segmentation_utils import load_model_v1_2
+        from anatomix.segmentation.segmentation_utils import load_model_v2
 
         print(f"[{self.prefix}] 👨‍🏫 Initializing Baby U-Net Teacher...")
         try:
-            teacher = load_model_v1_2(
+            teacher = load_model_v2(
                 pretrained_ckpt=self.cfg.teacher_weights_path,
                 n_classes=self.cfg.n_classes - 1,
                 device=self.device,
@@ -721,7 +722,8 @@ class BaseTrainer:
         """
         from monai.data import DataLoader, PersistentDataset
 
-        val_dicts = build_data_dicts(self.cfg.root_dir, self.val_subjects, load_seg=load_seg)
+        val_dicts = build_data_dicts(self.cfg.root_dir, self.val_subjects, load_seg=load_seg,
+                                     seg_filename=getattr(self.cfg, "seg_filename", "cads_grouped_35_labels_seg.nii.gz"))
         kwargs = {"hash_transform": hash_transform} if hash_transform is not None else {}
         val_ds = PersistentDataset(data=val_dicts, transform=cached_xform, cache_dir=cache_dir, **kwargs)
         return DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
@@ -822,9 +824,10 @@ class BaseTrainer:
                 "perceptual": perceptual_w,
                 "dice_w": getattr(self.cfg, "dice_w", 0.0),
                 "dice_bone_w": getattr(self.cfg, "dice_bone_w", 0.0),
-                "dice_bone_idx": getattr(self.cfg, "dice_bone_idx", 5),
+                "dice_bone_indices": getattr(self.cfg, "dice_bone_indices", []),
             },
             perceptual=perceptual,
+            class_names=getattr(self.cfg, "class_names", None),
         ).to(self.device)
 
     @torch.inference_mode()

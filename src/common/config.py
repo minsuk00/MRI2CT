@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import torch
 
+from common.labels import BONE_CLASS_INDICES, CADS_35_CLASS_NAMES
+
 
 class Config(SimpleNamespace):
     def __init__(self, dictionary, **kwargs):
@@ -35,7 +37,7 @@ DEFAULT_CONFIG = {
     "data_queue_max_length": 100,
     "data_queue_num_workers": 4,
     "anatomix_weights": "v1_3",  # "v1", "v1_2", "v1_3"
-    "teacher_weights_path": "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth",
+    "teacher_weights_path": "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_cads_35_center_wise_di54npq3_epoch_1000.pth",
     "res_mult": 32,
     "analyze_shapes": True,
     "enable_profiling": False,
@@ -72,7 +74,9 @@ DEFAULT_CONFIG = {
     "final_activation": "sigmoid",
     "use_weighted_sampler": True,
     "pass_mri_to_translator": False,
-    "n_classes": 12,  # 11 Organs + Brain
+    "n_classes": 35,  # CADS 35-class grouping (incl. background); see common.labels.CADS_35_CLASS_NAMES
+    "class_names": CADS_35_CLASS_NAMES,  # per-class Dice logging keys (dice_score_{idx}_{name})
+    "seg_filename": "cads_grouped_35_labels_seg.nii.gz",  # GT seg label map for teacher Dice (must match teacher label space)
     # Sliding Window & Viz Options
     "val_patch_size": 256,
     "val_sw_batch_size": 2,
@@ -85,7 +89,9 @@ DEFAULT_CONFIG = {
     "ssim_w": 0.1,
     "dice_w": 0.0,
     "dice_bone_w": 0.0,
-    "dice_bone_idx": 5,
+    # Bone-family class indices in the CADS 35-class map: Skull, Bone-other,
+    # Limb & girdle bones, Spine, Thoracic cage. All get dice_bone_w (others get dice_w).
+    "dice_bone_indices": BONE_CLASS_INDICES,
     "perceptual_w": 0.0,  # Anatomix v1_4 perceptual loss weight (0 = off)
     "perceptual_layers": None,  # comma-separated decoder layer indices; None -> [38,45,52,65]
     "perceptual_metric": "ncc",  # "ncc" (normalized cross-correlation, default) or "l1"

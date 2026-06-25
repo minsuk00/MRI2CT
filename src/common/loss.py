@@ -3,15 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from fused_ssim import fused_ssim3d
 
+from common.labels import class_slug
 
-def get_class_dice(logits, target_mask, mask=None, bone_idx=5):
+
+def get_class_dice(logits, target_mask, mask=None):
     """
     Soft dice per class. Optionally restricted to body voxels.
     logits:      [B, C, X, Y, Z] raw logits from teacher
     target_mask: [B, 1, X, Y, Z] integer GT labels
     mask:        [1, 1, X, Y, Z] binary body mask (optional); when provided,
                  dice is computed only on body voxels (B=1 assumed)
-    Returns: class_dices [C], bone_dice scalar (or None if bone_idx out of range)
+    Returns: class_dices [C]
     """
     smooth = 1e-5
     # Cast to fp32 before softmax: fp16 probs.sum() over millions of voxels
@@ -41,8 +43,7 @@ def get_class_dice(logits, target_mask, mask=None, bone_idx=5):
         union = p.sum(dim=2) + t.sum(dim=2)
         class_dices = ((2.0 * intersection + smooth) / (union + smooth)).mean(dim=0)  # [C]
 
-    bone_dice = class_dices[bone_idx] if class_dices.shape[0] > bone_idx else None
-    return class_dices, bone_dice
+    return class_dices
 
 
 class AnatomixPerceptualLoss(nn.Module):
@@ -195,12 +196,14 @@ class AnatomixPerceptualLoss(nn.Module):
 
 
 class CompositeLoss(nn.Module):
-    def __init__(self, weights, perceptual=None):
+    def __init__(self, weights, perceptual=None, class_names=None):
         super().__init__()
         self.weights = weights
         self.l1 = nn.L1Loss()
         self.l2 = nn.MSELoss()
         self.perceptual = perceptual
+        # Names for per-class Dice logging (dice_score_{idx}_{name}); index == label value.
+        self.class_names = class_names
 
     def forward(self, pred, target, pred_probs=None, target_mask=None, compute_perceptual=True):
         """Returns (total_loss, loss_components).
@@ -244,27 +247,31 @@ class CompositeLoss(nn.Module):
 
         # 5. Dice Losses (Teacher-guided)
         if pred_probs is not None and target_mask is not None:
-            bone_idx = self.weights.get("dice_bone_idx", 5)
-            class_dices, bone_dice = get_class_dice(pred_probs, target_mask, bone_idx=bone_idx)
+            bone_idx = self.weights.get("dice_bone_indices", [])
+            class_dices = get_class_dice(pred_probs, target_mask)
             C = class_dices.shape[0]
 
             # Per-class weight vector over ALL classes (background included): every
-            # class defaults to dice_w; bone is REPLACED by dice_bone_w (not added).
-            # Dice is applied once as a mean over all classes, so when
+            # class defaults to dice_w; bone class(es) are REPLACED by dice_bone_w
+            # (not added). Dice is applied once as a mean over all classes, so when
             # dice_bone_w == dice_w this reduces exactly to dice_w * mean(1 - dice).
+            bone_idxs = [bone_idx] if isinstance(bone_idx, int) else list(bone_idx)
             w = torch.full((C,), self.weights.get("dice_w", 0.0), device=class_dices.device, dtype=class_dices.dtype)
-            if bone_idx < C:
-                w[bone_idx] = self.weights.get("dice_bone_w", 0.0)
+            for b in bone_idxs:
+                if b < C:
+                    w[b] = self.weights.get("dice_bone_w", 0.0)
 
             if torch.any(w > 0):
                 total_loss += (w * (1.0 - class_dices)).sum() / C
 
-            # Diagnostics (unweighted; logged to wandb, no gradient impact).
+            # Diagnostics (unweighted; logged to wandb, no gradient impact). The
+            # "score" keys are filtered out of the per-step train charts and surface
+            # under val/ and val_body/. Per-label Dice replaces the old bone scalar.
             gen_dice = class_dices.mean()
             loss_components["dice_score_all"] = gen_dice
             loss_components["loss_dice"] = 1.0 - gen_dice
-            if bone_dice is not None:
-                loss_components["dice_score_bone"] = bone_dice
-                loss_components["loss_dice_bone"] = 1.0 - bone_dice
+            if self.class_names is not None:
+                for i in range(1, min(C, len(self.class_names))):  # skip background (idx 0)
+                    loss_components[f"dice_score_{class_slug(i, self.class_names[i])}"] = class_dices[i]
 
         return total_loss, loss_components

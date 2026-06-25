@@ -102,7 +102,8 @@ class Trainer(BaseTrainer):
         )
 
         # Train: cached full volumes -> CPU random crop (workers) -> default collate (uniform patches) -> GPU aug.
-        train_dicts = build_data_dicts(self.cfg.root_dir, self.train_subjects, load_seg=load_seg)
+        train_dicts = build_data_dicts(self.cfg.root_dir, self.train_subjects, load_seg=load_seg,
+                                       seg_filename=getattr(self.cfg, "seg_filename", "cads_grouped_35_labels_seg.nii.gz"))
         base_train = PersistentDataset(data=train_dicts, transform=cached_xform, cache_dir=cache_dir)
         train_random_crop = get_random_crop(
             patch_size=self.cfg.patch_size,
@@ -603,7 +604,7 @@ class Trainer(BaseTrainer):
                 val_loss = avg_met.get("loss", 0)
 
                 tqdm.write(
-                    f"Ep {epoch} | Train: {loss:.4f} | Val: {val_loss:.4f} | SSIM: {avg_met.get('ssim', 0):.4f} | PSNR: {avg_met.get('psnr', 0):.2f} | Dice: {avg_met.get('dice_score_all', 0):.4f} | Bone: {avg_met.get('dice_score_bone', 0):.4f}"
+                    f"Ep {epoch} | Train: {loss:.4f} | Val: {val_loss:.4f} | SSIM: {avg_met.get('ssim', 0):.4f} | PSNR: {avg_met.get('psnr', 0):.2f} | Dice: {avg_met.get('dice_score_all', 0):.4f}"
                 )
 
             ep_duration = time.time() - ep_start

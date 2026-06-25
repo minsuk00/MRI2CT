@@ -142,7 +142,8 @@ class BaselineTrainer(BaseTrainer):
         )
 
         # Train: cached full volumes -> CPU random crop (workers) -> default collate (uniform patches) -> GPU aug.
-        train_dicts = build_data_dicts(self.cfg.root_dir, self.train_subjects, load_seg=load_seg)
+        train_dicts = build_data_dicts(self.cfg.root_dir, self.train_subjects, load_seg=load_seg,
+                                       seg_filename=getattr(self.cfg, "seg_filename", "cads_grouped_35_labels_seg.nii.gz"))
         base_train = PersistentDataset(data=train_dicts, transform=cached_xform, cache_dir=cache_dir)
         train_random_crop = get_random_crop(
             patch_size=self.cfg.patch_size,
@@ -445,7 +446,7 @@ class BaselineTrainer(BaseTrainer):
                 avg_met = self.validate(epoch)
                 val_duration = time.time() - val_start
                 print(
-                    f"Ep {epoch} | Train: {loss:.4f} | Val: {avg_met.get('loss', 0):.4f} | SSIM: {avg_met.get('ssim', 0):.4f} | PSNR: {avg_met.get('psnr', 0):.2f} | Dice: {avg_met.get('dice_score_all', 0):.4f} | Bone: {avg_met.get('dice_score_bone', 0):.4f}"
+                    f"Ep {epoch} | Train: {loss:.4f} | Val: {avg_met.get('loss', 0):.4f} | SSIM: {avg_met.get('ssim', 0):.4f} | PSNR: {avg_met.get('psnr', 0):.2f} | Dice: {avg_met.get('dice_score_all', 0):.4f}"
                 )
 
             ep_duration = time.time() - ep_start
@@ -523,6 +524,7 @@ if __name__ == "__main__":
     parser.add_argument("--perceptual_metric", type=str, choices=["l1", "ncc"], help="Perceptual feature distance: 'l1' (default) or 'ncc'")
     parser.add_argument("--perceptual_separable", type=str, choices=["True", "False"], help="LNCC box-sum via separable 1-D convs (default True, exact & faster); False = dense conv")
     parser.add_argument("--perceptual_fused", type=str, choices=["True", "False"], help="Use the fused_lncc CUDA kernel for the ncc metric (default False; drop-in for the Python box-conv)")
+    parser.add_argument("--override_lr", type=str, choices=["True", "False"], help="On resume, ignore saved LR/scheduler state and recompute the cosine curve from config 'lr' + new total_epochs (needed when extending a run whose cosine already decayed to 0)")
     args = parser.parse_args()
 
     # Convert wandb arg to boolean
@@ -583,6 +585,8 @@ if __name__ == "__main__":
         BASELINE_CONFIG["perceptual_separable"] = args.perceptual_separable == "True"
     if args.perceptual_fused is not None:
         BASELINE_CONFIG["perceptual_fused"] = args.perceptual_fused == "True"
+    if args.override_lr is not None:
+        BASELINE_CONFIG["override_lr"] = args.override_lr == "True"
 
     try:
         trainer = BaselineTrainer(BASELINE_CONFIG)

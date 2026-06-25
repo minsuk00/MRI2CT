@@ -115,11 +115,16 @@ def get_region_key(subj_id):
 # ============================================================================
 # Build per-subject dicts for MONAI Dataset / PersistentDataset
 # ============================================================================
-def build_data_dicts(root_dir, subjects, load_seg=False, load_body_mask=True):
+def build_data_dicts(root_dir, subjects, load_seg=False, load_body_mask=True,
+                     seg_filename="ct_seg.nii"):
     """Build [{mri, ct, [body_mask], [seg], subj_id}, ...] of file paths.
 
     Set `load_body_mask=False` for eval splits where masks may be absent
     (mask is required for training because of weighted sampling / val_body).
+
+    `seg_filename` selects the GT seg label map loaded for teacher Dice. Defaults
+    to the legacy 12-class `ct_seg.nii`; training passes the CADS 35-class file
+    explicitly via cfg.seg_filename. Both `.nii` and `.nii.gz` are tried.
     """
     items = []
     for s in subjects:
@@ -138,9 +143,10 @@ def build_data_dicts(root_dir, subjects, load_seg=False, load_body_mask=True):
             d["body_mask"] = paths["body_mask"]
 
         if load_seg:
-            seg_path = os.path.join(root_dir, s, "ct_seg.nii")
+            base = seg_filename[:-7] if seg_filename.endswith(".nii.gz") else os.path.splitext(seg_filename)[0]
+            seg_path = os.path.join(root_dir, s, f"{base}.nii")
             if not os.path.exists(seg_path):
-                seg_path_gz = os.path.join(root_dir, s, "ct_seg.nii.gz")
+                seg_path_gz = os.path.join(root_dir, s, f"{base}.nii.gz")
                 seg_path = seg_path_gz if os.path.exists(seg_path_gz) else None
             if seg_path is None:
                 print(f"  [WARNING] Segmentation missing for {s}. Skipping.")
