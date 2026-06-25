@@ -43,12 +43,13 @@ from common.data import (
     get_split_subjects,
 )
 from common.eval_utils import (
-    compute_dice,
+    default_teacher_specs,
     default_validate_dir,
+    dual_teacher_dice,
     extract_checkpoint_info,
     format_checkpoint_info,
-    load_teacher_model,
-    run_teacher_sw,
+    load_subject_segs,
+    load_teachers,
     write_metrics_txt,
 )
 from common.utils import clean_state_dict, compute_metrics, compute_metrics_body, unpad
@@ -58,7 +59,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 AUTOENCODER_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "autoencoder_v1.pt")
 DIFFUSION_PATH = os.path.join(PROJECT_ROOT, "ckpt", "nv-generate-ct", "models", "diff_unet_3d_rflow-ct.pt")
 NETWORK_CONFIG_PATH = os.path.join(PROJECT_ROOT, "baselines", "NV-Generate-CTMR", "configs", "config_network_rflow.json")
-DEFAULT_TEACHER = "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth"
 
 
 # ---------------------------------------------------------------------------
@@ -189,11 +189,11 @@ def main():
     parser.add_argument("--max_subjects", type=int, default=None,
                         help="Limit to first N subjects (smoke testing).")
     # Teacher / Dice
-    parser.add_argument("--teacher_weights_path", default=DEFAULT_TEACHER,
-                        help="Baby U-Net teacher weights. Pass 'none' to skip Dice.")
-    parser.add_argument("--n_classes", type=int, default=12)
-    parser.add_argument("--dice_bone_idx", type=int, default=5)
-    parser.add_argument("--teacher_sw_batch_size", type=int, default=2)
+    parser.add_argument("--teacher_weights_path", default="auto",
+                        help="'none' to disable Dice; any other value runs the canonical dual teachers.")
+    # batch=1: sliding-window results are batch-invariant, and the wider CADS-35
+    # (v2) teacher overflows 32-bit conv indexing at a 256^3 window with batch>1.
+    parser.add_argument("--teacher_sw_batch_size", type=int, default=1)
     parser.add_argument("--teacher_sw_overlap", type=float, default=0.25)
     # MAISI model paths (override if non-default)
     parser.add_argument("--autoencoder_path", default=AUTOENCODER_PATH)
@@ -221,18 +221,15 @@ def main():
     # ckpt is now metadata-only (no need to hold the model state dict in memory)
     del ckpt
 
-    # --- Teacher ---
-    teacher = None
-    if dice_on:
-        teacher = load_teacher_model(
-            args.teacher_weights_path, device=device, n_classes_minus_bg=args.n_classes - 1
-        )
+    # --- Teachers (legacy 12-class + CADS 35-class) ---
+    teachers = load_teachers(default_teacher_specs(), device) if dice_on else []
 
     # --- Val data ---
     val_subj = get_split_subjects(args.split_file, args.split_name)
     if args.max_subjects is not None:
         val_subj = val_subj[: args.max_subjects]
-    val_dicts = build_data_dicts(args.root_dir, val_subj, load_seg=dice_on, load_body_mask=True)
+    # Segs are loaded per-teacher (dual label spaces), not through the cached pipeline.
+    val_dicts = build_data_dicts(args.root_dir, val_subj, load_seg=False, load_body_mask=True)
     print(f"[VAL-MAISI] 📂 {len(val_dicts)} subjects (split={args.split_name})")
 
     # MAISI preproc: ct_range=(-1000, 1000), mri_norm="percentile", res_mult=32.
@@ -242,7 +239,7 @@ def main():
         enforce_ras=True,
         mri_norm="percentile",
         ct_range=(-1000, 1000),
-        load_seg=dice_on,
+        load_seg=False,
         load_ct_image=True,
         load_ct_latent_from=None,
     )
@@ -261,7 +258,6 @@ def main():
         spacing = batch["ct_spacing"].float().to(device) * 100.0
         orig_shape = batch["original_shape"][0].tolist()
         body_mask = batch["body_mask"].to(device).float() if "body_mask" in batch else None
-        seg = batch["seg"].to(device).long() if (dice_on and "seg" in batch) else None
         affine = batch["ct_affine"][0].cpu().numpy()
 
         if device.type == "cuda":
@@ -287,7 +283,6 @@ def main():
         pred_hu_unpad = unpad(pred_hu.float(), orig_shape)
         gt_hu_unpad = unpad(gt_hu.float(), orig_shape)
         mask_unpad = unpad(body_mask, orig_shape) if body_mask is not None else None
-        seg_unpad = unpad(seg, orig_shape) if seg is not None else None
 
         # Image metrics (hu_range=2000 because MAISI clips to [-1000, 1000])
         met = compute_metrics(pred_unpad, gt_unpad, hu_range=2000)
@@ -310,21 +305,15 @@ def main():
             record["body_ssim"]   = bm["ssim"]
 
         # Dice (teacher fed MAISI [0,1] directly — matches trainer.validate())
-        if teacher is not None and seg_unpad is not None:
-            pred_logits = run_teacher_sw(
-                teacher, pred_unpad.float(), device=device,
-                val_patch_size=args.val_patch_size,
-                sw_batch_size=args.teacher_sw_batch_size,
-                overlap=args.teacher_sw_overlap,
-            )
-            dice = compute_dice(pred_logits, seg_unpad, bone_idx=args.dice_bone_idx)
-            record.update(dice)
-            if mask_unpad is not None:
-                dice_b = compute_dice(pred_logits, seg_unpad, mask=mask_unpad, bone_idx=args.dice_bone_idx)
-                record["body_dice_score_all"] = dice_b["dice_score_all"]
-                if "dice_score_bone" in dice_b:
-                    record["body_dice_score_bone"] = dice_b["dice_score_bone"]
-            del pred_logits
+        # Both teachers: 12-class unsuffixed, 35-class `_cads35`.
+        if teachers:
+            seg_by_file = load_subject_segs(args.root_dir, subj_id, teachers, device)
+            sw = dict(val_patch_size=args.val_patch_size, sw_batch_size=args.teacher_sw_batch_size,
+                      overlap=args.teacher_sw_overlap)
+            full, bod = dual_teacher_dice(teachers, pred_unpad.float(), seg_by_file, device,
+                                          body_mask=mask_unpad, sw_kwargs=sw)
+            record.update(full)
+            record.update(bod)
 
         record["time_sec"] = elapsed
         per_subject.append({"subj_id": subj_id, "metrics": record})
@@ -340,9 +329,9 @@ def main():
         tqdm.write(
             f"  {subj_id} | {elapsed:6.1f}s | MAE={record['mae_hu']:6.1f}HU "
             f"PSNR={record['psnr']:5.2f} SSIM={record['ssim']:.3f}"
-            + (f" | dice_all={record.get('dice_score_all', float('nan')):.3f}"
-               f" bone={record.get('dice_score_bone', float('nan')):.3f}"
-               if teacher else "")
+            + (f" | dice12={record.get('dice_score_all', float('nan')):.3f}"
+               f" dice35={record.get('dice_score_all_cads35', float('nan')):.3f}"
+               if teachers else "")
         )
 
         # Memory cleanup per subject (large volumes)
@@ -363,7 +352,7 @@ def main():
         f"checkpoint info: {ckpt_info_str}",
         f"split_file: {args.split_file}   split_name: {args.split_name}",
         f"num_inference_steps: {args.num_inference_steps}   val_sw_overlap: {args.val_sw_overlap}",
-        f"teacher: {args.teacher_weights_path if teacher is not None else 'disabled'}",
+        f"teachers: {', '.join(t['tag'] for t in teachers) if teachers else 'disabled'}",
         f"subjects: {len(per_subject)}",
     ]
     write_metrics_txt(

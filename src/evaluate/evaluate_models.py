@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(_REPO_DIR, "MC-DDPM"))
 
 from common.config import DEFAULT_CONFIG
 from common.data import build_data_dicts, default_monai_cache_dir, get_cached_transforms, get_split_subjects
-from common.loss import get_class_dice
+from common.eval_utils import default_teacher_specs, dual_teacher_dice, load_subject_segs, load_teachers
 from common.utils import clean_state_dict, compute_metrics, compute_metrics_body, unpad
 
 _GPFS_ROOT = DEFAULT_CONFIG["root_dir"]
@@ -80,29 +80,28 @@ def _build_val_loader(
     return DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
 
-def _compute_teacher_dice(pred_unpad, seg_unpad, teacher_model, patch_size, val_sw_batch_size, val_sw_overlap, device, cfg, body_mask_tensor=None):
-    """Run teacher BabyUNet on pred CT and compute dice_score_all and dice_score_bone."""
-    from monai.inferers import sliding_window_inference
+_TEACHERS_CACHE = {}
 
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        pred_probs = sliding_window_inference(
-            inputs=pred_unpad.float(),
-            roi_size=(patch_size, patch_size, patch_size),
-            sw_batch_size=val_sw_batch_size,
-            predictor=teacher_model,
-            overlap=val_sw_overlap,
-            device=device,
-        )
 
-    bone_idx = cfg.get("dice_bone_idx", 5)
-    class_dices, bone_dice = get_class_dice(pred_probs, seg_unpad, mask=body_mask_tensor, bone_idx=bone_idx)
+def _get_teachers(device):
+    """Memoized dual teachers (legacy 12-class + CADS 35-class). Loaded once per device."""
+    key = str(device)
+    if key not in _TEACHERS_CACHE:
+        _TEACHERS_CACHE[key] = load_teachers(default_teacher_specs(), device)
+    return _TEACHERS_CACHE[key]
 
-    result = {}
-    result["dice_score_all"] = class_dices.mean().item()
-    if bone_dice is not None:
-        result["dice_score_bone"] = bone_dice.item()
 
-    return result
+def _compute_teacher_dice(pred_unpad, root_dir, subj_id, teachers, val_sw_overlap, device, body_mask_tensor=None):
+    """Dual-teacher Dice (12-class unsuffixed + 35-class `_cads35`), full + body.
+
+    The teacher runs at its native 128^3 patch (batch=1: results are batch-invariant
+    and the wider CADS-35 teacher overflows 32-bit conv indexing at larger windows).
+    """
+    seg_by_file = load_subject_segs(root_dir, subj_id, teachers, device)
+    sw = dict(val_patch_size=128, sw_batch_size=1, overlap=val_sw_overlap)
+    full, body = dual_teacher_dice(teachers, pred_unpad, seg_by_file, device,
+                                   body_mask=body_mask_tensor, sw_kwargs=sw)
+    return {**full, **body}
 
 
 def detect_type(ckpt: dict) -> str:
@@ -170,22 +169,8 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
     for p in feat_extractor.parameters():
         p.requires_grad = False
 
-    # Teacher model for dice scores (matches training validate_dice=True)
-    teacher_model = None
-    validate_dice = cfg.get("validate_dice", False)
-    if validate_dice:
-        teacher_weights = cfg.get("teacher_weights_path")
-        if teacher_weights and os.path.exists(teacher_weights):
-            from anatomix.segmentation.segmentation_utils import load_model_v1_2
-
-            n_classes = cfg.get("n_classes", 12)
-            teacher_model = load_model_v1_2(pretrained_ckpt=teacher_weights, n_classes=n_classes - 1, device=device, compile_model=False)
-            teacher_model.to(device=device, dtype=torch.bfloat16).eval()
-            for p in teacher_model.parameters():
-                p.requires_grad = False
-            print(f"  [AMIX] Loaded teacher model for dice computation.")
-        else:
-            print(f"  [AMIX] Warning: validate_dice=True but teacher_weights_path not found ({teacher_weights}). Skipping dice.")
+    # Dual teachers (legacy 12-class + CADS 35-class) for dice scores
+    teachers = _get_teachers(device) if cfg.get("validate_dice", False) else []
 
     # Build translator
     translator_input_nc = 17 if pass_mri else 16
@@ -208,7 +193,7 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
         enforce_ras=cfg.get("enforce_ras", True),
         mri_norm=cfg.get("mri_norm", "minmax"),
         load_mask=body_mask,
-        load_seg=teacher_model is not None,
+        load_seg=False,  # segs loaded per-teacher (dual label spaces)
     )
 
     val_metrics = defaultdict(list)
@@ -245,9 +230,8 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
         else:
             met = compute_metrics(pred_unpad, ct_unpad)
 
-        if teacher_model is not None and "seg" in batch:
-            seg_unpad = unpad(batch["seg"].to(device), orig_shape)
-            met.update(_compute_teacher_dice(pred_unpad, seg_unpad, teacher_model, patch_size, val_sw_batch_size, val_sw_overlap, device, cfg, body_mask_tensor=mask_unpad))
+        if teachers:
+            met.update(_compute_teacher_dice(pred_unpad, root_dir, subj_id, teachers, val_sw_overlap, device, body_mask_tensor=mask_unpad))
 
         for k, v in met.items():
             val_metrics[k].append(v)
@@ -293,20 +277,8 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
     model.eval()
 
     # Teacher model for dice scores
-    teacher_model = None
-    if cfg.get("validate_dice", False):
-        teacher_weights = cfg.get("teacher_weights_path")
-        if teacher_weights and os.path.exists(teacher_weights):
-            from anatomix.segmentation.segmentation_utils import load_model_v1_2
-
-            n_classes = cfg.get("n_classes", 12)
-            teacher_model = load_model_v1_2(pretrained_ckpt=teacher_weights, n_classes=n_classes - 1, device=device, compile_model=False)
-            teacher_model.to(device=device, dtype=torch.bfloat16).eval()
-            for p in teacher_model.parameters():
-                p.requires_grad = False
-            print(f"  [UNet] Loaded teacher model for dice computation.")
-        else:
-            print(f"  [UNet] Warning: validate_dice=True but teacher_weights_path not found ({teacher_weights}). Skipping dice.")
+    # Dual teachers (legacy 12-class + CADS 35-class) for dice scores
+    teachers = _get_teachers(device) if cfg.get("validate_dice", False) else []
 
     val_loader = _build_val_loader(
         root_dir,
@@ -316,7 +288,7 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
         enforce_ras=cfg.get("enforce_ras", True),
         mri_norm=cfg.get("mri_norm", "minmax"),
         load_mask=body_mask,
-        load_seg=teacher_model is not None,
+        load_seg=False,  # segs loaded per-teacher (dual label spaces)
     )
 
     val_metrics = defaultdict(list)
@@ -345,9 +317,8 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
         else:
             met = compute_metrics(pred_unpad, ct_unpad)
 
-        if teacher_model is not None and "seg" in batch:
-            seg_unpad = unpad(batch["seg"].to(device), orig_shape)
-            met.update(_compute_teacher_dice(pred_unpad, seg_unpad, teacher_model, patch_size, val_sw_batch_size, val_sw_overlap, device, cfg, body_mask_tensor=mask_unpad))
+        if teachers:
+            met.update(_compute_teacher_dice(pred_unpad, root_dir, subj_id, teachers, val_sw_overlap, device, body_mask_tensor=mask_unpad))
 
         for k, v in met.items():
             val_metrics[k].append(v)

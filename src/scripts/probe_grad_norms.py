@@ -19,7 +19,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from anatomix.model.network import Unet
-from anatomix.segmentation.segmentation_utils import load_model_v1_2
+from anatomix.segmentation.segmentation_utils import load_model_v2
 
 from common.config import DEFAULT_CONFIG
 from common.data import (
@@ -46,8 +46,8 @@ RES_MULT = 16
 BATCH_SIZE = 1
 N_BATCHES = 48
 WEIGHTS = {"l1": 1.0, "ssim": 0.1, "perceptual": 0.5, "dice": 0.1, "dice_bone": 0.3}
-BONE_IDX = 5
-N_CLASSES = 12
+BONE_IDXS = DEFAULT_CONFIG["dice_bone_indices"]  # CADS 35-class bone family
+N_CLASSES = DEFAULT_CONFIG["n_classes"]
 DEVICE = "cuda"
 SEED = 42
 
@@ -73,8 +73,8 @@ def main():
     print(f"[probe] loaded ep{ckpt.get('epoch')} ({sum(p.numel() for p in model.parameters()):,} params)")
 
     # --- teacher (frozen) for Dice ---
-    teacher = load_model_v1_2(pretrained_ckpt=TEACHER, n_classes=N_CLASSES - 1,
-                              device=DEVICE, compile_model=False)
+    teacher = load_model_v2(pretrained_ckpt=TEACHER, n_classes=N_CLASSES - 1,
+                            device=DEVICE, compile_model=False)
     teacher.to(device=DEVICE, dtype=torch.bfloat16).eval()
     for p in teacher.parameters():
         p.requires_grad = False
@@ -87,7 +87,8 @@ def main():
     cached_xform = get_cached_transforms(patch_size=PATCH, res_mult=RES_MULT, enforce_ras=True,
                                          mri_norm="minmax", load_seg=True, use_float16_storage=True)
     train_subjects = get_split_subjects(SPLIT, "train")
-    train_dicts = build_data_dicts(ROOT, train_subjects, load_seg=True)
+    train_dicts = build_data_dicts(ROOT, train_subjects, load_seg=True,
+                                   seg_filename=DEFAULT_CONFIG["seg_filename"])
     base = PersistentDataset(data=train_dicts, transform=cached_xform, cache_dir=cache_dir)
     crop = get_random_crop(patch_size=PATCH, use_weighted_sampler=True, has_seg=True, num_samples=1)
     ds = Dataset(data=base, transform=crop)
@@ -113,9 +114,9 @@ def main():
             l1 = torch.nn.functional.l1_loss(pred, ct)
             ssim = 1.0 - fused_ssim3d(pred.float(), ct.float(), train=True)
             perc = perceptual(pred, ct)
-            class_dices, bone_dice = get_class_dice(pred_probs, seg, bone_idx=BONE_IDX)
+            class_dices = get_class_dice(pred_probs, seg)
             dice = 1.0 - class_dices[1:].mean()
-            dice_bone = 1.0 - bone_dice
+            dice_bone = 1.0 - class_dices[BONE_IDXS].mean()
         loss_terms = {"l1": l1, "ssim": ssim, "perceptual": perc, "dice": dice, "dice_bone": dice_bone}
 
         for t in terms:

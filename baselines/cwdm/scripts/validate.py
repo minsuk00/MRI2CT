@@ -52,19 +52,16 @@ from common.data import (  # noqa: E402
     get_split_subjects,
 )
 from common.eval_utils import (  # noqa: E402
-    compute_dice,
+    default_teacher_specs,
     default_validate_dir,
+    dual_teacher_dice,
     extract_checkpoint_info,
     format_checkpoint_info,
-    load_teacher_model,
-    run_teacher_sw,
+    load_subject_segs,
+    load_teachers,
     write_metrics_txt,
 )
 from common.utils import compute_metrics, compute_metrics_body, unpad  # noqa: E402
-
-
-# Default teacher checkpoint matches DEFAULT_CONFIG["teacher_weights_path"].
-DEFAULT_TEACHER = "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth"
 
 
 def _build_val_loader(args, load_seg):
@@ -150,14 +147,12 @@ def main():
 
     device = dist_util.dev()
 
-    # Teacher (optional). Set --teacher_weights_path=none to disable Dice.
-    teacher = None
-    if args.teacher_weights_path and args.teacher_weights_path.lower() != "none":
-        teacher = load_teacher_model(
-            args.teacher_weights_path, device=device, n_classes_minus_bg=args.n_classes - 1
-        )
+    # Teachers (legacy 12-class + CADS 35-class). Set --teacher_weights_path=none to disable Dice.
+    dice_on = bool(args.teacher_weights_path and args.teacher_weights_path.lower() != "none")
+    teachers = load_teachers(default_teacher_specs(), device) if dice_on else []
 
-    loader, _dicts = _build_val_loader(args, load_seg=(teacher is not None))
+    # Segs are loaded per-teacher (dual label spaces), not through the cached pipeline.
+    loader, _dicts = _build_val_loader(args, load_seg=False)
 
     per_subject = []
     hu_range = args.ct_range_hi - args.ct_range_lo
@@ -171,7 +166,6 @@ def main():
         mri = batch['mri'].to(device).float()
         ct_gt = batch['ct'].to(device).float()
         mask = batch['body_mask'].to(device).float() if 'body_mask' in batch else None
-        seg = batch['seg'].to(device).long() if (teacher is not None and 'seg' in batch) else None
 
         # 8-ch conditioning DWT.
         LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH = dwt(mri)
@@ -207,8 +201,6 @@ def main():
         if mask is not None:
             mask = unpad(mask, orig_shape)
             pred = pred * mask  # background cleanup (sample.py mirror)
-        if seg is not None:
-            seg = unpad(seg, orig_shape)
 
         # Image metrics
         met = compute_metrics(pred.float(), ct_gt.float(), hu_range=hu_range)
@@ -222,22 +214,14 @@ def main():
             record['body_psnr']   = bm['psnr']
             record['body_ssim']   = bm['ssim']
 
-        # Dice (optional)
-        if teacher is not None and seg is not None:
-            pred_logits = run_teacher_sw(
-                teacher, pred.float(), device=device,
-                val_patch_size=args.val_patch_size,
-                sw_batch_size=args.val_sw_batch_size,
-                overlap=args.val_sw_overlap,
-            )
-            dice = compute_dice(pred_logits, seg, bone_idx=args.dice_bone_idx)
-            record.update(dice)
-            if mask is not None:
-                dice_body = compute_dice(pred_logits, seg, mask=mask, bone_idx=args.dice_bone_idx)
-                record['body_dice_score_all']  = dice_body['dice_score_all']
-                if 'dice_score_bone' in dice_body:
-                    record['body_dice_score_bone'] = dice_body['dice_score_bone']
-            del pred_logits
+        # Dice — both teachers (12-class unsuffixed, 35-class `_cads35`)
+        if teachers:
+            seg_by_file = load_subject_segs(args.data_dir, subj_id, teachers, device)
+            sw = dict(val_patch_size=args.val_patch_size, sw_batch_size=1, overlap=args.val_sw_overlap)
+            full, bod = dual_teacher_dice(teachers, pred.float(), seg_by_file, device,
+                                          body_mask=mask, sw_kwargs=sw)
+            record.update(full)
+            record.update(bod)
 
         if th.cuda.is_available():
             th.cuda.synchronize()  # CUDA is async; sync so time_sec reflects real GPU compute
@@ -280,7 +264,7 @@ def main():
         f"checkpoint info: {ckpt_info_str}",
         f"split_file: {args.split_file}   split_name: {args.split_name}",
         f"ddim_steps: {args.ddim_steps}   ct_range: [{args.ct_range_lo}, {args.ct_range_hi}]   mri_norm: {args.mri_norm}",
-        f"teacher: {args.teacher_weights_path if teacher is not None else 'disabled'}",
+        f"teachers: {', '.join(t['tag'] for t in teachers) if teachers else 'disabled'}",
         f"subjects: {len(per_subject)}",
     ]
     if args.num_shards and args.num_shards > 1:
@@ -323,9 +307,7 @@ def create_argparser():
         shard_idx=0,
         num_shards=1,    # >1 enables SLURM-array round-robin sharding
         # Teacher / Dice ------------------------------------------------------
-        teacher_weights_path=DEFAULT_TEACHER,
-        n_classes=12,
-        dice_bone_idx=5,
+        teacher_weights_path="auto",  # 'none' disables Dice; else runs the canonical dual teachers
         val_patch_size=128,
         val_sw_batch_size=2,
         val_sw_overlap=0.25,

@@ -27,12 +27,13 @@ from common.data import (
     get_split_subjects,
 )
 from common.eval_utils import (
-    compute_dice,
+    default_teacher_specs,
     default_validate_dir,
+    dual_teacher_dice,
     extract_checkpoint_info,
     format_checkpoint_info,
-    load_teacher_model,
-    run_teacher_sw,
+    load_subject_segs,
+    load_teachers,
     write_metrics_txt,
 )
 from common.utils import (
@@ -41,9 +42,6 @@ from common.utils import (
     compute_metrics_body,
     unpad,
 )
-
-
-DEFAULT_TEACHER = "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth"
 
 
 @torch.inference_mode()
@@ -57,10 +55,11 @@ def main():
     parser.add_argument("--max_subjects", type=int, default=None)
     parser.add_argument("--shard_idx", type=int, default=0)
     parser.add_argument("--num_shards", type=int, default=1)
-    parser.add_argument("--teacher_weights_path", default=DEFAULT_TEACHER)
-    parser.add_argument("--n_classes", type=int, default=12)
-    parser.add_argument("--dice_bone_idx", type=int, default=5)
-    parser.add_argument("--teacher_sw_batch_size", type=int, default=2)
+    parser.add_argument("--teacher_weights_path", default="auto",
+                        help="'none' to disable Dice; any other value runs the canonical dual teachers.")
+    # batch=1: sliding-window results are batch-invariant, and the wider CADS-35
+    # (v2) teacher overflows 32-bit conv indexing at a 256^3 window with batch>1.
+    parser.add_argument("--teacher_sw_batch_size", type=int, default=1)
     parser.add_argument("--teacher_sw_overlap", type=float, default=0.25)
     args = parser.parse_args()
 
@@ -101,11 +100,7 @@ def main():
     for p in model.parameters():
         p.requires_grad = False
 
-    teacher = None
-    if dice_on:
-        teacher = load_teacher_model(
-            args.teacher_weights_path, device=device, n_classes_minus_bg=args.n_classes - 1
-        )
+    teachers = load_teachers(default_teacher_specs(), device) if dice_on else []
 
     val_subj = get_split_subjects(args.split_file, args.split_name)
     if args.max_subjects is not None:
@@ -113,7 +108,8 @@ def main():
     if args.num_shards and args.num_shards > 1:
         val_subj = val_subj[args.shard_idx :: args.num_shards]
         print(f"[VAL-UNET] shard {args.shard_idx}/{args.num_shards} → {len(val_subj)} subjects")
-    val_dicts = build_data_dicts(args.root_dir, val_subj, load_seg=dice_on, load_body_mask=True)
+    # Segs are loaded per-teacher (dual label spaces), not through the cached pipeline.
+    val_dicts = build_data_dicts(args.root_dir, val_subj, load_seg=False, load_body_mask=True)
     print(f"[VAL-UNET] 📂 {len(val_dicts)} subjects (split={args.split_name})")
 
     val_xform = get_cached_transforms(
@@ -122,7 +118,7 @@ def main():
         enforce_ras=True,
         mri_norm=cfg.get("mri_norm", "minmax"),
         ct_range=tuple(cfg.get("ct_range", (-1024, 1024))),
-        load_seg=dice_on,
+        load_seg=False,
         load_body_mask=True,
     )
     cache_dir = default_monai_cache_dir()
@@ -140,7 +136,6 @@ def main():
         mri = batch["mri"].to(device).float()
         ct  = batch["ct"].to(device).float()
         body_mask = batch["body_mask"].to(device).float() if "body_mask" in batch else None
-        seg = batch["seg"].to(device).long() if (dice_on and "seg" in batch) else None
         orig_shape = batch["original_shape"][0].tolist()
         affine = batch["ct_affine"][0].cpu().numpy()
 
@@ -162,7 +157,6 @@ def main():
         pred_unpad = unpad(pred.float(), orig_shape)
         ct_unpad   = unpad(ct, orig_shape)
         mask_unpad = unpad(body_mask, orig_shape) if body_mask is not None else None
-        seg_unpad  = unpad(seg, orig_shape) if seg is not None else None
 
         met = compute_metrics(pred_unpad, ct_unpad, hu_range=2048)
         record = {"mae_hu": met["mae_hu"], "psnr": met["psnr"],
@@ -173,21 +167,14 @@ def main():
             record["body_psnr"]   = bm["psnr"]
             record["body_ssim"]   = bm["ssim"]
 
-        if teacher is not None and seg_unpad is not None:
-            pred_logits = run_teacher_sw(
-                teacher, pred_unpad, device=device,
-                val_patch_size=val_ps,
-                sw_batch_size=args.teacher_sw_batch_size,
-                overlap=args.teacher_sw_overlap,
-            )
-            d = compute_dice(pred_logits, seg_unpad, bone_idx=args.dice_bone_idx)
-            record.update(d)
-            if mask_unpad is not None:
-                db = compute_dice(pred_logits, seg_unpad, mask=mask_unpad, bone_idx=args.dice_bone_idx)
-                record["body_dice_score_all"]  = db["dice_score_all"]
-                if "dice_score_bone" in db:
-                    record["body_dice_score_bone"] = db["dice_score_bone"]
-            del pred_logits
+        if teachers:
+            seg_by_file = load_subject_segs(args.root_dir, subj_id, teachers, device)
+            sw = dict(val_patch_size=val_ps, sw_batch_size=args.teacher_sw_batch_size,
+                      overlap=args.teacher_sw_overlap)
+            full, bod = dual_teacher_dice(teachers, pred_unpad, seg_by_file, device,
+                                          body_mask=mask_unpad, sw_kwargs=sw)
+            record.update(full)
+            record.update(bod)
 
         record["time_sec"] = elapsed
         per_subject.append({"subj_id": subj_id, "metrics": record})
@@ -202,9 +189,9 @@ def main():
         tqdm.write(
             f"  {subj_id} | {elapsed:6.1f}s | MAE={record['mae_hu']:6.1f}HU "
             f"PSNR={record['psnr']:5.2f} SSIM={record['ssim']:.3f}"
-            + (f" | dice_all={record.get('dice_score_all', float('nan')):.3f}"
-               f" bone={record.get('dice_score_bone', float('nan')):.3f}"
-               if teacher else "")
+            + (f" | dice12={record.get('dice_score_all', float('nan')):.3f}"
+               f" dice35={record.get('dice_score_all_cads35', float('nan')):.3f}"
+               if teachers else "")
         )
         del pred, pred_unpad, ct_unpad, mri, ct
         gc.collect()
@@ -222,7 +209,7 @@ def main():
         f"split_file: {args.split_file}   split_name: {args.split_name}",
         f"input_nc: {cfg.get('input_nc', 1)}   num_downs: {cfg.get('num_downs', 4)}   ngf: {cfg.get('ngf', 16)}   norm: {cfg.get('norm', 'batch')}",
         f"val_patch_size: {val_ps}   val_sw_overlap: {val_sw_overlap}   val_sw_batch_size: {val_sw_batch_size}",
-        f"teacher: {args.teacher_weights_path if teacher is not None else 'disabled'}",
+        f"teachers: {', '.join(t['tag'] for t in teachers) if teachers else 'disabled'}",
         f"subjects: {len(per_subject)}",
     ]
     if args.num_shards and args.num_shards > 1:

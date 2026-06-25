@@ -54,12 +54,13 @@ from common.data import (
     get_split_subjects,
 )
 from common.eval_utils import (
-    compute_dice,
+    default_teacher_specs,
     default_validate_dir,
+    dual_teacher_dice,
     extract_checkpoint_info,
     format_checkpoint_info,
-    load_teacher_model,
-    run_teacher_sw,
+    load_subject_segs,
+    load_teachers,
     write_metrics_txt,
 )
 from common.utils import clean_state_dict, compute_metrics, compute_metrics_body, unpad
@@ -68,7 +69,6 @@ from common.utils import clean_state_dict, compute_metrics, compute_metrics_body
 CT_SPAN_PAPER = CT_CLIP[1] - CT_CLIP[0]  # 1650 - (-1024) = 2674
 CT_SPAN_AMIX = 2048  # [-1024, 1024]; the yardstick all metrics report on.
 
-DEFAULT_TEACHER = "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth"
 
 
 def build_cached_xform_with_seg(load_body_mask=True, load_seg=False):
@@ -208,10 +208,8 @@ def main():
     parser.add_argument("--use_checkpoint", action="store_true",
                         help="Use gradient-checkpointed SwinVITModel (saves VRAM during inference)")
     # Teacher / Dice ----------------------------------------------------------
-    parser.add_argument("--teacher_weights_path", default=DEFAULT_TEACHER,
-                        help="Baby U-Net teacher weights. Pass 'none' to skip Dice.")
-    parser.add_argument("--n_classes", type=int, default=12)
-    parser.add_argument("--dice_bone_idx", type=int, default=5)
+    parser.add_argument("--teacher_weights_path", default="auto",
+                        help="'none' to disable Dice; any other value runs the canonical dual teachers.")
     parser.add_argument("--teacher_val_patch_size", type=int, default=128)
     parser.add_argument("--teacher_sw_batch_size", type=int, default=2)
     parser.add_argument("--teacher_sw_overlap", type=float, default=0.25)
@@ -250,12 +248,8 @@ def main():
     ckpt_info_str = format_checkpoint_info(ckpt_info)
     print(f"[VAL] checkpoint: {ckpt_info_str}")
 
-    # --- Teacher ---
-    teacher = None
-    if dice_on:
-        teacher = load_teacher_model(
-            args.teacher_weights_path, device=device, n_classes_minus_bg=args.n_classes - 1
-        )
+    # --- Teachers (legacy 12-class + CADS 35-class) ---
+    teachers = load_teachers(default_teacher_specs(), device) if dice_on else []
 
     # --- Build val dataset ---
     subjects = get_split_subjects(args.split_file, args.split_name)
@@ -264,10 +258,11 @@ def main():
     if args.num_shards and args.num_shards > 1:
         subjects = subjects[args.shard_idx :: args.num_shards]
         print(f"[VAL] shard {args.shard_idx}/{args.num_shards} → {len(subjects)} subjects")
-    dicts = build_data_dicts(args.root_dir, subjects, load_seg=dice_on, load_body_mask=True)
+    # Segs are loaded per-teacher (dual label spaces), not through the cached pipeline.
+    dicts = build_data_dicts(args.root_dir, subjects, load_seg=False, load_body_mask=True)
     print(f"[VAL] 📂 {len(dicts)} subjects (split={args.split_name}, max_subjects={args.max_subjects})")
 
-    xform = build_cached_xform_with_seg(load_body_mask=True, load_seg=dice_on)
+    xform = build_cached_xform_with_seg(load_body_mask=True, load_seg=False)
     # hash_transform=pickle_hashing → key by transform spec, not just data path,
     # so this validate cache doesn't collide with the training cache (different
     # CT clip range / scale / load_seg).
@@ -285,7 +280,6 @@ def main():
         mri = batch["mri"].to(device).float()        # (1, 1, D, H, W) in [-1, 1]
         ct  = batch["ct"].to(device).float()         # (1, 1, D, H, W) in [-1, 1]
         body_mask = batch["body_mask"].to(device).float() if "body_mask" in batch else None
-        seg = batch["seg"].to(device).long() if (dice_on and "seg" in batch) else None
         original_shape = batch["original_shape"][0]
         ct_affine = batch["ct_affine"][0].cpu().numpy()
 
@@ -303,7 +297,6 @@ def main():
         # GT in HU
         ct_hu_unpad = unpad(paper_to_hu(ct), original_shape)
         mask_unpad = unpad(body_mask, original_shape) if body_mask is not None else None
-        seg_unpad = unpad(seg, original_shape) if seg is not None else None
 
         # Metrics on the amix [-1024, 1024] yardstick (span 2048).
         pred_amix01 = hu_to_amix01(pred_hu_unpad)
@@ -325,23 +318,15 @@ def main():
             record["body_ssim"]   = mb["ssim"]
 
         # Dice — teacher consumes amix-clipped [0,1] (same preproc it was trained on).
-        if teacher is not None and seg_unpad is not None:
-            pred_logits = run_teacher_sw(
-                teacher, pred_amix01.float(), device=device,
-                val_patch_size=args.teacher_val_patch_size,
-                sw_batch_size=args.teacher_sw_batch_size,
-                overlap=args.teacher_sw_overlap,
-            )
-            dice = compute_dice(pred_logits, seg_unpad, bone_idx=args.dice_bone_idx)
-            record["dice_score_all"] = dice["dice_score_all"]
-            if "dice_score_bone" in dice:
-                record["dice_score_bone"] = dice["dice_score_bone"]
-            if mask_unpad is not None:
-                dice_b = compute_dice(pred_logits, seg_unpad, mask=mask_unpad, bone_idx=args.dice_bone_idx)
-                record["body_dice_score_all"] = dice_b["dice_score_all"]
-                if "dice_score_bone" in dice_b:
-                    record["body_dice_score_bone"] = dice_b["dice_score_bone"]
-            del pred_logits
+        # Both teachers: 12-class unsuffixed, 35-class `_cads35`.
+        if teachers:
+            seg_by_file = load_subject_segs(args.root_dir, subj_id, teachers, device)
+            sw = dict(val_patch_size=args.teacher_val_patch_size, sw_batch_size=1,
+                      overlap=args.teacher_sw_overlap)
+            full, bod = dual_teacher_dice(teachers, pred_amix01.float(), seg_by_file, device,
+                                          body_mask=mask_unpad, sw_kwargs=sw)
+            record.update(full)
+            record.update(bod)
 
         record["time_sec"] = elapsed
         per_subject.append({"subj_id": subj_id, "metrics": record})
@@ -357,7 +342,7 @@ def main():
         tqdm.write(
             f"  {subj_id} | {elapsed:6.1f}s | amix MAE={met['mae_hu']:6.1f}HU "
             f"PSNR={met['psnr']:5.2f} SSIM={met['ssim']:.3f}"
-            + (f" | dice_all={record.get('dice_score_all', float('nan')):.3f} bone={record.get('dice_score_bone', float('nan')):.3f}" if teacher else "")
+            + (f" | dice12={record.get('dice_score_all', float('nan')):.3f} dice35={record.get('dice_score_all_cads35', float('nan')):.3f}" if teachers else "")
         )
 
     # --- TXT report ---
@@ -373,7 +358,7 @@ def main():
         f"split_file: {args.split_file}   split_name: {args.split_name}",
         f"ddim_steps: {args.ddim_steps}   mc_runs: {args.mc_runs}   overlap: {args.overlap}",
         f"ct_span_paper: {CT_SPAN_PAPER}   ct_span_amix: {CT_SPAN_AMIX}",
-        f"teacher: {args.teacher_weights_path if teacher is not None else 'disabled'}",
+        f"teachers: {', '.join(t['tag'] for t in teachers) if teachers else 'disabled'}",
         f"subjects: {len(per_subject)}",
     ]
     if args.num_shards and args.num_shards > 1:

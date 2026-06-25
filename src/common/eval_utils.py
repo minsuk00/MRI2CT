@@ -25,18 +25,21 @@ def load_teacher_model(
     *,
     device,
     n_classes_minus_bg=11,  # teacher trained on 11 fg classes (n_classes=12 incl. bg)
+    arch="v1_2",            # "v1_2" (legacy 12-class) or "v2" (CADS 35-class)
     dtype=torch.bfloat16,
 ):
     """Load + freeze the Baby U-Net teacher used for Dice eval.
 
     Mirrors BaseTrainer._setup_teacher_model but takes explicit args so callers
     don't need a Trainer/Config in scope. `n_classes_minus_bg` matches the
-    `cfg.n_classes - 1` convention in the trainer (DEFAULT_CONFIG.n_classes=12).
+    `cfg.n_classes - 1` convention in the trainer. Set arch="v2" with
+    n_classes_minus_bg=34 to load the CADS 35-class teacher.
     """
-    from anatomix.segmentation.segmentation_utils import load_model_v1_2
+    from anatomix.segmentation.segmentation_utils import load_model_v1_2, load_model_v2
 
-    print(f"[eval] 👨‍🏫 Loading teacher from {weights_path}")
-    teacher = load_model_v1_2(
+    loader = load_model_v2 if arch == "v2" else load_model_v1_2
+    print(f"[eval] 👨‍🏫 Loading teacher ({arch}) from {weights_path}")
+    teacher = loader(
         pretrained_ckpt=weights_path,
         n_classes=n_classes_minus_bg,
         device=device,
@@ -79,6 +82,107 @@ def run_teacher_sw(
         )
 
 
+# ---------------------------------------------------------------------------
+# Dual-teacher Dice: legacy 12-class (ct_seg.nii) + CADS 35-class
+# ---------------------------------------------------------------------------
+LEGACY_TEACHER_PATH = "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_epoch_749.pth"
+CADS35_TEACHER_PATH = "/home/minsukc/MRI2CT/ckpt/seg_baby_unet/seg_baby_unet_cads_35_center_wise_di54npq3_epoch_1000.pth"
+
+
+def default_teacher_specs():
+    """Canonical teachers for evaluation Dice. The 12-class teacher keeps the
+    UNSUFFIXED metric keys (dice_score_all/dice_score_bone) so historical reports
+    keep meaning the same; the 35-class teacher adds `_cads35`-suffixed keys.
+    Each spec names its matching GT seg file so the label spaces line up.
+    """
+    from common.labels import BONE_CLASS_INDICES
+
+    return [
+        {"tag": "seg12", "suffix": "", "arch": "v1_2", "weights": LEGACY_TEACHER_PATH,
+         "n_classes": 12, "seg_filename": "ct_seg.nii", "bone_idx": 5},
+        {"tag": "cads35", "suffix": "_cads35", "arch": "v2", "weights": CADS35_TEACHER_PATH,
+         "n_classes": 35, "seg_filename": "cads_grouped_35_labels_seg.nii.gz",
+         "bone_idx": BONE_CLASS_INDICES},
+    ]
+
+
+def load_teachers(specs, device, dtype=torch.bfloat16):
+    """Load every teacher in `specs` (skipping any whose weights are missing).
+    Returns the spec dicts augmented with a loaded `model`.
+    """
+    loaded = []
+    for s in specs:
+        if not os.path.exists(s["weights"]):
+            print(f"[eval] ⚠️ teacher weights missing, skipping {s['tag']}: {s['weights']}")
+            continue
+        model = load_teacher_model(
+            s["weights"], device=device, n_classes_minus_bg=s["n_classes"] - 1,
+            arch=s["arch"], dtype=dtype,
+        )
+        loaded.append({**s, "model": model})
+    return loaded
+
+
+def load_seg_oriented(root_dir, subj_id, seg_filename, device):
+    """Load one subject's GT seg at its RAS pre-pad (original) shape, aligned with
+    the unpadded prediction. Returns (1, 1, X, Y, Z) long tensor, or None if absent.
+
+    A plain RAS load matches the cached pipeline's unpadded seg exactly (verified):
+    the pipeline records original_shape after RAS, pads at the end, then unpads back.
+    """
+    from monai.transforms import Compose, EnsureChannelFirstd, EnsureTyped, LoadImaged, Orientationd
+
+    base = seg_filename[:-7] if seg_filename.endswith(".nii.gz") else os.path.splitext(seg_filename)[0]
+    path = None
+    for ext in (".nii", ".nii.gz"):
+        cand = os.path.join(root_dir, subj_id, base + ext)
+        if os.path.exists(cand):
+            path = cand
+            break
+    if path is None:
+        return None
+    xform = Compose([
+        LoadImaged(keys=["seg"], image_only=True),
+        EnsureChannelFirstd(keys=["seg"]),
+        Orientationd(keys=["seg"], axcodes="RAS"),
+        EnsureTyped(keys=["seg"]),
+    ])
+    seg = xform({"seg": path})["seg"]  # (1, X, Y, Z)
+    return seg[None].to(device).long()  # (1, 1, X, Y, Z)
+
+
+def load_subject_segs(root_dir, subj_id, teachers, device):
+    """Preload each distinct seg file referenced by `teachers` for one subject."""
+    segs = {}
+    for t in teachers:
+        fn = t["seg_filename"]
+        if fn not in segs:
+            segs[fn] = load_seg_oriented(root_dir, subj_id, fn, device)
+    return segs
+
+
+@torch.inference_mode()
+def dual_teacher_dice(teachers, pred_unpad, seg_by_file, device, *, body_mask=None, sw_kwargs=None):
+    """Run every teacher on `pred_unpad` once and score Dice against its matching
+    seg. Returns (full_metrics, body_metrics): full keys like dice_score_all{suffix},
+    body keys prefixed `body_`. A teacher whose seg is missing is skipped.
+    """
+    sw_kwargs = sw_kwargs or {}
+    full, body = {}, {}
+    for t in teachers:
+        seg = seg_by_file.get(t["seg_filename"])
+        if seg is None:
+            continue
+        logits = run_teacher_sw(t["model"], pred_unpad, device=device, **sw_kwargs)
+        for k, v in compute_dice(logits, seg, bone_idx=t["bone_idx"]).items():
+            full[k + t["suffix"]] = v
+        if body_mask is not None:
+            for k, v in compute_dice(logits, seg, mask=body_mask, bone_idx=t["bone_idx"]).items():
+                body["body_" + k + t["suffix"]] = v
+        del logits
+    return full, body
+
+
 def compute_dice(pred_logits, seg, *, mask=None, bone_idx=5, exclude_background=True):
     """Compute {dice_score_all, dice_score_bone} from teacher logits + GT seg.
 
@@ -87,13 +191,15 @@ def compute_dice(pred_logits, seg, *, mask=None, bone_idx=5, exclude_background=
     `mask`:       optional (B, 1, D, H, W) body mask — restricts the Dice to body
                   voxels (matches `compute_metrics_body`).
     """
-    class_dices, bone_dice = get_class_dice(pred_logits, seg, mask=mask, bone_idx=bone_idx)
+    class_dices = get_class_dice(pred_logits, seg, mask=mask)
     out = {}
     out["dice_score_all"] = (
         class_dices[1:].mean() if exclude_background else class_dices.mean()
     ).item()
-    if bone_dice is not None:
-        out["dice_score_bone"] = bone_dice.item()
+    bone_idxs = [bone_idx] if isinstance(bone_idx, int) else list(bone_idx)
+    in_range = [b for b in bone_idxs if b < class_dices.shape[0]]
+    if in_range:
+        out["dice_score_bone"] = class_dices[in_range].mean().item()
     return out
 
 
@@ -115,7 +221,9 @@ def compute_dice_hard(pred_logits, seg, *, bone_idx=5):
     if seg.ndim == 5:
         seg = seg.squeeze(1)                    # (B, D, H, W)
     n_classes = pred_logits.shape[1]
+    bone_idxs = {bone_idx} if isinstance(bone_idx, int) else set(bone_idx)
     fg_scores = []
+    bone_scores = []
     out = {}
     for c in range(1, n_classes):
         a = pred_lab == c
@@ -129,8 +237,10 @@ def compute_dice_hard(pred_logits, seg, *, bone_idx=5):
         else:
             s = 2.0 * int((a & b).sum().item()) / (a_sum + b_sum)
         fg_scores.append(s)
-        if c == bone_idx:
-            out["dice_score_bone"] = s
+        if c in bone_idxs:
+            bone_scores.append(s)
+    if bone_scores:
+        out["dice_score_bone"] = float(np.mean(bone_scores))
     out["dice_score_all"] = float(np.mean(fg_scores))
     return out
 
