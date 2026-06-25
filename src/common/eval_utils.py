@@ -161,6 +161,18 @@ def load_subject_segs(root_dir, subj_id, teachers, device):
     return segs
 
 
+def rescale_pred_to_teacher(pred, ct_range):
+    """Map a prediction from ct_range [0,1] to the teachers' native (-1024,1024)
+    [0,1] convention (clipping), so teachers trained on that range segment it
+    correctly. No-op when ct_range == (-1024,1024). Mirrors BaseTrainer._pred_for_teacher.
+    """
+    lo, hi = ct_range
+    if (lo, hi) == (-1024, 1024):
+        return pred
+    pred_hu = pred * (hi - lo) + lo
+    return ((pred_hu + 1024.0) / 2048.0).clamp(0.0, 1.0)
+
+
 @torch.inference_mode()
 def dual_teacher_dice(teachers, pred_unpad, seg_by_file, device, *, body_mask=None, sw_kwargs=None):
     """Run every teacher on `pred_unpad` once and score Dice against its matching

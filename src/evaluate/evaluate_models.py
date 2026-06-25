@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(_REPO_DIR, "MC-DDPM"))
 
 from common.config import DEFAULT_CONFIG
 from common.data import build_data_dicts, default_monai_cache_dir, get_cached_transforms, get_split_subjects
-from common.eval_utils import default_teacher_specs, dual_teacher_dice, load_subject_segs, load_teachers
+from common.eval_utils import default_teacher_specs, dual_teacher_dice, load_subject_segs, load_teachers, rescale_pred_to_teacher
 from common.utils import clean_state_dict, compute_metrics, compute_metrics_body, unpad
 
 _GPFS_ROOT = DEFAULT_CONFIG["root_dir"]
@@ -74,7 +74,9 @@ def _build_val_loader(
         load_seg=load_seg,
         load_body_mask=load_mask,
     )
-    cache_dir = default_monai_cache_dir()
+    # ct_range-specific cache dir so a widened-range checkpoint (e.g. -1024..3500)
+    # doesn't reuse the default-range cached CT (PersistentDataset keys on file paths only).
+    cache_dir = default_monai_cache_dir(ct_range=ct_range)
     os.makedirs(cache_dir, exist_ok=True)
     ds = PersistentDataset(data=dicts, transform=cached, cache_dir=cache_dir)
     return DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
@@ -142,6 +144,8 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
     val_sw_overlap = cfg.get("val_sw_overlap", 0.25)
     feat_instance_norm = cfg.get("feat_instance_norm", False)
     pass_mri = cfg.get("pass_mri_to_translator", False)
+    ct_range = tuple(cfg.get("ct_range", (-1024, 1024)))
+    ct_span = ct_range[1] - ct_range[0]
 
     # Build Anatomix feature extractor
     if anatomix_weights == "v1":
@@ -192,6 +196,7 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
         res_mult=res_mult,
         enforce_ras=cfg.get("enforce_ras", True),
         mri_norm=cfg.get("mri_norm", "minmax"),
+        ct_range=ct_range,
         load_mask=body_mask,
         load_seg=False,  # segs loaded per-teacher (dual label spaces)
     )
@@ -226,12 +231,13 @@ def validate_amix(ckpt_path: str, val_subjects: list, device: torch.device, root
         mask_unpad = None
         if body_mask and "body_mask" in batch:
             mask_unpad = unpad(batch["body_mask"].to(device), orig_shape)
-            met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad)
+            met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad, hu_range=ct_span)
         else:
-            met = compute_metrics(pred_unpad, ct_unpad)
+            met = compute_metrics(pred_unpad, ct_unpad, hu_range=ct_span)
 
         if teachers:
-            met.update(_compute_teacher_dice(pred_unpad, root_dir, subj_id, teachers, val_sw_overlap, device, body_mask_tensor=mask_unpad))
+            # Teachers were trained on (-1024,1024)->[0,1]; rescale a wider-range pred (no-op for default).
+            met.update(_compute_teacher_dice(rescale_pred_to_teacher(pred_unpad, ct_range), root_dir, subj_id, teachers, val_sw_overlap, device, body_mask_tensor=mask_unpad))
 
         for k, v in met.items():
             val_metrics[k].append(v)
@@ -264,6 +270,8 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
     ngf = cfg.get("ngf", 16)
     val_sw_batch_size = cfg.get("val_sw_batch_size", 8)
     val_sw_overlap = cfg.get("val_sw_overlap", 0.25)
+    ct_range = tuple(cfg.get("ct_range", (-1024, 1024)))
+    ct_span = ct_range[1] - ct_range[0]
 
     model = Unet(
         dimension=3,
@@ -287,6 +295,7 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
         res_mult=res_mult,
         enforce_ras=cfg.get("enforce_ras", True),
         mri_norm=cfg.get("mri_norm", "minmax"),
+        ct_range=ct_range,
         load_mask=body_mask,
         load_seg=False,  # segs loaded per-teacher (dual label spaces)
     )
@@ -313,12 +322,13 @@ def validate_unet(ckpt_path: str, val_subjects: list, device: torch.device, root
         mask_unpad = None
         if body_mask and "body_mask" in batch:
             mask_unpad = unpad(batch["body_mask"].to(device), orig_shape)
-            met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad)
+            met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad, hu_range=ct_span)
         else:
-            met = compute_metrics(pred_unpad, ct_unpad)
+            met = compute_metrics(pred_unpad, ct_unpad, hu_range=ct_span)
 
         if teachers:
-            met.update(_compute_teacher_dice(pred_unpad, root_dir, subj_id, teachers, val_sw_overlap, device, body_mask_tensor=mask_unpad))
+            # Teachers were trained on (-1024,1024)->[0,1]; rescale a wider-range pred (no-op for default).
+            met.update(_compute_teacher_dice(rescale_pred_to_teacher(pred_unpad, ct_range), root_dir, subj_id, teachers, val_sw_overlap, device, body_mask_tensor=mask_unpad))
 
         for k, v in met.items():
             val_metrics[k].append(v)
@@ -351,6 +361,8 @@ def validate_mcddpm(ckpt_path: str, val_subjects: list, device: torch.device, ro
     learn_sigma = cfg.get("learn_sigma", True)
     val_sw_batch_size = cfg.get("val_sw_batch_size", 4)
     val_sw_overlap = cfg.get("val_sw_overlap", 0.5)
+    ct_range = tuple(cfg.get("ct_range", (-1024, 1024)))
+    ct_span = ct_range[1] - ct_range[0]
 
     # Reconstruct diffusion schedule from saved config
     timestep_respacing = cfg.get("timestep_respacing", [50])
@@ -408,6 +420,7 @@ def validate_mcddpm(ckpt_path: str, val_subjects: list, device: torch.device, ro
         res_mult=1,
         enforce_ras=False,
         mri_norm=cfg.get("mri_norm", "minmax"),
+        ct_range=ct_range,
         load_mask=body_mask,
     )
 
@@ -437,9 +450,9 @@ def validate_mcddpm(ckpt_path: str, val_subjects: list, device: torch.device, ro
         ct_unpad = unpad(ct, orig_shape)
         if body_mask and "body_mask" in batch:
             mask_unpad = unpad(batch["body_mask"].to(device), orig_shape)
-            met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad)
+            met = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad, hu_range=ct_span)
         else:
-            met = compute_metrics(pred_unpad, ct_unpad)
+            met = compute_metrics(pred_unpad, ct_unpad, hu_range=ct_span)
         for k, v in met.items():
             val_metrics[k].append(v)
         del mri, ct, pred, pred_unpad, ct_unpad

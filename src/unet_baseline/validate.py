@@ -30,6 +30,7 @@ from common.eval_utils import (
     default_teacher_specs,
     default_validate_dir,
     dual_teacher_dice,
+    rescale_pred_to_teacher,
     extract_checkpoint_info,
     format_checkpoint_info,
     load_subject_segs,
@@ -129,6 +130,9 @@ def main():
     val_ps = cfg.get("val_patch_size", 256)
     val_sw_overlap = cfg.get("val_sw_overlap", 0.25)
     val_sw_batch_size = cfg.get("val_sw_batch_size", 1)
+    # CT HU clip range this checkpoint was trained with (default for pre-ct_range runs).
+    ct_lo, ct_hi = cfg.get("ct_range", (-1024, 1024))
+    ct_span = ct_hi - ct_lo
 
     per_subject = []
     for batch in tqdm(loader, desc="validate", dynamic_ncols=True):
@@ -158,11 +162,11 @@ def main():
         ct_unpad   = unpad(ct, orig_shape)
         mask_unpad = unpad(body_mask, orig_shape) if body_mask is not None else None
 
-        met = compute_metrics(pred_unpad, ct_unpad, hu_range=2048)
+        met = compute_metrics(pred_unpad, ct_unpad, hu_range=ct_span)
         record = {"mae_hu": met["mae_hu"], "psnr": met["psnr"],
                   "ssim": met["ssim"], "grad_diff": met["grad_diff"]}
         if mask_unpad is not None:
-            bm = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad, hu_range=2048)
+            bm = compute_metrics_body(pred_unpad, ct_unpad, mask_unpad, hu_range=ct_span)
             record["body_mae_hu"] = bm["mae_hu"]
             record["body_psnr"]   = bm["psnr"]
             record["body_ssim"]   = bm["ssim"]
@@ -171,7 +175,9 @@ def main():
             seg_by_file = load_subject_segs(args.root_dir, subj_id, teachers, device)
             sw = dict(val_patch_size=val_ps, sw_batch_size=args.teacher_sw_batch_size,
                       overlap=args.teacher_sw_overlap)
-            full, bod = dual_teacher_dice(teachers, pred_unpad, seg_by_file, device,
+            # Teachers were trained on (-1024,1024)->[0,1]; rescale a wider-range pred (no-op for default).
+            pred_teacher = rescale_pred_to_teacher(pred_unpad, (ct_lo, ct_hi))
+            full, bod = dual_teacher_dice(teachers, pred_teacher, seg_by_file, device,
                                           body_mask=mask_unpad, sw_kwargs=sw)
             record.update(full)
             record.update(bod)
@@ -181,8 +187,8 @@ def main():
 
         subj_dir = os.path.join(args.out_dir, subj_id)
         os.makedirs(subj_dir, exist_ok=True)
-        pred_hu = (pred_unpad * 2048.0 - 1024.0).float().cpu().numpy().squeeze()
-        ct_hu   = (ct_unpad   * 2048.0 - 1024.0).float().cpu().numpy().squeeze()
+        pred_hu = (pred_unpad * ct_span + ct_lo).float().cpu().numpy().squeeze()
+        ct_hu   = (ct_unpad   * ct_span + ct_lo).float().cpu().numpy().squeeze()
         nib.save(nib.Nifti1Image(pred_hu, affine), os.path.join(subj_dir, "sample.nii.gz"))
         nib.save(nib.Nifti1Image(ct_hu,   affine), os.path.join(subj_dir, "target.nii.gz"))
 
